@@ -6,6 +6,8 @@
 //! backend the server *uses*, not the API: the bespoke protocol modules stay
 //! compiled and exported either way.
 
+#[cfg(feature = "hyper-backend")]
+pub(crate) mod hyper;
 pub(crate) mod native;
 
 use crate::conn::ConnConfig;
