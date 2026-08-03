@@ -104,6 +104,85 @@ where
     }
 }
 
+/// A response body in hyper's dialect.
+///
+/// Framing choice is delegated to hyper via `SizeHint`: exact hints yield
+/// `Content-Length`, the absence of one yields chunked — the same decision
+/// table as the native writer's `OutBody`.
+#[allow(dead_code)] // wired in a later task
+pub(crate) struct HyperOutBody {
+    body: crate::service::ResponseBody,
+    done: bool,
+}
+
+#[allow(dead_code)] // wired in a later task
+impl HyperOutBody {
+    pub(crate) fn new(body: crate::service::ResponseBody) -> Self {
+        let done = matches!(body, crate::service::ResponseBody::Empty);
+        Self { body, done }
+    }
+}
+
+impl ::hyper::body::Body for HyperOutBody {
+    type Data = Bytes;
+    type Error = crate::service::BodyError;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<::hyper::body::Frame<Bytes>, Self::Error>>> {
+        if self.done {
+            return Poll::Ready(None);
+        }
+        match &mut self.body {
+            crate::service::ResponseBody::Empty => {
+                self.done = true;
+                Poll::Ready(None)
+            }
+            crate::service::ResponseBody::Full(b) => {
+                let data = std::mem::take(b);
+                self.done = true;
+                if data.is_empty() {
+                    Poll::Ready(None)
+                } else {
+                    Poll::Ready(Some(Ok(::hyper::body::Frame::data(data))))
+                }
+            }
+            crate::service::ResponseBody::Stream(s) => match s.as_mut().poll_next(cx) {
+                Poll::Pending => Poll::Pending,
+                Poll::Ready(None) => {
+                    self.done = true;
+                    Poll::Ready(None)
+                }
+                Poll::Ready(Some(Ok(chunk))) => {
+                    Poll::Ready(Some(Ok(::hyper::body::Frame::data(chunk))))
+                }
+                Poll::Ready(Some(Err(e))) => {
+                    // Mid-stream failure: erroring the body makes hyper drop
+                    // the connection without a terminating chunk, which is the
+                    // native loop's Disposition::Close for the same case.
+                    self.done = true;
+                    Poll::Ready(Some(Err(e)))
+                }
+            },
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.done
+    }
+
+    fn size_hint(&self) -> ::hyper::body::SizeHint {
+        match &self.body {
+            crate::service::ResponseBody::Empty => ::hyper::body::SizeHint::with_exact(0),
+            crate::service::ResponseBody::Full(b) => {
+                ::hyper::body::SizeHint::with_exact(b.len() as u64)
+            }
+            crate::service::ResponseBody::Stream(_) => ::hyper::body::SizeHint::default(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -200,5 +279,64 @@ mod tests {
         let mut io = body_io(vec![]);
         let r = std::future::poll_fn(|cx| io.poll_send_continue(cx)).await;
         assert!(r.is_ok());
+    }
+
+    use crate::service::{ResponseBody, futures_stream};
+
+    fn poll_out(
+        b: &mut HyperOutBody,
+    ) -> Poll<Option<Result<::hyper::body::Frame<Bytes>, crate::service::BodyError>>> {
+        use ::hyper::body::Body as _;
+        let waker = std::task::Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        Pin::new(b).poll_frame(&mut cx)
+    }
+
+    #[test]
+    fn empty_body_ends_immediately_with_exact_zero_hint() {
+        let mut b = HyperOutBody::new(ResponseBody::Empty);
+        assert!(::hyper::body::Body::is_end_stream(&b));
+        assert_eq!(::hyper::body::Body::size_hint(&b).exact(), Some(0));
+        assert!(matches!(poll_out(&mut b), Poll::Ready(None)));
+    }
+
+    #[test]
+    fn full_body_yields_one_frame_with_exact_hint() {
+        let mut b = HyperOutBody::new(ResponseBody::Full(Bytes::from_static(b"hello")));
+        assert_eq!(::hyper::body::Body::size_hint(&b).exact(), Some(5));
+        let Poll::Ready(Some(Ok(frame))) = poll_out(&mut b) else {
+            panic!("expected a data frame");
+        };
+        assert_eq!(&frame.into_data().unwrap()[..], b"hello");
+        assert!(matches!(poll_out(&mut b), Poll::Ready(None)));
+    }
+
+    #[test]
+    fn stream_body_has_no_exact_hint_so_hyper_chunks_it() {
+        struct Two(u8);
+        impl futures_stream::Stream for Two {
+            fn poll_next(
+                mut self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+            ) -> Poll<Option<Result<Bytes, crate::service::BodyError>>> {
+                self.0 += 1;
+                match self.0 {
+                    1 => Poll::Ready(Some(Ok(Bytes::from_static(b"a")))),
+                    2 => Poll::Ready(Some(Ok(Bytes::from_static(b"b")))),
+                    _ => Poll::Ready(None),
+                }
+            }
+        }
+        let mut b = HyperOutBody::new(ResponseBody::Stream(Box::pin(Two(0))));
+        assert_eq!(::hyper::body::Body::size_hint(&b).exact(), None);
+        let Poll::Ready(Some(Ok(f))) = poll_out(&mut b) else {
+            panic!()
+        };
+        assert_eq!(&f.into_data().unwrap()[..], b"a");
+        let Poll::Ready(Some(Ok(f))) = poll_out(&mut b) else {
+            panic!()
+        };
+        assert_eq!(&f.into_data().unwrap()[..], b"b");
+        assert!(matches!(poll_out(&mut b), Poll::Ready(None)));
     }
 }
