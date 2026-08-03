@@ -35,6 +35,7 @@ default = []
 tls = ["dep:rustls", "dep:tokio-rustls"]
 
 [dev-dependencies]
+cargo-husky = { version = "1.5", default-features = false, features = ["user-hooks"] }
 tokio = { version = "1.52", features = ["rt", "net", "io-util", "time", "sync", "macros", "test-util"] }
 # Self-signed certificates for the TLS dispatch tests. Dev-only: the crate itself
 # never generates certificates.
