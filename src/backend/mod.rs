@@ -41,11 +41,8 @@ pub(crate) trait Backend {
 #[cfg(not(feature = "hyper-backend"))]
 pub(crate) type ActiveBackend = native::NativeBackend;
 
-// Temporary: the hyper backend arrives in a later task. Until then the
-// feature still selects the native loop so every intermediate commit
-// compiles and tests under --features hyper-backend.
 #[cfg(feature = "hyper-backend")]
-pub(crate) type ActiveBackend = native::NativeBackend;
+pub(crate) type ActiveBackend = hyper::HyperBackend;
 
 /// Serve one connection through whichever backend this build selected.
 ///

@@ -6,26 +6,28 @@
 //! dropping hyper's serve future, and so upgrade recovery can hand the
 //! transport back out as a `Box<dyn Transport>`.
 
+use super::{Phase, PhaseClock};
 use bytes::Bytes;
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::io;
 use std::pin::Pin;
 use std::rc::Rc;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
-#[allow(dead_code)]
 pub(crate) struct IoShared<IO> {
     pub(crate) io: IO,
     /// Bytes read before hyper took over (h2c sniff read-ahead). Served first.
     pub(crate) buffered: Bytes,
-    /// Set on every nonzero read: the watchdog's idle -> header signal.
-    pub(crate) saw_bytes: Rc<Cell<bool>>,
+    /// The watchdog's phase clock. A nonzero read while the connection is idle
+    /// is the first byte of a request head, which is exactly the native loop's
+    /// idle -> header transition; signalling it here rather than polling a flag
+    /// keeps the transition prompt even when `idle_timeout < header_timeout`.
+    pub(crate) clock: Rc<PhaseClock>,
 }
 
 impl<IO: AsyncRead + AsyncWrite + Unpin> IoShared<IO> {
     /// Fill `out` from the prepend buffer first, then the transport.
-    #[allow(dead_code)]
     fn poll_read_into(
         &mut self,
         cx: &mut Context<'_>,
@@ -34,32 +36,37 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> IoShared<IO> {
         if !self.buffered.is_empty() {
             let n = self.buffered.len().min(out.remaining());
             out.put_slice(&self.buffered.split_to(n));
-            self.saw_bytes.set(true);
+            self.note_bytes();
             return Poll::Ready(Ok(()));
         }
         let before = out.filled().len();
         let poll = Pin::new(&mut self.io).poll_read(cx, out);
         if matches!(poll, Poll::Ready(Ok(()))) && out.filled().len() > before {
-            self.saw_bytes.set(true);
+            self.note_bytes();
         }
         poll
     }
+
+    /// Move `Idle -> Head` on the first byte of a new request.
+    fn note_bytes(&self) {
+        if self.clock.phase() == Phase::Idle {
+            self.clock.set(Phase::Head);
+        }
+    }
 }
 
-#[allow(dead_code)]
 pub(crate) struct HyperIo<IO>(pub(crate) Rc<RefCell<IoShared<IO>>>);
 
 impl<IO: AsyncRead + AsyncWrite + Unpin> HyperIo<IO> {
-    #[allow(dead_code)]
     pub(crate) fn new(
         io: IO,
         buffered: Bytes,
-        saw_bytes: Rc<Cell<bool>>,
+        clock: Rc<PhaseClock>,
     ) -> (Self, Rc<RefCell<IoShared<IO>>>) {
         let shared = Rc::new(RefCell::new(IoShared {
             io,
             buffered,
-            saw_bytes,
+            clock,
         }));
         (Self(shared.clone()), shared)
     }
@@ -109,7 +116,6 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> ::hyper::rt::Write for HyperIo<IO> {
 
 /// Tokio-flavored view over the same shared state, for upgrade handoff and the
 /// watchdog's post-drop error write.
-#[allow(dead_code)]
 pub(crate) struct SharedIo<IO>(pub(crate) Rc<RefCell<IoShared<IO>>>);
 
 impl<IO: AsyncRead + AsyncWrite + Unpin> AsyncRead for SharedIo<IO> {
@@ -143,15 +149,18 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> AsyncWrite for SharedIo<IO> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::cell::Cell;
     use std::pin::Pin;
     use std::rc::Rc;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+    fn clock() -> Rc<PhaseClock> {
+        Rc::new(PhaseClock::new(Phase::Idle))
+    }
+
     #[tokio::test]
     async fn write_passes_through_and_flushes() {
         let (mut client, server) = tokio::io::duplex(4096);
-        let (io, _shared) = HyperIo::new(server, bytes::Bytes::new(), Rc::new(Cell::new(false)));
+        let (io, _shared) = HyperIo::new(server, bytes::Bytes::new(), clock());
         let mut io = io;
         std::future::poll_fn(|cx| ::hyper::rt::Write::poll_write(Pin::new(&mut io), cx, b"abc"))
             .await
@@ -167,11 +176,7 @@ mod tests {
     #[tokio::test]
     async fn shared_io_reads_and_writes_through_the_same_state() {
         let (mut client, server) = tokio::io::duplex(4096);
-        let (_hyper_io, shared) = HyperIo::new(
-            server,
-            bytes::Bytes::from_static(b"pre"),
-            Rc::new(Cell::new(false)),
-        );
+        let (_hyper_io, shared) = HyperIo::new(server, bytes::Bytes::from_static(b"pre"), clock());
         let mut sio = SharedIo(shared);
         // Prepended bytes come out first.
         let mut buf = [0u8; 3];
@@ -187,5 +192,20 @@ mod tests {
         let mut out = [0u8; 2];
         client.read_exact(&mut out).await.unwrap();
         assert_eq!(&out, b"ok");
+    }
+
+    /// The first byte of a request is the idle -> header transition; the IO
+    /// adapter must report it so the watchdog switches deadlines promptly.
+    #[tokio::test]
+    async fn first_byte_moves_the_clock_from_idle_to_head() {
+        let (mut client, server) = tokio::io::duplex(4096);
+        let c = clock();
+        let (_hyper_io, shared) = HyperIo::new(server, bytes::Bytes::new(), c.clone());
+        let mut sio = SharedIo(shared);
+        assert_eq!(c.phase(), Phase::Idle);
+        client.write_all(b"G").await.unwrap();
+        let mut buf = [0u8; 1];
+        sio.read_exact(&mut buf).await.unwrap();
+        assert_eq!(c.phase(), Phase::Head);
     }
 }

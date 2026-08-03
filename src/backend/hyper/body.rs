@@ -13,9 +13,6 @@ use std::pin::Pin;
 use std::rc::Rc;
 use std::task::{Context, Poll};
 
-// No production caller exists yet (wired in Task 7); keep the type from
-// tripping dead-code lints under `--all-targets` in the meantime.
-#[allow(dead_code)]
 pub(crate) struct HyperBodyIo<B> {
     body: B,
     /// Bytes the `Body` took but did not consume, or pushed back.
@@ -23,7 +20,6 @@ pub(crate) struct HyperBodyIo<B> {
     trailers_slot: Rc<RefCell<Option<HeaderVec>>>,
 }
 
-#[allow(dead_code)] // wired in a later task
 impl<B> HyperBodyIo<B> {
     pub(crate) fn new(body: B, trailers_slot: Rc<RefCell<Option<HeaderVec>>>) -> Self {
         Self {
@@ -109,13 +105,11 @@ where
 /// Framing choice is delegated to hyper via `SizeHint`: exact hints yield
 /// `Content-Length`, the absence of one yields chunked — the same decision
 /// table as the native writer's `OutBody`.
-#[allow(dead_code)] // wired in a later task
 pub(crate) struct HyperOutBody {
     body: crate::service::ResponseBody,
     done: bool,
 }
 
-#[allow(dead_code)] // wired in a later task
 impl HyperOutBody {
     pub(crate) fn new(body: crate::service::ResponseBody) -> Self {
         let done = matches!(body, crate::service::ResponseBody::Empty);

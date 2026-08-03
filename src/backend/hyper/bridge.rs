@@ -13,20 +13,17 @@ use std::pin::Pin;
 use std::rc::Rc;
 
 use super::body::{HyperBodyIo, HyperOutBody};
+use super::{Phase, PhaseClock};
 
 /// Approximate request-line overhead ("METHOD  HTTP/1.1\r\n" scaffolding) for
 /// the cumulative head-bytes cap. The wire-exact cap is enforced by hyper's
 /// `max_buf_size`; this check exists so a head that is *cumulatively* huge
 /// without any single oversized piece is still rejected at 431 parity.
-#[allow(dead_code)] // wired in a later task, via `convert_head`
 const HEAD_OVERHEAD: usize = 26;
 
 /// Convert a hyper request head into the bespoke `Head`, enforcing the parity
 /// checks hyper itself does not (header count, cumulative head bytes,
 /// declared body size). `Err` carries the rejection status.
-// No production caller exists yet (`Bridge` is wired into the connection
-// driver in a later task); keep it from tripping dead-code lints.
-#[allow(dead_code)]
 pub(crate) fn convert_head(
     parts: &::hyper::http::request::Parts,
     limits: &Limits,
@@ -88,24 +85,17 @@ pub(crate) fn convert_head(
 
 /// Adapts an [`H1Service`] to hyper's `Service` trait over `Incoming`
 /// request bodies and [`HyperOutBody`] response bodies.
-///
-/// `phase` (connection-lifecycle coordination for graceful shutdown / the
-/// upgrade handoff) is added in a later task; this bridge only carries what
-/// per-request conversion needs.
-// No production caller exists yet (the connection driver constructs a
-// `Bridge` and passes it to `hyper::server::conn::http1` in a later task);
-// keep it from tripping dead-code lints in the meantime.
-#[allow(dead_code)]
 pub(crate) struct Bridge<S> {
     pub(crate) service: Rc<S>,
     pub(crate) cfg: Rc<ConnConfig>,
     /// Filled only when a 101 on a request that asked for an upgrade goes out.
     pub(crate) upgrade_slot: Rc<RefCell<Option<::hyper::upgrade::OnUpgrade>>>,
     pub(crate) sent_101: Rc<Cell<bool>>,
+    /// The watchdog's phase clock: `Handler` while the handler runs, back to
+    /// `Idle` once a response is ready to go out.
+    pub(crate) phase: Rc<PhaseClock>,
 }
 
-// wired in a later task, along with `Bridge` itself
-#[allow(dead_code)]
 type BridgeResponse = ::hyper::http::Response<HyperOutBody>;
 
 impl<S: H1Service + 'static>
@@ -120,21 +110,31 @@ impl<S: H1Service + 'static>
         let cfg = self.cfg.clone();
         let upgrade_slot = self.upgrade_slot.clone();
         let sent_101 = self.sent_101.clone();
+        let phase = self.phase.clone();
 
         Box::pin(async move {
+            // The head is parsed by the time hyper calls us: everything from
+            // here to the response is the native loop's handler/body window.
+            phase.set(Phase::Handler);
             let on_upgrade = ::hyper::upgrade::on(&mut req);
             let (parts, incoming) = req.into_parts();
 
             let head = match convert_head(&parts, &cfg.limits) {
                 Ok(h) => h,
-                Err(status) => return Ok(reject(status)),
+                Err(status) => {
+                    phase.set(Phase::Idle);
+                    return Ok(reject(status));
+                }
             };
 
             // Reuse the bespoke framing decision table so anything hyper let
             // through is still rejected exactly where the native stack would.
             let kind = match crate::framing::decide(&head, &cfg.limits) {
                 Ok(k) => k,
-                Err(e) => return Ok(reject(e.status())),
+                Err(e) => {
+                    phase.set(Phase::Idle);
+                    return Ok(reject(e.status()));
+                }
             };
 
             let wants_upgrade =
@@ -171,6 +171,9 @@ impl<S: H1Service + 'static>
             // parity wins: force close.
             let force_close = !upgrading && !fully_read.get();
 
+            // The handler window is over. Response writing is hyper's; the
+            // watchdog treats it as idle (see BACKENDS.md on write_timeout).
+            phase.set(Phase::Idle);
             Ok(convert_response(resp, &cfg, force_close))
         })
     }
@@ -178,7 +181,6 @@ impl<S: H1Service + 'static>
 
 /// An empty rejection response that also closes the connection, matching the
 /// native rule that any framing rejection closes.
-#[allow(dead_code)] // wired in a later task
 fn reject(status: u16) -> BridgeResponse {
     let mut r = ::hyper::http::Response::builder()
         .status(::hyper::http::StatusCode::from_u16(status).expect("known status"))
@@ -191,7 +193,6 @@ fn reject(status: u16) -> BridgeResponse {
     r
 }
 
-#[allow(dead_code)] // wired in a later task
 fn convert_response(
     resp: crate::service::Response,
     cfg: &ConnConfig,
