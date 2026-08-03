@@ -6,7 +6,7 @@
 //! date caches and service state safe to keep non-atomic.
 
 use crate::Limits;
-use crate::conn::{ConnConfig, Connection};
+use crate::conn::ConnConfig;
 use crate::service::{H1Service, Transport};
 use crate::tls::{H2Fallback, Preface, is_h2c_preface};
 use crate::write::DateCache;
@@ -227,8 +227,10 @@ impl Server {
     /// to route them somewhere instead.
     ///
     /// A connection a handler upgrades with status 101 is *also* closed: there
-    /// is no upgrade-consumer hook here. Drive [`Connection`] yourself and take
-    /// the `Upgraded` from [`Connection::serve`] if you need the raw socket.
+    /// is no upgrade-consumer hook here. Drive [`Connection`](crate::conn::Connection)
+    /// yourself and take the `Upgraded` from
+    /// [`Connection::serve`](crate::conn::Connection::serve) if you need the raw
+    /// socket.
     ///
     /// `make` runs once per worker thread to produce that worker's service. Note
     /// the bounds: the *factory* is `Send`, because it crosses thread boundaries
@@ -465,7 +467,6 @@ async fn serve_h1<IO, S>(
     IO: AsyncRead + AsyncWrite + Unpin + 'static,
     S: H1Service + 'static,
 {
-    let conn = Connection::with_buffered(io, RcService(service), conn_cfg, date, buffered);
     // A clean close and an I/O error are the same outcome here: the connection is
     // over and there is nobody left to tell.
     //
@@ -475,7 +476,9 @@ async fn serve_h1<IO, S>(
     // and take the `Upgraded` from `Connection::serve`. Closing is the honest
     // outcome for a handoff this server cannot complete; the alternative is to
     // leave a socket open that nothing will ever read.
-    if let Ok(Some(upgraded)) = conn.serve().await {
+    if let Ok(Some(upgraded)) =
+        crate::backend::serve_connection(io, service, conn_cfg, date, buffered).await
+    {
         drop(upgraded);
     }
 }
@@ -494,18 +497,6 @@ impl H2Fallback for CloseH2 {
             drop(buffered);
             drop(io);
         })
-    }
-}
-
-/// Shares one service across every connection on a worker.
-struct RcService<S>(Rc<S>);
-
-impl<S: H1Service> H1Service for RcService<S> {
-    type Future = S::Future;
-
-    #[inline]
-    fn call(&self, req: crate::Request) -> Self::Future {
-        self.0.call(req)
     }
 }
 

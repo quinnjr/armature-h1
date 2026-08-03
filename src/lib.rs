@@ -15,6 +15,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+mod backend;
 mod bytestr;
 pub mod chunked;
 pub mod conn;
@@ -30,6 +31,7 @@ pub mod service;
 pub mod tls;
 pub mod write;
 
+pub use backend::serve_connection;
 pub use bytestr::ByteStr;
 pub use chunked::{ChunkEvent, ChunkedDecoder, ChunkedError};
 pub use conn::{ConnConfig, Connection, Disposition};
