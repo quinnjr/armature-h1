@@ -272,7 +272,12 @@ impl Body {
         fully_read: Rc<Cell<bool>>,
         trailers_slot: Rc<RefCell<Option<HeaderVec>>>,
     ) -> Self {
-        let done = matches!(kind, BodyKind::None);
+        // `Length(0)` is already exhausted, exactly as in `new` above
+        // (`n == 0`). Treating it as unread would leave `fully_read` false for a
+        // handler that never touched the body of an explicit
+        // `Content-Length: 0` request, and the bridge would force a close where
+        // the native loop reuses the connection.
+        let done = matches!(kind, BodyKind::None | BodyKind::Length(0));
         fully_read.set(done);
         Self {
             state: BodyState {

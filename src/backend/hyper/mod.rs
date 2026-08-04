@@ -440,12 +440,23 @@ mod tests {
     where
         S: crate::H1Service + 'static,
     {
+        exchange_with_cfg(input, service, cfg(limits)).await
+    }
+
+    async fn exchange_with_cfg<S>(
+        input: &'static [u8],
+        service: S,
+        config: Rc<ConnConfig>,
+    ) -> String
+    where
+        S: crate::H1Service + 'static,
+    {
         let (mut client, server) = tokio::io::duplex(64 * 1024);
         let local = tokio::task::LocalSet::new();
         let task = local.spawn_local(HyperBackend::serve(
             server,
             Rc::new(service),
-            cfg(limits),
+            config,
             Rc::new(RefCell::new(DateCache::new())),
             Bytes::new(),
         ));
@@ -794,6 +805,13 @@ mod tests {
     /// out with no `Connection` at all where native emits one. The native
     /// writer's `emitted` applies the same writability filter for the same
     /// reason.
+    ///
+    /// The case has to be a *keep-alive* one to discriminate: under a forced
+    /// close the bridge drops any handler `Connection` before the
+    /// `HeaderValue` conversion is reached, so the value's validity never
+    /// matters. HTTP/1.0 + keep-alive is the shape where the bridge owes a
+    /// field of its own (`connection: keep-alive`) that a wrongly-latched
+    /// `has_connection` would suppress.
     #[tokio::test]
     async fn an_invalid_handler_connection_header_does_not_suppress_ours() {
         async fn bad(_req: Request) -> Response {
@@ -803,17 +821,69 @@ mod tests {
             )
         }
         let out = exchange(
-            b"POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\n\r\nhelloGET / HTTP/1.1\r\nHost: a\r\n\r\n",
+            b"GET / HTTP/1.0\r\nHost: a\r\nConnection: keep-alive\r\n\r\n",
             bad,
             Limits::default(),
         )
         .await;
         assert!(
-            out.to_ascii_lowercase().contains("connection: close"),
+            out.to_ascii_lowercase().contains("connection: keep-alive"),
             "an unwritable handler field must not leave the response without \
              one: {out}"
         );
-        assert_eq!(out.matches("HTTP/1.1").count(), 1, "{out}");
+    }
+
+    /// The `has_server` half of the same rule: a handler `Server` value hyper
+    /// rejects must not suppress the configured `server_name`.
+    #[tokio::test]
+    async fn an_invalid_handler_server_header_does_not_suppress_the_configured_one() {
+        async fn bad(_req: Request) -> Response {
+            Response::status_only(200)
+                .header(crate::HeaderId::Server, Bytes::from_static(b"ba\r\nd"))
+        }
+        let config = Rc::new(ConnConfig {
+            limits: quick(Limits::default()),
+            tick: Duration::from_millis(10),
+            server_name: Some(Bytes::from_static(b"armature")),
+        });
+        let out = exchange_with_cfg(
+            b"GET / HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n",
+            bad,
+            config,
+        )
+        .await;
+        assert!(
+            out.to_ascii_lowercase().contains("server: armature"),
+            "{out}"
+        );
+        assert!(!out.contains("ba\r\nd"), "{out}");
+    }
+
+    /// An explicit `Content-Length: 0` body is already exhausted, so a handler
+    /// that never reads it has still "fully read" it and the connection is
+    /// reusable — as it is under the native loop, whose constructor treats
+    /// `Length(0)` as done. Before `from_backend` agreed, this forced a close
+    /// and the pipelined follow-up went unanswered.
+    #[tokio::test]
+    async fn an_unread_content_length_zero_body_still_allows_reuse() {
+        async fn ignore(_req: Request) -> Response {
+            Response::status_only(204)
+        }
+        let out = exchange(
+            b"POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 0\r\n\r\nGET / HTTP/1.1\r\nHost: a\r\n\r\n",
+            ignore,
+            Limits::default(),
+        )
+        .await;
+        assert_eq!(
+            out.matches("HTTP/1.1 204").count(),
+            2,
+            "an already-exhausted body must not force a close: {out}"
+        );
+        assert!(
+            !out.to_ascii_lowercase().contains("connection: close"),
+            "{out}"
+        );
     }
 
     /// The body-phase 408 carries the request's version, as the native loop's
