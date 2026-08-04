@@ -1,13 +1,13 @@
 [package]
 name = "armature-h1"
 version = "0.1.0"
-edition.workspace = true
-rust-version.workspace = true
+edition = "2024"
+rust-version = "1.94.1"
 autobenches = false  # Disable auto-discovery, use explicit [[bench]] only
-authors.workspace = true
-license.workspace = true
+authors = ["Joseph Quinn <quinn.josephr@proton.me>"]
+license = "Apache-2.0"
 repository = "https://github.com/quinnjr/armature-h1"
-homepage.workspace = true
+homepage = "https://quinnjr.github.io/armature"
 description = "Zero-allocation thread-per-core HTTP/1.1 server for the Armature framework"
 keywords = ["http", "server", "http1", "performance", "async"]
 categories = ["web-programming::http-server", "asynchronous", "network-programming"]

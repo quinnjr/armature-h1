@@ -1,0 +1,45 @@
+name: Fuzz
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fuzz:
+    name: fuzz ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [parse_head, chunked, framing_differential]
+    steps:
+      - uses: actions/checkout@v4
+      # cargo-fuzz needs nightly: the sanitizer and coverage instrumentation
+      # libFuzzer relies on are nightly-only. `clippy` is requested explicitly
+      # because this action installs the minimal profile, which omits it.
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+      - run: cargo install cargo-fuzz --locked
+      # `fuzz/` is its own workspace, so the crate's own clippy run never sees
+      # it. Without this the harnesses are the one part of the tree outside the
+      # lint gate.
+      - run: cargo clippy --manifest-path fuzz/Cargo.toml --all-targets -- -D warnings
+      - name: Fuzz ${{ matrix.target }} for 60s
+        run: cargo fuzz run ${{ matrix.target }} -- -max_total_time=60 -print_final_stats=1
+      # The crash file is the reproducer. Without it the log line naming the
+      # input is all that survives the runner, and re-finding it costs a run.
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts-${{ matrix.target }}
+          path: fuzz/artifacts/
+          if-no-files-found: ignore

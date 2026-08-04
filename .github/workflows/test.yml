@@ -1,0 +1,42 @@
+name: Test
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: test (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Explicit rows, not --all-features: a combo that stops being listed
+        # here stops being tested, visibly.
+        include:
+          - { name: default, flags: "" }
+          - { name: tls, flags: "--features tls" }
+          - { name: hyper-backend, flags: "--features hyper-backend" }
+          - { name: hyper-backend-tls, flags: "--features hyper-backend,tls" }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test ${{ matrix.flags }}
+
+  msrv:
+    name: MSRV 1.94.1
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.94.1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: msrv
+      # `--all-targets` without `--all-features`: the MSRV claim is about the
+      # crate as published with its defaults, not about every optional feature.
+      - run: cargo check --all-targets

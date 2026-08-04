@@ -1,0 +1,25 @@
+name: Benchmark
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  bench:
+    name: benches compile and run once
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: bench
+      # `-- --test` runs each benchmark once instead of timing it. A shared CI
+      # runner cannot produce a number worth comparing, so this guards against
+      # the thing that actually rots: a benchmark that stops compiling or starts
+      # panicking because the API moved under it.
+      - run: cargo bench --all-features -- --test
