@@ -13,7 +13,7 @@ jobs:
     name: benches compile and run once
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -22,4 +22,10 @@ jobs:
       # runner cannot produce a number worth comparing, so this guards against
       # the thing that actually rots: a benchmark that stops compiling or starts
       # panicking because the API moved under it.
-      - run: cargo bench --all-features -- --test
+      - run: cargo bench --bench parse -- --test
+      - run: cargo bench --bench write -- --test
+      - run: cargo bench --bench e2e -- --test
+      # `serve_connection` exists specifically so `e2e` is a real A/B harness
+      # between the native loop and the hyper backend; without this the hyper
+      # side of that comparison never executes anywhere in CI.
+      - run: cargo bench --features hyper-backend --bench e2e -- --test

@@ -17,7 +17,7 @@ jobs:
       matrix:
         target: [parse_head, chunked, framing_differential]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       # cargo-fuzz needs nightly: the sanitizer and coverage instrumentation
       # libFuzzer relies on are nightly-only. `clippy` is requested explicitly
       # because this action installs the minimal profile, which omits it.
@@ -41,5 +41,39 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: fuzz-artifacts-${{ matrix.target }}
+          path: fuzz/artifacts/
+          if-no-files-found: ignore
+
+  # `backend_differential` drives two runtimes (the native loop and hyper's)
+  # per case, with 80ms deadlines on each, so its execs/sec is far below the
+  # pure-parsing targets above. Giving it its own job — rather than a matrix
+  # row judged against the parser rows' 60s budget — means a slow-but-healthy
+  # run doesn't read like a stall, and it gets a longer time budget to
+  # compensate for the lower throughput.
+  fuzz_backend_differential:
+    name: fuzz backend_differential
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+      - run: cargo install cargo-fuzz --locked
+      # `hyper-backend` is a passthrough feature on the fuzz crate (see
+      # fuzz/Cargo.toml): only this target needs the hyper-enabled build, so
+      # only this job pays for it — and only this job's clippy run needs the
+      # feature on to see `backend_differential` at all (its `required-features`
+      # makes `--all-targets` skip it otherwise).
+      - run: cargo clippy --manifest-path fuzz/Cargo.toml --all-targets --features hyper-backend -- -D warnings
+      - name: Fuzz backend_differential for 300s
+        run: cargo fuzz run backend_differential --features hyper-backend -- -max_total_time=300 -print_final_stats=1
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts-backend_differential
           path: fuzz/artifacts/
           if-no-files-found: ignore

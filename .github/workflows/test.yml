@@ -23,16 +23,36 @@ jobs:
           - { name: hyper-backend, flags: "--features hyper-backend" }
           - { name: hyper-backend-tls, flags: "--features hyper-backend,tls" }
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test ${{ matrix.flags }}
+      # These tests are ignored under `hyper-backend` because they encode a
+      # documented BACKENDS.md divergence and FAIL by design today — the
+      # steady state is red-but-ignored. The event worth catching is the
+      # opposite: one of them starts passing, which means hyper gained a hook
+      # a BACKENDS.md row assumed did not exist. A bare `!cargo test` would
+      # also fire on a compile error, which is a different failure with a
+      # different fix, so the summary line is checked first to tell the two
+      # apart.
+      - name: fail if a hyper-backend divergence probe unexpectedly passes (see BACKENDS.md)
+        if: contains(matrix.flags, 'hyper-backend')
+        run: |
+          cargo test ${{ matrix.flags }} --test rfc9112 -- --ignored --format pretty | tee ignored-probes.log || true
+          if ! grep -q '^test result:' ignored-probes.log; then
+            echo "::error::ignored-divergence probes produced no test summary — this is a build or harness failure, not a probe result"
+            exit 1
+          fi
+          if grep -qE '^test .* \.\.\. ok$' ignored-probes.log; then
+            echo "::error::an ignored hyper-backend divergence probe PASSED — hyper gained a hook a BACKENDS.md row assumed did not exist. Update BACKENDS.md and un-ignore the test."
+            exit 1
+          fi
 
   msrv:
     name: MSRV 1.94.1
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@1.94.1
       - uses: Swatinem/rust-cache@v2
         with:
