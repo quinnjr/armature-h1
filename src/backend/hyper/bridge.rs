@@ -57,6 +57,14 @@ pub(crate) fn convert_head(
         cumulative += name.as_str().len() + value.as_bytes().len() + 4;
         let id = HeaderId::from_bytes(name.as_str().as_bytes())
             .unwrap_or_else(|| header::intern(name.as_str()));
+        // Read, not validated: hyper has already parsed and checked this field
+        // (rejecting a non-numeric, negative or conflicting `Content-Length`
+        // during head parsing and writing its own `400`), so a value reaching
+        // here is well-formed. This is only where the *declared* size is
+        // recovered for the `max_body_bytes` check below, and a parse that
+        // somehow fails simply leaves the check to the body reader. The `trim`
+        // is defensive against surrounding whitespace, not an enforcement
+        // point.
         if id == HeaderId::ContentLength
             && let Ok(s) = std::str::from_utf8(value.as_bytes())
             && let Ok(n) = s.trim().parse::<u64>()
@@ -166,6 +174,10 @@ impl<S: H1Service + 'static>
             // whose response defaulted to 1.1 would both mislabel the status
             // line and let hyper apply 1.1 framing (chunked) to a 1.0 peer.
             let version = head.version;
+            // Also captured before the move: hyper forces `Encoder::length(0)`
+            // for a `HEAD` response and never polls the response body, so the
+            // body's own end-of-stream signal can never arrive. See below.
+            let is_head_request = head.method == Method::Head;
             // hyper only keeps a 1.0 connection alive if the response says so
             // explicitly, and the native writer emits exactly this field for
             // the same case (`write::write_head`, Http10 + keep_alive).
@@ -199,9 +211,21 @@ impl<S: H1Service + 'static>
             // parity wins: force close.
             let force_close = !upgrading && !fully_read.get();
 
-            // The handler window is over. Response writing is hyper's; the
-            // watchdog treats it as idle (see BACKENDS.md on write_timeout).
+            // The handler window is over. Response writing is hyper's, under
+            // `write_timeout` (see BACKENDS.md on write_timeout granularity).
             phase.set(Phase::Write);
+            // For a `HEAD` response hyper writes the head and closes the
+            // message out without ever polling the body, so `HyperOutBody`
+            // would never report end-of-stream and the clock would never leave
+            // `Phase::Write` — parking a keep-alive connection under
+            // `write_timeout` instead of `idle_timeout`. hyper's behaviour here
+            // is guaranteed (it forces a zero-length encoder for `HEAD`), so
+            // signalling end-of-stream on its behalf is exact, not a guess.
+            // Must follow `set(Phase::Write)`: entering `Handler` or `Idle`
+            // clears the flag.
+            if is_head_request {
+                phase.note_body_end();
+            }
             Ok(convert_response(
                 resp,
                 &cfg,

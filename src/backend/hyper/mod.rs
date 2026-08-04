@@ -9,12 +9,12 @@
 //! reproduces the native reaction to each expiry.
 //!
 //! The reconstruction is exact for `idle_timeout`, `header_timeout` and
-//! `body_timeout`. Where it is not — `write_timeout` granularity, the keep-alive
-//! wait after a `HEAD` response, a pipelined head arriving mid-write — and for
-//! every non-timing divergence (hyper's parser permissiveness, its own status
-//! choices for heads it rejects, the `max_buf_size` floor under
-//! `max_head_bytes`), BACKENDS.md is the exhaustive list, with the reason each
-//! one cannot be shimmed. Every `#[cfg_attr(feature = "hyper-backend", ignore)]`
+//! `body_timeout`. Where it is not — `write_timeout` granularity, a pipelined
+//! head arriving mid-write — and for every non-timing divergence (hyper's
+//! parser permissiveness, its own status choices for heads it rejects, the
+//! `max_buf_size` floor under `max_head_bytes`, its status-code type),
+//! BACKENDS.md is the exhaustive list, with the reason each one cannot be
+//! shimmed. Every `#[cfg_attr(feature = "hyper-backend", ignore)]`
 //! in the test suite points at a row there.
 
 pub(crate) mod body;
@@ -63,10 +63,18 @@ pub(crate) enum Phase {
 pub(crate) struct PhaseClock {
     phase: Cell<Phase>,
     generation: Cell<u64>,
-    /// Whether any byte of the current response has reached the transport.
-    /// Set on every nonzero write, reset whenever a fresh response begins.
-    /// Gates the bare-408 write: bytes already on the wire mean a 408 would be
-    /// spliced into a response the peer is mid-parse of.
+    /// Whether any byte of the current *final* response has reached the
+    /// transport. Set on every nonzero write taken in [`Phase::Write`], reset
+    /// whenever a fresh response begins. Gates the bare-408 write: bytes of a
+    /// final response already on the wire mean a 408 would be spliced into a
+    /// message the peer is mid-parse of.
+    ///
+    /// Writes taken in any other phase are *interim* — hyper's eager
+    /// `100 Continue` is the only one this crate can produce — and must not
+    /// latch the flag: an interim response is explicitly followed by a final
+    /// one, so a 408 after it is correct framing, and it is what the native
+    /// loop writes (`conn.rs`, the `write_error(version, 408)` after the
+    /// handler-phase deadline, which is unconditional).
     wrote_bytes: Cell<bool>,
     /// Whether the current response body has reported end-of-stream. Half of
     /// the "response finished" signal; the other half is a drained write
@@ -116,12 +124,16 @@ impl PhaseClock {
 
     /// Record that bytes reached the transport, re-arming a write deadline.
     ///
-    /// Only [`Phase::Write`] re-arms: elsewhere the write is a `100-continue`
-    /// or hyper's own error response, neither of which should extend the
-    /// header or body deadline it happened under.
+    /// Only [`Phase::Write`] counts, for both effects. Elsewhere the write is
+    /// an interim `100 Continue` or hyper's own error response: neither should
+    /// extend the header or body deadline it happened under, and neither is a
+    /// message a later bare 408 could be spliced *into*. The bridge enters
+    /// [`Phase::Write`] before it hands the response back — on the success path
+    /// and on both rejection paths — so every byte of a final response is taken
+    /// under this phase.
     pub(crate) fn note_write(&self) {
-        self.wrote_bytes.set(true);
         if self.phase.get() == Phase::Write {
+            self.wrote_bytes.set(true);
             self.bump();
         }
     }
@@ -317,9 +329,10 @@ impl Backend for HyperBackend {
                     Phase::Handler => req_version.get(),
                     _ => Version::Http11,
                 };
-                // Unless something already went out for this response — a
-                // `100-continue`, or a response hyper is mid-write of. Appending
-                // a 408 to those corrupts the framing.
+                // Unless bytes of a *final* response are already on the wire,
+                // which a 408 would be spliced into. An interim `100 Continue`
+                // does not count: it is defined to be followed by a final
+                // response, and native writes the 408 after one too.
                 if !clock.wrote_bytes() {
                     write_error_close(&shared, &date, version, 408).await;
                 }
@@ -619,6 +632,88 @@ mod tests {
         )
         .await;
         assert!(out.starts_with("HTTP/1.1 408"), "{out}");
+    }
+
+    /// hyper answers `Expect: 100-continue` eagerly, at head-parse time. The
+    /// interim response must not suppress the body-phase 408: an interim
+    /// response is *defined* to be followed by a final one, so `100` then `408`
+    /// is correct framing, and it is exactly what the native loop writes (its
+    /// handler-phase `write_error(version, 408)` is unconditional).
+    ///
+    /// Discriminating: with `wrote_bytes` latched on any write rather than only
+    /// on writes taken in `Phase::Write`, hyper's eager `100` sets the flag and
+    /// the connection closes silently where native answers.
+    #[tokio::test]
+    async fn an_interim_100_continue_does_not_suppress_the_body_timeout_408() {
+        let limits = Limits {
+            body_timeout: Duration::from_millis(100),
+            ..Default::default()
+        };
+        // A declared body that never arrives, after an `Expect` hyper answers.
+        let out = exchange(
+            b"POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\nExpect: 100-continue\r\n\r\n",
+            echo,
+            limits,
+        )
+        .await;
+        assert!(
+            out.starts_with("HTTP/1.1 100 Continue"),
+            "hyper answers the Expect eagerly: {out:?}"
+        );
+        assert!(
+            out.contains("HTTP/1.1 408"),
+            "the interim response must not suppress the 408: {out:?}"
+        );
+    }
+
+    /// hyper never polls a `HEAD` response's body, so the body's own
+    /// end-of-stream can never fire and the clock would stay in `Phase::Write`
+    /// forever — parking the keep-alive wait under `write_timeout` (30s) rather
+    /// than `idle_timeout`. The bridge signals end-of-stream on hyper's behalf;
+    /// this checks the connection really does return to `Phase::Idle`.
+    #[tokio::test]
+    async fn a_head_response_returns_the_connection_to_the_idle_deadline() {
+        async fn head_hello(_req: Request) -> Response {
+            // A non-empty body, so nothing else could report end-of-stream:
+            // `HyperOutBody::new` only pre-marks empty bodies as done.
+            Response::text("hi")
+        }
+        let started = tokio::time::Instant::now();
+        // idle_timeout is 200ms (via `quick`), write_timeout the 30s default.
+        let out = exchange(
+            b"HEAD / HTTP/1.1\r\nHost: a\r\n\r\n",
+            head_hello,
+            Limits::default(),
+        )
+        .await;
+        assert!(out.starts_with("HTTP/1.1 200 OK"), "{out:?}");
+        assert!(
+            !out.ends_with("hi"),
+            "a HEAD response carries no body: {out:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(1500),
+            "closed after {:?}, so the connection never left Phase::Write",
+            started.elapsed()
+        );
+    }
+
+    /// The same shim, asserted structurally rather than by timing: a keep-alive
+    /// `HEAD` must leave the connection reusable for a pipelined follow-up.
+    #[tokio::test]
+    async fn a_head_response_keeps_the_connection_reusable() {
+        let out = exchange(
+            b"HEAD / HTTP/1.1\r\nHost: a\r\n\r\nGET / HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n",
+            hello,
+            Limits::default(),
+        )
+        .await;
+        assert_eq!(
+            out.matches("HTTP/1.1 200 OK").count(),
+            2,
+            "the follow-up request must be served too: {out:?}"
+        );
+        assert!(out.ends_with("hi"), "only the GET carries a body: {out:?}");
     }
 
     /// hyper writes the status line — and picks its framing — from the

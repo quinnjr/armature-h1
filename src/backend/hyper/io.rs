@@ -39,8 +39,13 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> IoShared<IO> {
     ) -> Poll<io::Result<()>> {
         if !self.buffered.is_empty() {
             let n = self.buffered.len().min(out.remaining());
-            out.put_slice(&self.buffered.split_to(n));
-            self.note_read();
+            // A zero-remaining `ReadBuf` moves nothing, so it is not the
+            // "first byte of a request" the phase transition is about; the
+            // transport read below applies the same `> before` rule.
+            if n > 0 {
+                out.put_slice(&self.buffered.split_to(n));
+                self.note_read();
+            }
             return Poll::Ready(Ok(()));
         }
         let before = out.filled().len();
