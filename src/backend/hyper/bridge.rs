@@ -94,6 +94,10 @@ pub(crate) struct Bridge<S> {
     /// The watchdog's phase clock: `Handler` while the handler runs, `Write`
     /// once a response is handed to hyper.
     pub(crate) phase: Rc<PhaseClock>,
+    /// The version of the request being served, for the bare 408 the watchdog
+    /// writes on a body-phase expiry: the native loop echoes the request's
+    /// version there (`conn.rs`, `write_error(version, 408)`).
+    pub(crate) req_version: Rc<Cell<Version>>,
 }
 
 type BridgeResponse = ::hyper::http::Response<HyperOutBody>;
@@ -111,11 +115,18 @@ impl<S: H1Service + 'static>
         let upgrade_slot = self.upgrade_slot.clone();
         let sent_101 = self.sent_101.clone();
         let phase = self.phase.clone();
+        let req_version = self.req_version.clone();
 
         Box::pin(async move {
             // The head is parsed by the time hyper calls us: everything from
             // here to the response is the native loop's handler/body window.
             phase.set(Phase::Handler);
+            // Recorded before anything can fail so a 408 raised anywhere in
+            // this window carries the request's version, as native's does.
+            req_version.set(match req.version() {
+                ::hyper::http::Version::HTTP_10 => Version::Http10,
+                _ => Version::Http11,
+            });
             let on_upgrade = ::hyper::upgrade::on(&mut req);
             let (parts, incoming) = req.into_parts();
 
@@ -264,11 +275,15 @@ fn convert_response(
     let mut has_server = false;
     let mut has_connection = false;
     for (id, value) in headers.into_iter() {
-        if id == HeaderId::Server {
-            has_server = true;
-        }
-        if id == HeaderId::Connection {
-            has_connection = true;
+        // A forced close is not the handler's field to override here. hyper
+        // decides whether to reuse the connection from the response's
+        // `Connection` field, so honouring a handler `keep-alive` on a request
+        // whose body went unread would reuse a connection the native loop
+        // closes unconditionally (it closes on `body_consumed` regardless of
+        // what the handler wrote). Dropping the handler's value is the only
+        // lever the bridge has over hyper's accounting.
+        if id == HeaderId::Connection && !keep_alive {
+            continue;
         }
         let Ok(name) = ::hyper::http::HeaderName::from_bytes(id.as_str().as_bytes()) else {
             continue;
@@ -276,6 +291,16 @@ fn convert_response(
         let Ok(value) = ::hyper::http::HeaderValue::from_maybe_shared(value) else {
             continue;
         };
+        // Only a field that survived validation suppresses the one below: the
+        // native writer's `emitted` applies the same writability filter, so a
+        // handler value hyper rejects must not leave the response with no
+        // `Connection` field at all.
+        if id == HeaderId::Server {
+            has_server = true;
+        }
+        if id == HeaderId::Connection {
+            has_connection = true;
+        }
         builder = builder.header(name, value);
     }
     if !has_server

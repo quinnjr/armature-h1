@@ -8,37 +8,14 @@
 //! advance, and a watchdog future that races hyper's connection future and
 //! reproduces the native reaction to each expiry.
 //!
-//! Known timing divergences, for BACKENDS.md:
-//!
-//! - **`write_timeout` is per response, not per flush.** Native re-arms it on
-//!   every flush; here it is re-armed on every byte that reaches the transport,
-//!   which is finer-grained, and the response is considered finished when the
-//!   body reports end-of-stream *and* a flush succeeds — the only "done" moment
-//!   observable from outside hyper.
-//! - **A response to a `HEAD` request never leaves [`Phase::Write`].** hyper
-//!   forces `Encoder::length(0)` for `HEAD` and never polls the body, so
-//!   `note_body_end` does not fire and the completion signal never completes.
-//!   The connection is then bounded by `write_timeout` rather than
-//!   `idle_timeout` while it waits for the next request — measured at the full
-//!   30s default, where native would have waited 75s. Benign: the wait is still
-//!   bounded, it is *shorter* than native's, and the close is silent either
-//!   way. But live, not hypothetical. Same shape for any future case where
-//!   hyper finishes a message without draining its body.
-//! - **The head of a pipelined request does not re-phase a response in flight.**
-//!   Native arms `header_timeout` from the first byte of a head; here, bytes
-//!   that arrive while a response is being written leave the phase at `Write`,
-//!   because `Write -> Head` would put `header_timeout` over the remainder of a
-//!   perfectly healthy stream and kill it. Such a head is bounded by
-//!   `write_timeout` — still bounded, still slowloris-safe. (A head that
-//!   arrives *after* a response completes is not affected: the connection is
-//!   back in `Idle` by then, so `Idle -> Head` fires and `header_timeout`
-//!   applies exactly as native.)
-//! - **`write_timeout` expiry closes silently, and so does any expiry after
-//!   bytes have gone out for the current response.** Native writes nothing on a
-//!   write stall; splicing a bare 408 into a half-written body would corrupt
-//!   the framing the peer is already parsing.
-//! - `max_head_bytes` below hyper's 8 KiB `max_buf_size` floor is enforced only
-//!   by the cumulative check in `bridge::convert_head`, not on the wire.
+//! The reconstruction is exact for `idle_timeout`, `header_timeout` and
+//! `body_timeout`. Where it is not — `write_timeout` granularity, the keep-alive
+//! wait after a `HEAD` response, a pipelined head arriving mid-write — and for
+//! every non-timing divergence (hyper's parser permissiveness, its own status
+//! choices for heads it rejects, the `max_buf_size` floor under
+//! `max_head_bytes`), BACKENDS.md is the exhaustive list, with the reason each
+//! one cannot be shimmed. Every `#[cfg_attr(feature = "hyper-backend", ignore)]`
+//! in the test suite points at a row there.
 
 pub(crate) mod body;
 pub(crate) mod bridge;
@@ -212,6 +189,7 @@ async fn watchdog(clock: &PhaseClock, limits: &Limits, deadline: &mut ConnDeadli
 async fn write_error_close<IO: AsyncRead + AsyncWrite + Unpin>(
     shared: &Rc<RefCell<IoShared<IO>>>,
     date: &Rc<RefCell<DateCache>>,
+    version: Version,
     status: u16,
 ) {
     let mut out = bytes::BytesMut::new();
@@ -220,7 +198,7 @@ async fn write_error_close<IO: AsyncRead + AsyncWrite + Unpin>(
         let date_bytes = date.get(std::time::SystemTime::now());
         write::write_head(
             &mut out,
-            Version::Http11,
+            version,
             &ResponseHead {
                 status,
                 headers: HeaderVec::new(),
@@ -269,12 +247,14 @@ impl Backend for HyperBackend {
         let (hyper_io, shared) = HyperIo::new(io, buffered, clock.clone());
         let upgrade_slot = Rc::new(RefCell::new(None));
         let sent_101 = Rc::new(Cell::new(false));
+        let req_version = Rc::new(Cell::new(Version::Http11));
         let bridge = Bridge {
             service,
             cfg: cfg.clone(),
             upgrade_slot: upgrade_slot.clone(),
             sent_101: sent_101.clone(),
             phase: clock.clone(),
+            req_version: req_version.clone(),
         };
 
         let mut builder = ::hyper::server::conn::http1::Builder::new();
@@ -327,14 +307,21 @@ impl Backend for HyperBackend {
                 Ok(None)
             }
             // Header/body expiry: native writes a bare 408 and closes.
-            Err(Phase::Head | Phase::Handler) => {
+            Err(phase @ (Phase::Head | Phase::Handler)) => {
                 // Release hyper's borrow of the shared IO before writing.
                 drop(conn);
+                // Native answers a head it never finished parsing in 1.1 (it
+                // has no version to echo yet) and a body-phase timeout in the
+                // request's own version.
+                let version = match phase {
+                    Phase::Handler => req_version.get(),
+                    _ => Version::Http11,
+                };
                 // Unless something already went out for this response — a
                 // `100-continue`, or a response hyper is mid-write of. Appending
                 // a 408 to those corrupts the framing.
                 if !clock.wrote_bytes() {
-                    write_error_close(&shared, &date, 408).await;
+                    write_error_close(&shared, &date, version, 408).await;
                 }
                 Ok(None)
             }
@@ -770,5 +757,80 @@ mod tests {
             1,
             "unread body must not enable reuse: {out}"
         );
+    }
+
+    /// hyper reads keep-alive off the response's `Connection` field, so a
+    /// handler that sets one must not be able to keep a connection the native
+    /// loop closes unconditionally on an unread body. Before the bridge dropped
+    /// the handler's field under a forced close, hyper drained the small body
+    /// and served the pipelined request too.
+    #[tokio::test]
+    async fn a_handler_connection_header_cannot_defeat_the_unread_body_close() {
+        async fn ignore(_req: Request) -> Response {
+            Response::status_only(404).header(
+                crate::HeaderId::Connection,
+                Bytes::from_static(b"keep-alive"),
+            )
+        }
+        let out = exchange(
+            b"POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\n\r\nhelloGET / HTTP/1.1\r\nHost: a\r\n\r\n",
+            ignore,
+            Limits::default(),
+        )
+        .await;
+        assert_eq!(
+            out.matches("HTTP/1.1").count(),
+            1,
+            "unread body must not enable reuse: {out}"
+        );
+        assert!(
+            out.to_ascii_lowercase().contains("connection: close"),
+            "{out}"
+        );
+    }
+
+    /// A handler `Connection` value hyper's `HeaderValue` rejects is dropped;
+    /// it must not also suppress the bridge's own field, or the response goes
+    /// out with no `Connection` at all where native emits one. The native
+    /// writer's `emitted` applies the same writability filter for the same
+    /// reason.
+    #[tokio::test]
+    async fn an_invalid_handler_connection_header_does_not_suppress_ours() {
+        async fn bad(_req: Request) -> Response {
+            Response::status_only(200).header(
+                crate::HeaderId::Connection,
+                Bytes::from_static(b"keep\r\nalive"),
+            )
+        }
+        let out = exchange(
+            b"POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\n\r\nhelloGET / HTTP/1.1\r\nHost: a\r\n\r\n",
+            bad,
+            Limits::default(),
+        )
+        .await;
+        assert!(
+            out.to_ascii_lowercase().contains("connection: close"),
+            "an unwritable handler field must not leave the response without \
+             one: {out}"
+        );
+        assert_eq!(out.matches("HTTP/1.1").count(), 1, "{out}");
+    }
+
+    /// The body-phase 408 carries the request's version, as the native loop's
+    /// `write_error(version, 408)` does. (A header-phase 408 has no version to
+    /// echo yet, and stays 1.1 under both backends.)
+    #[tokio::test]
+    async fn the_body_timeout_408_echoes_an_http_10_request_version() {
+        let limits = Limits {
+            body_timeout: Duration::from_millis(100),
+            ..Default::default()
+        };
+        let out = exchange(
+            b"POST / HTTP/1.0\r\nHost: a\r\nContent-Length: 5\r\n\r\nhel",
+            echo,
+            limits,
+        )
+        .await;
+        assert!(out.starts_with("HTTP/1.0 408"), "{out}");
     }
 }
