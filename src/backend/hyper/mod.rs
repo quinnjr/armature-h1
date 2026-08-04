@@ -14,17 +14,25 @@
 //!   every flush; here it is re-armed on every byte that reaches the transport,
 //!   which is finer-grained, and the response is considered finished when the
 //!   body reports end-of-stream *and* a flush succeeds — the only "done" moment
-//!   observable from outside hyper. Should hyper ever complete a response
-//!   without polling its body (it does not today: bodies with a zero-length
-//!   hint are marked finished up front), the connection would linger in
-//!   [`Phase::Write`] and be bounded by `write_timeout` rather than
-//!   `idle_timeout`. Bounded either way; the number would differ.
+//!   observable from outside hyper.
+//! - **A response to a `HEAD` request never leaves [`Phase::Write`].** hyper
+//!   forces `Encoder::length(0)` for `HEAD` and never polls the body, so
+//!   `note_body_end` does not fire and the completion signal never completes.
+//!   The connection is then bounded by `write_timeout` rather than
+//!   `idle_timeout` while it waits for the next request — measured at the full
+//!   30s default, where native would have waited 75s. Benign: the wait is still
+//!   bounded, it is *shorter* than native's, and the close is silent either
+//!   way. But live, not hypothetical. Same shape for any future case where
+//!   hyper finishes a message without draining its body.
 //! - **The head of a pipelined request does not re-phase a response in flight.**
 //!   Native arms `header_timeout` from the first byte of a head; here, bytes
 //!   that arrive while a response is being written leave the phase at `Write`,
 //!   because `Write -> Head` would put `header_timeout` over the remainder of a
-//!   perfectly healthy stream and kill it. The following head is therefore
-//!   bounded by `write_timeout` instead — still bounded, still slowloris-safe.
+//!   perfectly healthy stream and kill it. Such a head is bounded by
+//!   `write_timeout` — still bounded, still slowloris-safe. (A head that
+//!   arrives *after* a response completes is not affected: the connection is
+//!   back in `Idle` by then, so `Idle -> Head` fires and `header_timeout`
+//!   applies exactly as native.)
 //! - **`write_timeout` expiry closes silently, and so does any expiry after
 //!   bytes have gone out for the current response.** Native writes nothing on a
 //!   write stall; splicing a bare 408 into a half-written body would corrupt
@@ -79,9 +87,9 @@ pub(crate) struct PhaseClock {
     phase: Cell<Phase>,
     generation: Cell<u64>,
     /// Whether any byte of the current response has reached the transport.
-    /// Reset when the handler starts, set on every nonzero write. Gates the
-    /// bare-408 write: bytes already on the wire mean a 408 would be spliced
-    /// into a response the peer is mid-parse of.
+    /// Set on every nonzero write, reset whenever a fresh response begins.
+    /// Gates the bare-408 write: bytes already on the wire mean a 408 would be
+    /// spliced into a response the peer is mid-parse of.
     wrote_bytes: Cell<bool>,
     /// Whether the current response body has reported end-of-stream. Half of
     /// the "response finished" signal; the other half is a drained write
@@ -112,10 +120,16 @@ impl PhaseClock {
 
     /// Enter `p`, bumping the generation and waking the watchdog.
     ///
-    /// Entering [`Phase::Handler`] also starts a fresh response, resetting the
-    /// per-response write and body-end flags.
+    /// Entering [`Phase::Idle`] or [`Phase::Handler`] starts a fresh response,
+    /// resetting the per-response write and body-end flags. Both are safe
+    /// points to do it: reaching `Idle` already required the body to report
+    /// end-of-stream *and* the write buffer to drain, so nothing of the
+    /// previous response is still in flight. Resetting at `Handler` alone would
+    /// leave `wrote_bytes` latched for the life of a keep-alive connection, and
+    /// every 408 after the first response would be suppressed as if it were
+    /// about to be spliced into a write.
     pub(crate) fn set(&self, p: Phase) {
-        if p == Phase::Handler {
+        if matches!(p, Phase::Idle | Phase::Handler) {
             self.wrote_bytes.set(false);
             self.body_done.set(false);
         }
@@ -273,6 +287,12 @@ impl Backend for HyperBackend {
             .max_buf_size(cfg.limits.max_head_bytes.max(MIN_HYPER_BUF))
             // Native semantics: EOF on read closes; responses flush per
             // response, not batched across pipelined requests.
+            //
+            // `pipeline_flush(false)` is load-bearing beyond parity:
+            // `PhaseClock::note_flush` reads a successful flush as "hyper owes
+            // the wire nothing more". With pipelined flushing enabled hyper's
+            // `flush_pipeline` path returns early without draining the write
+            // buffer, which would report a completion that had not happened.
             .half_close(false)
             .pipeline_flush(false);
         let mut conn = builder.serve_connection(hyper_io, bridge);
@@ -536,6 +556,56 @@ mod tests {
         // A started-but-never-finished head.
         let out = exchange(b"GET / HTT", hello, Limits::default()).await;
         assert!(out.starts_with("HTTP/1.1 408"), "{out}");
+    }
+
+    /// The 408 is owed on *every* request, not just the first.
+    ///
+    /// `wrote_bytes` suppresses the 408 so it is never spliced into a response
+    /// in flight; latched for the life of the connection it would instead
+    /// suppress every 408 after the first response, silently closing where
+    /// native answers. Only a second request on a live connection catches that.
+    #[tokio::test]
+    async fn header_timeout_writes_408_on_a_reused_connection() {
+        let (mut client, server) = tokio::io::duplex(64 * 1024);
+        let local = tokio::task::LocalSet::new();
+        let task = local.spawn_local(HyperBackend::serve(
+            server,
+            Rc::new(hello),
+            cfg(Limits::default()),
+            Rc::new(RefCell::new(DateCache::new())),
+            Bytes::new(),
+        ));
+        let (first, second) = local
+            .run_until(async move {
+                client
+                    .write_all(b"GET / HTTP/1.1\r\nHost: a\r\n\r\n")
+                    .await
+                    .unwrap();
+                // Drain the whole first response before sending anything else,
+                // so the second head cannot arrive while the write is in
+                // flight — that is the other, already-covered case.
+                let mut first = String::new();
+                let mut buf = [0u8; 256];
+                while !first.ends_with("hi") {
+                    let n = client.read(&mut buf).await.unwrap();
+                    assert!(n > 0, "server closed early: {first}");
+                    first.push_str(&String::from_utf8_lossy(&buf[..n]));
+                }
+                // A second head that never finishes.
+                client.write_all(b"GET / HTT").await.unwrap();
+                let mut rest = Vec::new();
+                let _ = tokio::time::timeout(Duration::from_secs(2), client.read_to_end(&mut rest))
+                    .await;
+                let _ = task.await;
+                (first, String::from_utf8_lossy(&rest).into_owned())
+            })
+            .await;
+        assert!(first.starts_with("HTTP/1.1 200 OK"), "{first}");
+        assert!(
+            second.starts_with("HTTP/1.1 408"),
+            "the second request is owed a 408 too, cleanly after the first \
+             response rather than spliced into it: {second:?}"
+        );
     }
 
     #[tokio::test]
