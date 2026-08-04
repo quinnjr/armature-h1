@@ -1,3 +1,12 @@
+> **Historical artifact.** This plan documents the design as it stood when the
+> `hyper-backend` feature was first built, including build-time scaffolding
+> instructions for a now-completed task list. It is kept for history, not as
+> current guidance. In particular, the Task 8 phase-clock section describes an
+> `idle_timeout`-based approximation that commit `b990f8e` later replaced with
+> a real `Phase::Write`; treat that section, and any other decision described
+> here, as superseded wherever it conflicts with the current source or with
+> `BACKENDS.md`.
+
 # Hyper Backend Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
