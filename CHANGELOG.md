@@ -7,6 +7,13 @@ and this crate adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.h
 
 ## [Unreleased]
 
+### Added
+
+- `hyper-backend` cargo feature: serve connections through hyper's
+  `conn::http1` behind the same public API. Compile-time swap; strict parity;
+  divergences documented in `BACKENDS.md`. Adds `serve_connection`, the
+  backend-selected per-connection entry point.
+
 ### Changed
 
 - Set `autobenches = false` so the `parse`, `write` and `e2e` bench targets are
