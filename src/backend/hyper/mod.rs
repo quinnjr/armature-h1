@@ -44,6 +44,7 @@ use bytes::Bytes;
 use io::{HyperIo, IoShared, SharedIo};
 use std::cell::{Cell, RefCell};
 use std::io as stdio;
+use std::net::SocketAddr;
 use std::rc::Rc;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -312,6 +313,7 @@ impl Backend for HyperBackend {
         cfg: Rc<ConnConfig>,
         date: Rc<RefCell<DateCache>>,
         buffered: Bytes,
+        peer: Option<SocketAddr>,
     ) -> stdio::Result<Option<Upgraded>>
     where
         IO: AsyncRead + AsyncWrite + Unpin + 'static,
@@ -329,6 +331,7 @@ impl Backend for HyperBackend {
             sent_101: sent_101.clone(),
             phase: clock.clone(),
             req_version: req_version.clone(),
+            peer,
         };
 
         let mut builder = ::hyper::server::conn::http1::Builder::new();
@@ -576,6 +579,7 @@ mod tests {
             config,
             Rc::new(RefCell::new(DateCache::new())),
             Bytes::new(),
+            None,
         ));
         local
             .run_until(async move {
@@ -712,6 +716,7 @@ mod tests {
             cfg(limits),
             Rc::new(RefCell::new(DateCache::new())),
             Bytes::new(),
+            None,
         ));
         let finished = local
             .run_until(async move {
@@ -768,6 +773,7 @@ mod tests {
             config,
             Rc::new(RefCell::new(DateCache::new())),
             Bytes::new(),
+            None,
         ));
         let (first, second) = local
             .run_until(async move {
@@ -974,6 +980,7 @@ mod tests {
             cfg(limits),
             Rc::new(RefCell::new(DateCache::new())),
             Bytes::new(),
+            None,
         ));
         let (out, closed) = local
             .run_until(async move {
@@ -1037,6 +1044,7 @@ mod tests {
             cfg(Limits::default()),
             Rc::new(RefCell::new(DateCache::new())),
             Bytes::new(),
+            None,
         ));
         let (first, rest, closed) = local
             .run_until(async move {
@@ -1099,6 +1107,7 @@ mod tests {
             cfg(Limits::default()),
             Rc::new(RefCell::new(DateCache::new())),
             Bytes::new(),
+            None,
         ));
         let upgraded = local
             .run_until(async move {
@@ -1304,6 +1313,7 @@ mod tests {
             cfg(Limits::default()),
             Rc::new(RefCell::new(DateCache::new())),
             Bytes::new(),
+            None,
         ));
         let served = local
             .run_until(async move {

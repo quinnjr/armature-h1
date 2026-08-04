@@ -17,6 +17,7 @@ use bytes::Bytes;
 use std::cell::RefCell;
 use std::future::Future;
 use std::io;
+use std::net::SocketAddr;
 use std::rc::Rc;
 use tokio::io::{AsyncRead, AsyncWrite};
 
@@ -26,12 +27,16 @@ pub(crate) trait Backend {
     ///
     /// `buffered` holds bytes protocol dispatch already read (h2c sniffing);
     /// they are part of the first request and must be consumed before `io`.
+    ///
+    /// `peer` is stamped onto every request served here, and is `None` for a
+    /// transport with no address to report.
     fn serve<IO, S>(
         io: IO,
         service: Rc<S>,
         cfg: Rc<ConnConfig>,
         date: Rc<RefCell<DateCache>>,
         buffered: Bytes,
+        peer: Option<SocketAddr>,
     ) -> impl Future<Output = io::Result<Option<Upgraded>>>
     where
         IO: AsyncRead + AsyncWrite + Unpin + 'static,
@@ -55,12 +60,13 @@ pub async fn serve_connection<IO, S>(
     cfg: Rc<ConnConfig>,
     date: Rc<RefCell<DateCache>>,
     buffered: Bytes,
+    peer: Option<SocketAddr>,
 ) -> io::Result<Option<Upgraded>>
 where
     IO: AsyncRead + AsyncWrite + Unpin + 'static,
     S: H1Service + 'static,
 {
-    ActiveBackend::serve(io, service, cfg, date, buffered).await
+    ActiveBackend::serve(io, service, cfg, date, buffered, peer).await
 }
 
 #[cfg(test)]
@@ -86,6 +92,7 @@ mod tests {
             Rc::new(ConnConfig::default()),
             Rc::new(RefCell::new(DateCache::new())),
             bytes::Bytes::new(),
+            None,
         ));
         let out = local
             .run_until(async move {
@@ -119,6 +126,7 @@ mod tests {
             Rc::new(ConnConfig::default()),
             Rc::new(RefCell::new(DateCache::new())),
             bytes::Bytes::from_static(b"GET "),
+            None,
         ));
         let out = local
             .run_until(async move {

@@ -8,7 +8,7 @@
 use crate::Limits;
 use crate::conn::ConnConfig;
 use crate::service::{H1Service, Transport};
-use crate::tls::{H2Fallback, Preface, is_h2c_preface};
+use crate::tls::{H2Fallback, Preface, UpgradeConsumer, is_h2c_preface};
 use crate::write::DateCache;
 use bytes::{Bytes, BytesMut};
 use std::cell::RefCell;
@@ -228,14 +228,9 @@ impl Server {
     /// Serve until shutdown, blocking the calling thread.
     ///
     /// Connections this crate will not serve — a negotiated `h2`, or an h2c
-    /// preface — are closed. Use [`serve_with_fallback`](Self::serve_with_fallback)
-    /// to route them somewhere instead.
-    ///
-    /// A connection a handler upgrades with status 101 is *also* closed: there
-    /// is no upgrade-consumer hook here. Drive [`Connection`](crate::conn::Connection)
-    /// yourself and take the `Upgraded` from
-    /// [`Connection::serve`](crate::conn::Connection::serve) if you need the raw
-    /// socket.
+    /// preface — are closed, as is one a handler upgrades with status 101. Use
+    /// [`serve_with_fallback`](Self::serve_with_fallback) to route HTTP/2
+    /// somewhere, and [`serve_with`](Self::serve_with) to also consume upgrades.
     ///
     /// `make` runs once per worker thread to produce that worker's service. Note
     /// the bounds: the *factory* is `Send`, because it crosses thread boundaries
@@ -254,12 +249,44 @@ impl Server {
     /// `make_fallback` runs once per worker, like `make`, and for the same reason:
     /// the factory crosses thread boundaries at startup, the fallback it produces
     /// never does — so a fallback may hold non-`Send` state.
+    ///
+    /// An upgraded connection is still closed; use [`serve_with`](Self::serve_with)
+    /// to consume those too.
     pub fn serve_with_fallback<F, S, G, H>(self, make: F, make_fallback: G) -> io::Result<()>
     where
         F: Fn() -> S + Send + Clone + 'static,
         S: H1Service + 'static,
         G: Fn() -> H + Send + Clone + 'static,
         H: H2Fallback + 'static,
+    {
+        self.serve_with(make, make_fallback, || CloseUpgrade)
+    }
+
+    /// Serve until shutdown, with both exits off the HTTP/1 path plugged.
+    ///
+    /// `make_upgrade` produces this worker's [`UpgradeConsumer`], which receives
+    /// the transport whenever a handler answers an upgrade request with 101 —
+    /// the WebSocket handoff. It runs once per worker with the same `Send`
+    /// factory / non-`Send` product asymmetry as `make` and `make_fallback`.
+    ///
+    /// A handler that retains the request [`Body`](crate::service::Body) past
+    /// its response forfeits the handoff and the connection closes instead: the
+    /// body holds a second handle on the transport, and two readers on one
+    /// socket is not a state this crate will produce. See
+    /// [`Connection::serve`](crate::conn::Connection::serve).
+    pub fn serve_with<F, S, G, H, U, C>(
+        self,
+        make: F,
+        make_fallback: G,
+        make_upgrade: U,
+    ) -> io::Result<()>
+    where
+        F: Fn() -> S + Send + Clone + 'static,
+        S: H1Service + 'static,
+        G: Fn() -> H + Send + Clone + 'static,
+        H: H2Fallback + 'static,
+        U: Fn() -> C + Send + Clone + 'static,
+        C: UpgradeConsumer + 'static,
     {
         let Server {
             cfg, listeners, tx, ..
@@ -294,6 +321,7 @@ impl Server {
             let cfg = cfg.clone();
             let make = make.clone();
             let make_fallback = make_fallback.clone();
+            let make_upgrade = make_upgrade.clone();
             let rx = tx.subscribe();
             let core = core_ids.get(worker).copied();
             let Some(std_listener) = slot.take() else {
@@ -315,7 +343,14 @@ impl Server {
                         else {
                             return;
                         };
-                        rt.block_on(worker_loop(std_listener, make, make_fallback, cfg, rx));
+                        rt.block_on(worker_loop(
+                            std_listener,
+                            make,
+                            make_fallback,
+                            make_upgrade,
+                            cfg,
+                            rx,
+                        ));
                     })?,
             );
         }
@@ -328,10 +363,11 @@ impl Server {
 }
 
 /// One worker's accept loop.
-async fn worker_loop<F, S, G, H>(
+async fn worker_loop<F, S, G, H, U, C>(
     std_listener: std::net::TcpListener,
     make: F,
     make_fallback: G,
+    make_upgrade: U,
     cfg: Config,
     mut rx: watch::Receiver<bool>,
 ) where
@@ -339,6 +375,8 @@ async fn worker_loop<F, S, G, H>(
     S: H1Service + 'static,
     G: Fn() -> H,
     H: H2Fallback + 'static,
+    U: Fn() -> C,
+    C: UpgradeConsumer + 'static,
 {
     std_listener.set_nonblocking(true).ok();
     let Ok(listener) = TcpListener::from_std(std_listener) else {
@@ -362,6 +400,7 @@ async fn worker_loop<F, S, G, H>(
     let date = Rc::new(RefCell::new(DateCache::new()));
     let service = Rc::new(make());
     let fallback = Rc::new(make_fallback());
+    let upgrades = Rc::new(make_upgrade());
 
     let local = tokio::task::LocalSet::new();
 
@@ -375,7 +414,7 @@ async fn worker_loop<F, S, G, H>(
                         }
                     }
                     accepted = listener.accept() => {
-                        let Ok((stream, _peer)) = accepted else { continue };
+                        let Ok((stream, peer)) = accepted else { continue };
                         if cfg.tcp.nodelay {
                             let _ = stream.set_nodelay(true);
                         }
@@ -383,9 +422,11 @@ async fn worker_loop<F, S, G, H>(
                         let date = date.clone();
                         let service = service.clone();
                         let fallback = fallback.clone();
+                        let upgrades = upgrades.clone();
                         let cfg = cfg.clone();
                         tokio::task::spawn_local(async move {
-                            dispatch(stream, service, fallback, conn_cfg, date, cfg).await;
+                            dispatch(stream, service, fallback, upgrades, conn_cfg, date, cfg, peer)
+                                .await;
                         });
                     }
                 }
@@ -401,16 +442,20 @@ async fn worker_loop<F, S, G, H>(
 ///
 /// With TLS off and h2c detection off — the default — this reduces to serving
 /// HTTP/1 directly, with no extra read on the fast path.
-async fn dispatch<S, H>(
+#[allow(clippy::too_many_arguments)]
+async fn dispatch<S, H, C>(
     stream: tokio::net::TcpStream,
     service: Rc<S>,
     fallback: Rc<H>,
+    upgrades: Rc<C>,
     conn_cfg: Rc<ConnConfig>,
     date: Rc<RefCell<DateCache>>,
     cfg: Rc<Config>,
+    peer: SocketAddr,
 ) where
     S: H1Service + 'static,
     H: H2Fallback + 'static,
+    C: UpgradeConsumer + 'static,
 {
     #[cfg(feature = "tls")]
     if let Some(tls) = cfg.tls.clone() {
@@ -426,7 +471,16 @@ async fn dispatch<S, H>(
             // application data to forward.
             fallback.handle(Box::new(tls_stream), Bytes::new()).await;
         } else {
-            serve_h1(tls_stream, service, conn_cfg, date, Bytes::new()).await;
+            serve_h1(
+                tls_stream,
+                service,
+                upgrades,
+                conn_cfg,
+                date,
+                Bytes::new(),
+                peer,
+            )
+            .await;
         }
         return;
     }
@@ -439,14 +493,23 @@ async fn dispatch<S, H>(
                 fallback.handle(Box::new(stream), buffered).await;
             }
             Some((stream, buffered, _)) => {
-                serve_h1(stream, service, conn_cfg, date, buffered).await;
+                serve_h1(stream, service, upgrades, conn_cfg, date, buffered, peer).await;
             }
             None => {}
         }
         return;
     }
 
-    serve_h1(stream, service, conn_cfg, date, Bytes::new()).await;
+    serve_h1(
+        stream,
+        service,
+        upgrades,
+        conn_cfg,
+        date,
+        Bytes::new(),
+        peer,
+    )
+    .await;
 }
 
 /// Read just enough to classify a plaintext connection.
@@ -478,29 +541,28 @@ async fn peek_preface(
 }
 
 /// Serve one HTTP/1 connection to completion.
-async fn serve_h1<IO, S>(
+async fn serve_h1<IO, S, C>(
     io: IO,
     service: Rc<S>,
+    upgrades: Rc<C>,
     conn_cfg: Rc<ConnConfig>,
     date: Rc<RefCell<DateCache>>,
     buffered: Bytes,
+    peer: SocketAddr,
 ) where
     IO: AsyncRead + AsyncWrite + Unpin + 'static,
     S: H1Service + 'static,
+    C: UpgradeConsumer + 'static,
 {
     // A clean close and an I/O error are the same outcome here: the connection is
     // over and there is nobody left to tell.
     //
-    // An upgraded transport is dropped, which closes the socket. `Server` has no
-    // upgrade consumer to hand it to — unlike the HTTP/2 fallback, which is
-    // pluggable — so a service that answers 101 must drive `Connection` itself
-    // and take the `Upgraded` from `Connection::serve`. Closing is the honest
-    // outcome for a handoff this server cannot complete; the alternative is to
-    // leave a socket open that nothing will ever read.
+    // An upgraded transport goes to the connection consumer, which is
+    // `CloseUpgrade` unless the caller plugged one in via `serve_with`.
     if let Ok(Some(upgraded)) =
-        crate::backend::serve_connection(io, service, conn_cfg, date, buffered).await
+        crate::backend::serve_connection(io, service, conn_cfg, date, buffered, Some(peer)).await
     {
-        drop(upgraded);
+        upgrades.handle(upgraded).await;
     }
 }
 
@@ -517,6 +579,22 @@ impl H2Fallback for CloseH2 {
         Box::pin(async move {
             drop(buffered);
             drop(io);
+        })
+    }
+}
+
+/// An [`UpgradeConsumer`] that closes the transport.
+///
+/// The default, and what [`Server`] did unconditionally before `serve_with`
+/// existed. Closing is the honest outcome for a handoff with no destination:
+/// the alternative is a socket left open that nothing will ever read.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CloseUpgrade;
+
+impl UpgradeConsumer for CloseUpgrade {
+    fn handle(&self, upgraded: crate::service::Upgraded) -> Pin<Box<dyn Future<Output = ()>>> {
+        Box::pin(async move {
+            drop(upgraded);
         })
     }
 }

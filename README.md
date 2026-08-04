@@ -132,12 +132,20 @@ request without reading its body causes no interim response), `HEAD`, `CONNECT`,
 `Upgrade` with raw-socket handoff, origin/absolute/asterisk-form targets,
 HTTP/1.0 semantics.
 
-**Caveat on `Upgrade`.** The handoff is available on `Connection::serve`, which
-returns `Ok(Some(Upgraded))` — the transport plus the bytes the peer already sent
-past the head — when a handler answers a request carrying `Connection: upgrade`
-with status 101. `Server` has no upgrade-consumer hook, unlike the pluggable
-HTTP/2 fallback, so under `Server::serve` an upgraded connection is **closed**.
-Drive `Connection` yourself if you need the socket.
+**On `Upgrade`.** The handoff is available on `Connection::serve`, which returns
+`Ok(Some(Upgraded))` — the transport plus the bytes the peer already sent past
+the head — when a handler answers a request carrying `Connection: upgrade` with
+status 101. Under `Server`, pass an `UpgradeConsumer` to `serve_with` and it
+receives the same thing; `serve` and `serve_with_fallback` default to
+`CloseUpgrade`, which closes. A handler that retains the request body past its
+response forfeits the handoff either way — the body holds a second handle on the
+transport, and two readers on one socket is not a state this crate will
+produce — so drop the body before answering 101.
+
+**Peer address.** `Request::peer` carries the address of the socket the request
+arrived on, or `None` for a transport that has none (a `duplex` pair, or a
+`Connection` driven without `with_peer`). Read `None` as *unknown*, never as
+*local*: it is the only client identifier that is not chosen by the client.
 
 Rejected, per RFC 9110/9111/9112, each with a named test:
 

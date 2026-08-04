@@ -59,6 +59,26 @@ pub trait H2Fallback {
     fn handle(&self, io: Box<dyn Transport>, buffered: Bytes) -> Pin<Box<dyn Future<Output = ()>>>;
 }
 
+/// Somewhere to send a connection a handler upgraded out of HTTP/1.
+///
+/// The counterpart to [`H2Fallback`] for the other way off the HTTP/1 path: a
+/// handler answers a request carrying `Connection: upgrade` with status 101,
+/// the response goes out, and the transport is no longer HTTP/1's to read. This
+/// is what [`Server`](crate::Server) hands it to; without one it closes, which
+/// is a silently dropped WebSocket.
+///
+/// Like `H2Fallback`, deliberately without a `Send` bound: the consumer runs on
+/// the worker that owns the connection and never migrates.
+pub trait UpgradeConsumer {
+    /// Take over the upgraded transport.
+    ///
+    /// [`Upgraded::buffered`](crate::Upgraded::buffered) holds bytes the peer
+    /// already sent past the upgrade request's head — for WebSocket, the first
+    /// frames. The implementation **must** process them before reading
+    /// `upgraded.io`, or it will lose them.
+    fn handle(&self, upgraded: crate::service::Upgraded) -> Pin<Box<dyn Future<Output = ()>>>;
+}
+
 /// TLS configuration.
 #[cfg(feature = "tls")]
 #[derive(Clone, Debug)]

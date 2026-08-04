@@ -7,6 +7,30 @@ and this crate adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.h
 
 ## [Unreleased]
 
+### Added
+
+- `Request::peer`: the address of the socket the request arrived on, stamped
+  onto every request `Server` serves. Previously the accept loop discarded it,
+  so a consumer had no trustworthy client identifier at all — every address in
+  a header is set by the caller, so rate limiting, deduplication and audit
+  logging keyed on one are keyed on a value the client chooses.
+- `UpgradeConsumer`, `CloseUpgrade`, and `Server::serve_with`: a pluggable
+  destination for a connection a handler upgrades with status 101, matching
+  the existing `H2Fallback` hook for HTTP/2. Without it `Server` closed every
+  upgraded connection, so a WebSocket handshake could be completed and then
+  silently dropped; driving `Connection` directly was the only way to get the
+  socket. `serve` and `serve_with_fallback` still close, via `CloseUpgrade`.
+- `Connection::with_peer`, for a caller driving `Connection` itself.
+
+### Changed
+
+- **Breaking**: `Request` has a new public field, `peer`, so a struct-literal
+  construction outside this crate needs it. `Request` is normally received
+  from the crate rather than built.
+- **Breaking**: `serve_connection` takes a sixth argument, `peer:
+  Option<SocketAddr>`. Pass `None` for a transport with no address to report;
+  it is not a "trusted source" signal, it means unknown.
+
 ## [0.2.0] - 2026-08-04
 
 ### Added

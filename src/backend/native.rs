@@ -16,6 +16,7 @@ use crate::write::DateCache;
 use bytes::Bytes;
 use std::cell::RefCell;
 use std::io;
+use std::net::SocketAddr;
 use std::rc::Rc;
 use tokio::io::{AsyncRead, AsyncWrite};
 
@@ -42,12 +43,14 @@ impl Backend for NativeBackend {
         cfg: Rc<ConnConfig>,
         date: Rc<RefCell<DateCache>>,
         buffered: Bytes,
+        peer: Option<SocketAddr>,
     ) -> io::Result<Option<Upgraded>>
     where
         IO: AsyncRead + AsyncWrite + Unpin + 'static,
         S: H1Service + 'static,
     {
         Connection::with_buffered(io, RcService(service), cfg, date, buffered)
+            .with_peer(peer)
             .serve()
             .await
     }

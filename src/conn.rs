@@ -16,6 +16,7 @@ use crate::{Body, Limits, Method, Request, Response, Version, framing, parse, pa
 use bytes::{Bytes, BytesMut};
 use std::cell::{Cell, RefCell};
 use std::io;
+use std::net::SocketAddr;
 use std::rc::Rc;
 use std::task::{Context, Poll};
 use std::time::{Duration, SystemTime};
@@ -205,6 +206,10 @@ pub struct Connection<IO, S> {
     /// Reused across requests: allocating a fresh flag per request would put an
     /// allocation back on the steady-state path.
     body_read: Rc<Cell<bool>>,
+    /// Stamped onto every [`Request`] served here. A `SocketAddr` is `Copy` and
+    /// 32 bytes at worst, so this is carried by value rather than behind an
+    /// `Rc`: sharing it would cost a pointer chase per request to save nothing.
+    peer: Option<SocketAddr>,
 }
 
 impl<IO, S> Connection<IO, S>
@@ -249,7 +254,21 @@ where
             deadline,
             out: BytesMut::with_capacity(1024),
             body_read: Rc::new(Cell::new(false)),
+            peer: None,
         }
+    }
+
+    /// Report `peer` as the connection's remote address on every request.
+    ///
+    /// A builder rather than a constructor parameter because the address is
+    /// optional and the constructors already take four arguments; a fifth that
+    /// is `None` at most call sites is noise. Without this the requests this
+    /// connection serves carry [`Request::peer`](crate::Request::peer) of
+    /// `None`, which downstream code must read as "unknown", not "local".
+    #[must_use]
+    pub fn with_peer(mut self, peer: Option<SocketAddr>) -> Self {
+        self.peer = peer;
+        self
     }
 
     /// Serve requests until the connection ends.
@@ -349,7 +368,11 @@ where
             //
             // Cancelling the handler mid-await drops its `Body`, and with it the
             // last borrow of the transport, so the 408 can be written here.
-            let call = self.service.call(Request { head, body });
+            let call = self.service.call(Request {
+                head,
+                body,
+                peer: self.peer,
+            });
             self.deadline.arm(self.cfg.limits.body_timeout);
             let resp = {
                 let deadline = &mut self.deadline;

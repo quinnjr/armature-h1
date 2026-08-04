@@ -9,6 +9,7 @@ use crate::{Head, Limits, Method, Version};
 use bytes::Bytes;
 use std::cell::{Cell, RefCell};
 use std::future::Future;
+use std::net::SocketAddr;
 use std::pin::Pin;
 use std::rc::Rc;
 
@@ -116,6 +117,10 @@ pub(crate) struct Bridge<S> {
     /// writes on a body-phase expiry: the native loop echoes the request's
     /// version there (`conn.rs`, `write_error(version, 408)`).
     pub(crate) req_version: Rc<Cell<Version>>,
+    /// Stamped onto every bridged request, matching the native loop's
+    /// [`Request::peer`](crate::Request::peer). Taken from the accept call
+    /// rather than from hyper, which does not carry the address.
+    pub(crate) peer: Option<SocketAddr>,
 }
 
 type BridgeResponse = ::hyper::http::Response<HyperOutBody>;
@@ -134,6 +139,7 @@ impl<S: H1Service + 'static>
         let sent_101 = self.sent_101.clone();
         let phase = self.phase.clone();
         let req_version = self.req_version.clone();
+        let peer = self.peer;
 
         Box::pin(async move {
             // The head is parsed by the time hyper calls us: everything from
@@ -198,7 +204,7 @@ impl<S: H1Service + 'static>
                 trailers_slot,
             );
 
-            let resp = service.call(Request { head, body }).await;
+            let resp = service.call(Request { head, body, peer }).await;
 
             let upgrading = resp.status == 101 && wants_upgrade;
             if upgrading {
