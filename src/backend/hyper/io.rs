@@ -19,10 +19,14 @@ pub(crate) struct IoShared<IO> {
     pub(crate) io: IO,
     /// Bytes read before hyper took over (h2c sniff read-ahead). Served first.
     pub(crate) buffered: Bytes,
-    /// The watchdog's phase clock. A nonzero read while the connection is idle
-    /// is the first byte of a request head, which is exactly the native loop's
-    /// idle -> header transition; signalling it here rather than polling a flag
-    /// keeps the transition prompt even when `idle_timeout < header_timeout`.
+    /// The watchdog's phase clock, driven from both directions of the wire.
+    ///
+    /// A nonzero read while the connection is idle is the first byte of a
+    /// request head — the native loop's idle -> header transition; signalling it
+    /// here rather than polling a flag keeps it prompt even when
+    /// `idle_timeout < header_timeout`. A nonzero *write* is response progress,
+    /// which is what re-arms `write_timeout` the way the native writer re-arms
+    /// per flush.
     pub(crate) clock: Rc<PhaseClock>,
 }
 
@@ -36,22 +40,56 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> IoShared<IO> {
         if !self.buffered.is_empty() {
             let n = self.buffered.len().min(out.remaining());
             out.put_slice(&self.buffered.split_to(n));
-            self.note_bytes();
+            self.note_read();
             return Poll::Ready(Ok(()));
         }
         let before = out.filled().len();
         let poll = Pin::new(&mut self.io).poll_read(cx, out);
         if matches!(poll, Poll::Ready(Ok(()))) && out.filled().len() > before {
-            self.note_bytes();
+            self.note_read();
         }
         poll
     }
 
     /// Move `Idle -> Head` on the first byte of a new request.
-    fn note_bytes(&self) {
+    ///
+    /// Deliberately *only* from `Idle`. Bytes arriving in `Write` are a
+    /// pipelined head landing while a response is still going out; re-phasing
+    /// to `Head` there would put `header_timeout` over the remainder of a
+    /// perfectly healthy stream and kill it. See the module docs.
+    fn note_read(&self) {
         if self.clock.phase() == Phase::Idle {
             self.clock.set(Phase::Head);
         }
+    }
+
+    /// Report bytes reaching the transport, which re-arms a write deadline.
+    fn note_write(&self, n: usize) {
+        if n > 0 {
+            self.clock.note_write();
+        }
+    }
+
+    /// Write through to the transport, reporting progress to the clock.
+    fn poll_write_from(&mut self, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+        let poll = Pin::new(&mut self.io).poll_write(cx, buf);
+        if let Poll::Ready(Ok(n)) = &poll {
+            self.note_write(*n);
+        }
+        poll
+    }
+
+    /// Flush through to the transport, reporting completion to the clock.
+    ///
+    /// A successful flush means hyper owes the wire nothing more *right now*;
+    /// combined with an exhausted response body that is the end of the
+    /// response, and the clock uses it to return to `Idle`.
+    fn poll_flush_from(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let poll = Pin::new(&mut self.io).poll_flush(cx);
+        if matches!(poll, Poll::Ready(Ok(()))) {
+            self.clock.note_flush();
+        }
+        poll
     }
 }
 
@@ -102,11 +140,11 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> ::hyper::rt::Write for HyperIo<IO> {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        Pin::new(&mut self.0.borrow_mut().io).poll_write(cx, buf)
+        self.0.borrow_mut().poll_write_from(cx, buf)
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.0.borrow_mut().io).poll_flush(cx)
+        self.0.borrow_mut().poll_flush_from(cx)
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -134,11 +172,11 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> AsyncWrite for SharedIo<IO> {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        Pin::new(&mut self.0.borrow_mut().io).poll_write(cx, buf)
+        self.0.borrow_mut().poll_write_from(cx, buf)
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.0.borrow_mut().io).poll_flush(cx)
+        self.0.borrow_mut().poll_flush_from(cx)
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -207,5 +245,41 @@ mod tests {
         let mut buf = [0u8; 1];
         sio.read_exact(&mut buf).await.unwrap();
         assert_eq!(c.phase(), Phase::Head);
+    }
+
+    /// A pipelined head arriving mid-response must not re-phase to `Head`:
+    /// that would put `header_timeout` over the rest of a healthy stream.
+    #[tokio::test]
+    async fn reads_during_a_write_do_not_re_phase() {
+        let (mut client, server) = tokio::io::duplex(4096);
+        let c = clock();
+        let (_hyper_io, shared) = HyperIo::new(server, bytes::Bytes::new(), c.clone());
+        let mut sio = SharedIo(shared);
+        c.set(Phase::Write);
+        client.write_all(b"G").await.unwrap();
+        let mut buf = [0u8; 1];
+        sio.read_exact(&mut buf).await.unwrap();
+        assert_eq!(c.phase(), Phase::Write);
+    }
+
+    /// Write progress is what re-arms `write_timeout`, so it has to bump the
+    /// generation the watchdog snapshots — and mark the response as started.
+    #[tokio::test]
+    async fn writes_report_progress_to_the_clock() {
+        let (mut client, server) = tokio::io::duplex(4096);
+        let c = clock();
+        let (_hyper_io, shared) = HyperIo::new(server, bytes::Bytes::new(), c.clone());
+        let mut sio = SharedIo(shared);
+        c.set(Phase::Write);
+        assert!(!c.wrote_bytes());
+        let before = c.generation.get();
+        sio.write_all(b"ok").await.unwrap();
+        assert!(c.wrote_bytes(), "a nonzero write starts the response");
+        assert!(c.generation.get() > before, "write progress re-arms");
+        let mut out = [0u8; 2];
+        client.read_exact(&mut out).await.unwrap();
+        // Starting a new handler resets the per-response write flag.
+        c.set(Phase::Handler);
+        assert!(!c.wrote_bytes());
     }
 }

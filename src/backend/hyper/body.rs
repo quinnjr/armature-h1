@@ -108,12 +108,34 @@ where
 pub(crate) struct HyperOutBody {
     body: crate::service::ResponseBody,
     done: bool,
+    /// Told when the body has no more frames, which is half of the clock's
+    /// "this response is finished" signal (the other half is a drained write
+    /// buffer). Without it a keep-alive connection could not tell an idle wait
+    /// from a stalled write.
+    clock: Rc<super::PhaseClock>,
 }
 
 impl HyperOutBody {
-    pub(crate) fn new(body: crate::service::ResponseBody) -> Self {
-        let done = matches!(body, crate::service::ResponseBody::Empty);
-        Self { body, done }
+    pub(crate) fn new(body: crate::service::ResponseBody, clock: Rc<super::PhaseClock>) -> Self {
+        // A zero-length body is finished before it starts. That has to include
+        // an *empty* `Full`, not just `Empty`: hyper reads the size hint, sees
+        // `Content-Length: 0`, and closes the message out without ever polling
+        // the body — so `poll_frame` is not a signal that would ever arrive.
+        let done = match &body {
+            crate::service::ResponseBody::Empty => true,
+            crate::service::ResponseBody::Full(b) => b.is_empty(),
+            crate::service::ResponseBody::Stream(_) => false,
+        };
+        if done {
+            clock.note_body_end();
+        }
+        Self { body, done, clock }
+    }
+
+    /// Mark the body finished, once.
+    fn finish(&mut self) {
+        self.done = true;
+        self.clock.note_body_end();
     }
 }
 
@@ -130,12 +152,12 @@ impl ::hyper::body::Body for HyperOutBody {
         }
         match &mut self.body {
             crate::service::ResponseBody::Empty => {
-                self.done = true;
+                self.finish();
                 Poll::Ready(None)
             }
             crate::service::ResponseBody::Full(b) => {
                 let data = std::mem::take(b);
-                self.done = true;
+                self.finish();
                 if data.is_empty() {
                     Poll::Ready(None)
                 } else {
@@ -145,7 +167,7 @@ impl ::hyper::body::Body for HyperOutBody {
             crate::service::ResponseBody::Stream(s) => match s.as_mut().poll_next(cx) {
                 Poll::Pending => Poll::Pending,
                 Poll::Ready(None) => {
-                    self.done = true;
+                    self.finish();
                     Poll::Ready(None)
                 }
                 Poll::Ready(Some(Ok(chunk))) => {
@@ -155,7 +177,7 @@ impl ::hyper::body::Body for HyperOutBody {
                     // Mid-stream failure: erroring the body makes hyper drop
                     // the connection without a terminating chunk, which is the
                     // native loop's Disposition::Close for the same case.
-                    self.done = true;
+                    self.finish();
                     Poll::Ready(Some(Err(e)))
                 }
             },
@@ -179,6 +201,10 @@ impl ::hyper::body::Body for HyperOutBody {
 
 #[cfg(test)]
 mod tests {
+    fn out_clock() -> Rc<super::super::PhaseClock> {
+        Rc::new(super::super::PhaseClock::new(super::super::Phase::Write))
+    }
+
     use super::*;
     use crate::header::HeaderId;
     use bytes::Bytes;
@@ -288,7 +314,7 @@ mod tests {
 
     #[test]
     fn empty_body_ends_immediately_with_exact_zero_hint() {
-        let mut b = HyperOutBody::new(ResponseBody::Empty);
+        let mut b = HyperOutBody::new(ResponseBody::Empty, out_clock());
         assert!(::hyper::body::Body::is_end_stream(&b));
         assert_eq!(::hyper::body::Body::size_hint(&b).exact(), Some(0));
         assert!(matches!(poll_out(&mut b), Poll::Ready(None)));
@@ -296,7 +322,10 @@ mod tests {
 
     #[test]
     fn full_body_yields_one_frame_with_exact_hint() {
-        let mut b = HyperOutBody::new(ResponseBody::Full(Bytes::from_static(b"hello")));
+        let mut b = HyperOutBody::new(
+            ResponseBody::Full(Bytes::from_static(b"hello")),
+            out_clock(),
+        );
         assert_eq!(::hyper::body::Body::size_hint(&b).exact(), Some(5));
         let Poll::Ready(Some(Ok(frame))) = poll_out(&mut b) else {
             panic!("expected a data frame");
@@ -321,7 +350,7 @@ mod tests {
                 }
             }
         }
-        let mut b = HyperOutBody::new(ResponseBody::Stream(Box::pin(Two(0))));
+        let mut b = HyperOutBody::new(ResponseBody::Stream(Box::pin(Two(0))), out_clock());
         assert_eq!(::hyper::body::Body::size_hint(&b).exact(), None);
         let Poll::Ready(Some(Ok(f))) = poll_out(&mut b) else {
             panic!()

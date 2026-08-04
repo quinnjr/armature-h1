@@ -91,8 +91,8 @@ pub(crate) struct Bridge<S> {
     /// Filled only when a 101 on a request that asked for an upgrade goes out.
     pub(crate) upgrade_slot: Rc<RefCell<Option<::hyper::upgrade::OnUpgrade>>>,
     pub(crate) sent_101: Rc<Cell<bool>>,
-    /// The watchdog's phase clock: `Handler` while the handler runs, back to
-    /// `Idle` once a response is ready to go out.
+    /// The watchdog's phase clock: `Handler` while the handler runs, `Write`
+    /// once a response is handed to hyper.
     pub(crate) phase: Rc<PhaseClock>,
 }
 
@@ -122,8 +122,15 @@ impl<S: H1Service + 'static>
             let head = match convert_head(&parts, &cfg.limits) {
                 Ok(h) => h,
                 Err(status) => {
-                    phase.set(Phase::Idle);
-                    return Ok(reject(status));
+                    phase.set(Phase::Write);
+                    // Anything hyper parsed as neither 1.0 nor 1.1 gets a 1.1
+                    // status line, exactly as the native loop answers a head it
+                    // could not version.
+                    let v = match parts.version {
+                        ::hyper::http::Version::HTTP_10 => Version::Http10,
+                        _ => Version::Http11,
+                    };
+                    return Ok(reject(status, v, phase));
                 }
             };
 
@@ -132,8 +139,8 @@ impl<S: H1Service + 'static>
             let kind = match crate::framing::decide(&head, &cfg.limits) {
                 Ok(k) => k,
                 Err(e) => {
-                    phase.set(Phase::Idle);
-                    return Ok(reject(e.status()));
+                    phase.set(Phase::Write);
+                    return Ok(reject(e.status(), head.version, phase));
                 }
             };
 
@@ -142,6 +149,16 @@ impl<S: H1Service + 'static>
             let expects_continue = head
                 .get_str(&HeaderId::Expect)
                 .is_some_and(|v| v.eq_ignore_ascii_case("100-continue"));
+
+            // Captured before `head` moves into the `Request`: hyper writes the
+            // status line from the response's own version, so a 1.0 request
+            // whose response defaulted to 1.1 would both mislabel the status
+            // line and let hyper apply 1.1 framing (chunked) to a 1.0 peer.
+            let version = head.version;
+            // hyper only keeps a 1.0 connection alive if the response says so
+            // explicitly, and the native writer emits exactly this field for
+            // the same case (`write::write_head`, Http10 + keep_alive).
+            let keep_alive = head.is_keep_alive();
 
             let fully_read = Rc::new(Cell::new(false));
             let trailers_slot = Rc::new(RefCell::new(None));
@@ -173,18 +190,36 @@ impl<S: H1Service + 'static>
 
             // The handler window is over. Response writing is hyper's; the
             // watchdog treats it as idle (see BACKENDS.md on write_timeout).
-            phase.set(Phase::Idle);
-            Ok(convert_response(resp, &cfg, force_close))
+            phase.set(Phase::Write);
+            Ok(convert_response(
+                resp,
+                &cfg,
+                version,
+                phase,
+                keep_alive && !force_close,
+            ))
         })
+    }
+}
+
+/// The wire version hyper should write this response's status line in.
+fn wire_version(version: Version) -> ::hyper::http::Version {
+    match version {
+        Version::Http10 => ::hyper::http::Version::HTTP_10,
+        Version::Http11 => ::hyper::http::Version::HTTP_11,
     }
 }
 
 /// An empty rejection response that also closes the connection, matching the
 /// native rule that any framing rejection closes.
-fn reject(status: u16) -> BridgeResponse {
+fn reject(status: u16, version: Version, clock: Rc<PhaseClock>) -> BridgeResponse {
     let mut r = ::hyper::http::Response::builder()
         .status(::hyper::http::StatusCode::from_u16(status).expect("known status"))
-        .body(HyperOutBody::new(crate::service::ResponseBody::Empty))
+        .version(wire_version(version))
+        .body(HyperOutBody::new(
+            crate::service::ResponseBody::Empty,
+            clock,
+        ))
         .expect("static response");
     r.headers_mut().insert(
         ::hyper::http::header::CONNECTION,
@@ -196,7 +231,12 @@ fn reject(status: u16) -> BridgeResponse {
 fn convert_response(
     resp: crate::service::Response,
     cfg: &ConnConfig,
-    force_close: bool,
+    version: Version,
+    clock: Rc<PhaseClock>,
+    // Whether the connection persists after this response — the native writer's
+    // `keep_alive`: the request asked for it *and* nothing (an unread body, a
+    // rejection) forces a close.
+    keep_alive: bool,
 ) -> BridgeResponse {
     let crate::service::Response {
         status,
@@ -216,11 +256,19 @@ fn convert_response(
         body
     };
 
-    let mut builder = ::hyper::http::Response::builder().status(status);
+    // hyper writes the status line — and picks its framing — from the
+    // response's version, so it has to carry the request's.
+    let mut builder = ::hyper::http::Response::builder()
+        .status(status)
+        .version(wire_version(version));
     let mut has_server = false;
+    let mut has_connection = false;
     for (id, value) in headers.into_iter() {
         if id == HeaderId::Server {
             has_server = true;
+        }
+        if id == HeaderId::Connection {
+            has_connection = true;
         }
         let Ok(name) = ::hyper::http::HeaderName::from_bytes(id.as_str().as_bytes()) else {
             continue;
@@ -236,15 +284,28 @@ fn convert_response(
     {
         builder = builder.header(::hyper::http::header::SERVER, v);
     }
-    if force_close {
-        builder = builder.header(
-            ::hyper::http::header::CONNECTION,
-            ::hyper::http::HeaderValue::from_static("close"),
-        );
+    // The same table `write::write_head` uses, so the field matches the native
+    // writer's byte for byte: a handler that set `Connection` itself owns the
+    // field; HTTP/1.1 persistence is the default and saying so would be noise;
+    // HTTP/1.0 persistence has to be stated, because hyper closes a 1.0
+    // connection whose response does not; and a connection that will not
+    // persist says so, which hyper leaves implicit on 1.0.
+    if !has_connection {
+        let field = match (version, keep_alive) {
+            (Version::Http11, true) => None,
+            (Version::Http10, true) => Some("keep-alive"),
+            (_, false) => Some("close"),
+        };
+        if let Some(field) = field {
+            builder = builder.header(
+                ::hyper::http::header::CONNECTION,
+                ::hyper::http::HeaderValue::from_static(field),
+            );
+        }
     }
 
     builder
-        .body(HyperOutBody::new(body))
+        .body(HyperOutBody::new(body, clock))
         .expect("converted response is valid")
 }
 
