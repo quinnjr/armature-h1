@@ -9,6 +9,13 @@ of what could not be shimmed. Every
 `#[cfg_attr(feature = "hyper-backend", ignore)]` in the test suite must
 reference a row here; a row without a strong justification is a bug.
 
+**Verified against hyper 1.10.x and http 1.4.x.** Every "why it cannot be
+shimmed" below cites the behaviour of a specific upstream version, and several
+cite specific source files. A minor-version bump of either crate can add the
+hook a row says does not exist, or move the code a row points at: recheck the
+citations — and re-run the ignored conformance tests unignored — whenever
+either dependency's minor version moves.
+
 The shape of every unshimmable case is the same: hyper owns the transport from
 the first byte of a head until it hands a parsed `http::Request` to the service
 bridge. Anything it decides in that window — how permissively it parses, which
@@ -49,13 +56,24 @@ races hyper's future. That reconstruction is exact for `idle`, `header` and
 | Behavior | Native | hyper backend | Why it cannot be shimmed |
 |---|---|---|---|
 | `write_timeout` granularity | Re-armed per flush, i.e. once per body chunk | Re-armed on every write that reaches the transport | hyper exposes no per-flush boundary to re-arm against; the IO adapter sees writes, not flush boundaries. Finer-grained, so a progressing stream never expires under either. |
-| Keep-alive wait after a `HEAD` response | Bounded by `idle_timeout` (75s default) | Bounded by `write_timeout` (30s default): the connection never leaves the write phase | hyper forces `Encoder::length(0)` for `HEAD` and never polls the response body, so the body's end-of-stream — half of the only externally observable "response finished" signal — never fires. The wait is still bounded, is *shorter* than native's, and the close is silent under both. Same shape for any future case where hyper finishes a message without draining its body. |
 | A pipelined head arriving while a response is still being written | Arms `header_timeout` from the head's first byte | Leaves the phase at `Write`, so that head is bounded by `write_timeout` | Re-phasing `Write -> Head` would put `header_timeout` over the remainder of a perfectly healthy response stream and kill it. A head that arrives *after* a response completes is unaffected: the connection is back in `Idle`, so `Idle -> Head` fires and `header_timeout` applies exactly as native. |
-| `write_timeout` expiry, and any expiry after bytes have gone out for the current response | Writes nothing, closes | Writes nothing, closes | Parity, listed because it is a deliberate suppression rather than an accident: splicing a bare `408` into a half-written body would corrupt framing the peer is already parsing. |
+| `write_timeout` expiry, and any expiry after bytes of the *final* response have gone out | Writes nothing, closes | Writes nothing, closes | Parity, listed because it is a deliberate suppression rather than an accident: splicing a bare `408` into a half-written response would corrupt framing the peer is already parsing. The suppression is scoped to bytes written in the write phase, so hyper's eager interim `100 Continue` (written in the handler phase) does not trigger it — an interim response is defined to be followed by a final one, and native writes the `408` after one too. |
+
+A note on the `HEAD` keep-alive wait, which an earlier revision listed here as
+unshimmable: hyper forces `Encoder::length(0)` for a `HEAD` response and never
+polls the response body, so the body's own end-of-stream — half of the only
+externally observable "response finished" signal — cannot fire. The bridge
+knows the method before `head` moves into the `Request` and signals end-of-stream
+on hyper's behalf for `HEAD`, so the connection returns to the idle phase and
+the wait is bounded by `idle_timeout` exactly as native. The shim is exact
+rather than a guess because hyper's zero-length encoder for `HEAD` is a
+guarantee, not a heuristic. Any *other* case where hyper finishes a message
+without draining its body would need the same treatment.
 
 ## Responses
 
 | Behavior | Native | hyper backend | Why it cannot be shimmed |
 |---|---|---|---|
 | `Expect: 100-continue` interim response | Sent lazily on the handler's first body read; a handler that rejects without reading sends none | Sent eagerly by hyper when it parses `Expect` | hyper owns the transport during head processing; there is no pre-write hook to defer the interim response. |
+| A handler status code outside `http`'s accepted range (`< 100` or `> 999`) | The raw `u16` is written into the status line verbatim; the writer never inspects it | `bridge::convert_response` falls back to `500 Internal Server Error` | hyper's response type is `http::Response`, whose status is a `StatusCode`; there is no way to hand hyper an arbitrary `u16`. `StatusCode::from_u16` is the only constructor, and it rejects anything outside `100..=999`. A three-digit status in that range round-trips unchanged, so this is only reachable from a handler that constructs an out-of-range status — which is a handler bug under either backend, degraded differently. |
 | A handler `Connection` field on a response that must close (unread request body) | The handler's value is written verbatim; the loop closes anyway, because reuse is decided from `body_consumed`, not from the field | The handler's value is dropped and `Connection: close` is written | hyper decides reuse *from the response's `Connection` field*. Honouring a handler `keep-alive` there would reuse a connection the native loop closes — hyper drains a small unread body and serves the next pipelined request. Overriding the field is the only lever the bridge has over hyper's accounting; the close behaviour matches, only the emitted field differs. |
