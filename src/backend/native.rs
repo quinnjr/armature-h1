@@ -1,7 +1,13 @@
 //! The bespoke `Connection` loop, behind the backend seam.
 //!
-//! Always compiled: `Connection` is public API regardless of feature, and the
-//! differential story depends on the bespoke stack existing under both builds.
+//! Compiled unconditionally, including under `hyper-backend` where the
+//! active-backend alias selects hyper and nothing in this file is constructed.
+//! That is deliberate: keeping the seam's native side type-checked in every
+//! feature combination is what stops a change to `Backend`, `H1Service` or
+//! `Upgraded` from compiling green on one feature row and breaking the other.
+//! (The differential fuzz target reaches the native stack through
+//! `Connection::with_buffered` directly, not through `NativeBackend`, so it is
+//! not what keeps these items alive.) Hence the `dead_code` allowances below.
 
 use super::Backend;
 use crate::conn::{ConnConfig, Connection};
@@ -14,9 +20,6 @@ use std::rc::Rc;
 use tokio::io::{AsyncRead, AsyncWrite};
 
 /// Shares one service across every connection on a worker.
-// Under `hyper-backend` the active-backend alias selects hyper, so nothing
-// constructs this; it stays compiled because `Connection` is public API and
-// the differential story depends on the bespoke stack existing either way.
 #[cfg_attr(feature = "hyper-backend", allow(dead_code))]
 pub(crate) struct RcService<S>(pub(crate) Rc<S>);
 
@@ -29,9 +32,6 @@ impl<S: H1Service> H1Service for RcService<S> {
     }
 }
 
-// Under `hyper-backend` the active-backend alias selects hyper, so nothing
-// constructs this; it stays compiled because `Connection` is public API and
-// the differential story depends on the bespoke stack existing either way.
 #[cfg_attr(feature = "hyper-backend", allow(dead_code))]
 pub(crate) struct NativeBackend;
 

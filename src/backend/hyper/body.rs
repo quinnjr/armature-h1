@@ -45,7 +45,16 @@ where
                 }
                 Poll::Ready(Some(Ok(frame))) => {
                     let frame = match frame.into_data() {
-                        Ok(data) => return Poll::Ready(Ok(data)),
+                        Ok(data) => {
+                            if data.is_empty() {
+                                // An empty data frame is not EOF in hyper's
+                                // framing, but `BodyIo::poll_fill`'s contract
+                                // treats an empty return as EOF. Skip it so a
+                                // zero-length frame doesn't truncate the body.
+                                continue;
+                            }
+                            return Poll::Ready(Ok(data));
+                        }
                         Err(frame) => frame,
                     };
                     if let Ok(map) = frame.into_trailers() {
@@ -201,16 +210,17 @@ impl ::hyper::body::Body for HyperOutBody {
 
 #[cfg(test)]
 mod tests {
-    fn out_clock() -> Rc<super::super::PhaseClock> {
-        Rc::new(super::super::PhaseClock::new(super::super::Phase::Write))
-    }
-
+    use super::super::{Phase, PhaseClock};
     use super::*;
     use crate::header::HeaderId;
     use bytes::Bytes;
     use std::collections::VecDeque;
     use std::pin::Pin;
     use std::task::{Context, Poll};
+
+    fn out_clock() -> Rc<PhaseClock> {
+        Rc::new(PhaseClock::new(Phase::Write))
+    }
 
     /// A scripted `http_body::Body` standing in for `Incoming`.
     struct Scripted(VecDeque<::hyper::body::Frame<Bytes>>);
@@ -246,6 +256,16 @@ mod tests {
         ]);
         assert_eq!(&fill(&mut io).await.unwrap()[..], b"hel");
         assert_eq!(&fill(&mut io).await.unwrap()[..], b"lo");
+        assert!(fill(&mut io).await.unwrap().is_empty(), "EOF is empty");
+    }
+
+    #[tokio::test]
+    async fn skips_empty_data_frames_instead_of_treating_them_as_eof() {
+        let mut io = body_io(vec![
+            ::hyper::body::Frame::data(Bytes::new()),
+            ::hyper::body::Frame::data(Bytes::from_static(b"rest")),
+        ]);
+        assert_eq!(&fill(&mut io).await.unwrap()[..], b"rest");
         assert!(fill(&mut io).await.unwrap().is_empty(), "EOF is empty");
     }
 

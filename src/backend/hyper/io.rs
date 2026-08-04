@@ -15,6 +15,15 @@ use std::rc::Rc;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
+/// Upper bound on the reusable scratch buffer `HyperIo::poll_read` grows into.
+///
+/// Hyper only ever asks for up to its own `max_buf_size` (this crate's
+/// `.max_buf_size` builder call, floored at hyper's 8 KiB minimum) per call,
+/// so in practice growth stops at whatever that is configured to. The cap
+/// here is a second, independent ceiling so a `ReadBufCursor::remaining()`
+/// hyper never actually reports still cannot drive an unbounded allocation.
+const MAX_SCRATCH: usize = 64 * 1024;
+
 pub(crate) struct IoShared<IO> {
     pub(crate) io: IO,
     /// Bytes read before hyper took over (h2c sniff read-ahead). Served first.
@@ -28,6 +37,15 @@ pub(crate) struct IoShared<IO> {
     /// which is what re-arms `write_timeout` the way the native writer re-arms
     /// per flush.
     pub(crate) clock: Rc<PhaseClock>,
+    /// Reusable scratch for `HyperIo::poll_read`'s `ReadBufCursor` bridge.
+    ///
+    /// Grows via `Vec::resize`, which zero-fills only the newly added tail —
+    /// bytes already in the vector from an earlier, larger read are left as
+    /// they were and simply overwritten by the next read. Once grown to a
+    /// connection's steady-state read size it is never resized again, so
+    /// this pays the zero-fill cost once per connection rather than on every
+    /// poll (including `Pending` ones).
+    scratch: Vec<u8>,
 }
 
 impl<IO: AsyncRead + AsyncWrite + Unpin> IoShared<IO> {
@@ -96,6 +114,67 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> IoShared<IO> {
         }
         poll
     }
+
+    /// Bridge hyper's `ReadBufCursor` into a safe read, via the reusable
+    /// scratch buffer.
+    ///
+    /// `ReadBufCursor`'s uninit-filling API is unsafe; this crate forbids
+    /// unsafe. Reading into a plain, already-initialized `&mut [u8]` scratch
+    /// and copying out via the safe `put_slice` avoids it — one memcpy per
+    /// read, same trade `conn.rs` documents for its own read buffer. Sizing
+    /// `scratch` to `buf.remaining()` (capped at [`MAX_SCRATCH`]) rather than
+    /// a fixed 8 KiB lets a single read fill whatever hyper is actually
+    /// willing to accept, instead of silently halving reads against a 16 KiB
+    /// `max_buf_size`.
+    fn poll_read_cursor(
+        &mut self,
+        cx: &mut Context<'_>,
+        mut buf: ::hyper::rt::ReadBufCursor<'_>,
+    ) -> Poll<io::Result<()>> {
+        let want = buf.remaining().min(MAX_SCRATCH);
+        // `Ready(Ok(()))` having moved zero bytes *is* end-of-stream under
+        // `hyper::rt::Read` — it is the only way this adapter can report EOF —
+        // so a zero-remaining cursor must never reach the read below: it would
+        // report a live connection as closed. hyper does not issue such a call
+        // (it always hands over a cursor with room), which makes one a broken
+        // caller contract rather than a condition to handle, hence the assert.
+        //
+        // In release the read is skipped instead, and the task re-woken: no
+        // byte is consumed, nothing is reported as EOF, and hyper polls again
+        // once its own buffer has room. The wake is what keeps this from being
+        // a hang — a bare `Pending` here registers no waker, since the
+        // transport was never polled — and it cannot spin, because hyper does
+        // not repeat the call.
+        debug_assert!(
+            want > 0,
+            "hyper::rt::Read was polled with a zero-remaining cursor; \
+             a zero-byte read would be reported to hyper as end-of-stream"
+        );
+        if want == 0 {
+            cx.waker().wake_by_ref();
+            return Poll::Pending;
+        }
+        // Taken out rather than sliced in place: `ReadBuf::new` would borrow
+        // `self.scratch`, which would then conflict with the `&mut self`
+        // `poll_read_into` needs below. Put back before returning either way.
+        let mut scratch = std::mem::take(&mut self.scratch);
+        if scratch.len() < want {
+            // Only the newly added tail is zero-filled; the previously
+            // grown-into prefix is left as-is and simply overwritten below.
+            scratch.resize(want, 0);
+        }
+        let mut read_buf = ReadBuf::new(&mut scratch[..want]);
+        let result = match self.poll_read_into(cx, &mut read_buf) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+            Poll::Ready(Ok(())) => {
+                buf.put_slice(read_buf.filled());
+                Poll::Ready(Ok(()))
+            }
+        };
+        self.scratch = scratch;
+        result
+    }
 }
 
 pub(crate) struct HyperIo<IO>(pub(crate) Rc<RefCell<IoShared<IO>>>);
@@ -110,6 +189,7 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> HyperIo<IO> {
             io,
             buffered,
             clock,
+            scratch: Vec::new(),
         }));
         (Self(shared.clone()), shared)
     }
@@ -119,23 +199,9 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> ::hyper::rt::Read for HyperIo<IO> {
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
-        mut buf: ::hyper::rt::ReadBufCursor<'_>,
+        buf: ::hyper::rt::ReadBufCursor<'_>,
     ) -> Poll<io::Result<()>> {
-        // `ReadBufCursor`'s uninit API is unsafe; this crate forbids unsafe.
-        // Read into a small initialized scratch and copy via the safe
-        // `put_slice`. One memcpy per read, same trade `conn.rs` documents for
-        // its zeroed read buffer.
-        let mut scratch = [0u8; 8 * 1024];
-        let want = scratch.len().min(buf.remaining());
-        let mut read_buf = ReadBuf::new(&mut scratch[..want]);
-        match self.0.borrow_mut().poll_read_into(cx, &mut read_buf) {
-            Poll::Pending => Poll::Pending,
-            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
-            Poll::Ready(Ok(())) => {
-                buf.put_slice(read_buf.filled());
-                Poll::Ready(Ok(()))
-            }
-        }
+        self.0.borrow_mut().poll_read_cursor(cx, buf)
     }
 }
 

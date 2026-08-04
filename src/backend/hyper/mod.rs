@@ -9,12 +9,22 @@
 //! reproduces the native reaction to each expiry.
 //!
 //! The reconstruction is exact for `idle_timeout`, `header_timeout` and
-//! `body_timeout`. Where it is not — `write_timeout` granularity, a pipelined
-//! head arriving mid-write — and for every non-timing divergence (hyper's
+//! `body_timeout` when they apply to an otherwise-idle connection. Where it is
+//! not — `write_timeout` granularity, and a pipelined head that arrives
+//! *during* a response write — and for every non-timing divergence (hyper's
 //! parser permissiveness, its own status choices for heads it rejects, the
 //! `max_buf_size` floor under `max_head_bytes`, its status-code type),
 //! BACKENDS.md is the exhaustive list, with the reason each one cannot be
-//! shimmed. Every `#[cfg_attr(feature = "hyper-backend", ignore)]`
+//! shimmed. A partial head arriving mid-write is one such case: `note_read`
+//! only re-phases from `Phase::Idle` (see its doc), so those bytes sit
+//! buffered without starting `header_timeout`; once the response finishes and
+//! the connection returns to `Phase::Idle`, the already-buffered partial head
+//! does not produce another read to re-arm anything, so the wait is bounded
+//! by `idle_timeout` with a silent close rather than `header_timeout` and a
+//! 408. That is the safe direction — no unbounded wait — just not the native
+//! reaction; pinned by the `tests` module's
+//! `a_partial_head_arriving_mid_write_is_bounded_by_the_idle_deadline`.
+//! Every `#[cfg_attr(feature = "hyper-backend", ignore)]`
 //! in the test suite points at a row there.
 
 pub(crate) mod body;
@@ -37,6 +47,9 @@ use std::io as stdio;
 use std::rc::Rc;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
+
+/// hyper's hard floor for `max_buf_size`; passing less panics.
+const MIN_HYPER_BUF: usize = 8 * 1024;
 
 /// What the connection is waiting on, which picks the deadline that applies.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -69,7 +82,12 @@ pub(crate) struct PhaseClock {
     /// final response already on the wire mean a 408 would be spliced into a
     /// message the peer is mid-parse of.
     ///
-    /// Writes taken in any other phase are *interim* — hyper's eager
+    /// Also set on writes taken in [`Phase::Head`], which are hyper's *own*
+    /// final error response (400/431/505) for a head it refused to parse: a
+    /// bare 408 appended to a truncated 400 is two final responses for one
+    /// request, which poisons the response queue behind a pipelining proxy.
+    ///
+    /// Writes taken in [`Phase::Handler`] are *interim* — hyper's eager
     /// `100 Continue` is the only one this crate can produce — and must not
     /// latch the flag: an interim response is explicitly followed by a final
     /// one, so a 408 after it is correct framing, and it is what the native
@@ -80,6 +98,13 @@ pub(crate) struct PhaseClock {
     /// the "response finished" signal; the other half is a drained write
     /// buffer, which is a successful flush.
     body_done: Cell<bool>,
+    /// Set once the transport has been handed to an upgrade consumer. From
+    /// that point nobody is watching this clock — the watchdog is gone with
+    /// the serve future — but the handed-out `SharedIo` still routes through
+    /// `IoShared`, so post-101 traffic would keep calling `note_write` and
+    /// `note_flush`. Detaching makes both no-ops rather than pointless
+    /// `notify_waiters()` calls and phase flips on a dead clock.
+    detached: Cell<bool>,
     notify: tokio::sync::Notify,
 }
 
@@ -90,8 +115,14 @@ impl PhaseClock {
             generation: Cell::new(0),
             wrote_bytes: Cell::new(false),
             body_done: Cell::new(false),
+            detached: Cell::new(false),
             notify: tokio::sync::Notify::new(),
         }
+    }
+
+    /// Stop tracking: the transport has left for an upgrade consumer.
+    pub(crate) fn detach(&self) {
+        self.detached.set(true);
     }
 
     pub(crate) fn phase(&self) -> Phase {
@@ -114,6 +145,9 @@ impl PhaseClock {
     /// every 408 after the first response would be suppressed as if it were
     /// about to be spliced into a write.
     pub(crate) fn set(&self, p: Phase) {
+        if self.detached.get() {
+            return;
+        }
         if matches!(p, Phase::Idle | Phase::Handler) {
             self.wrote_bytes.set(false);
             self.body_done.set(false);
@@ -124,16 +158,31 @@ impl PhaseClock {
 
     /// Record that bytes reached the transport, re-arming a write deadline.
     ///
-    /// Only [`Phase::Write`] counts, for both effects. Elsewhere the write is
-    /// an interim `100 Continue` or hyper's own error response: neither should
-    /// extend the header or body deadline it happened under, and neither is a
-    /// message a later bare 408 could be spliced *into*. The bridge enters
-    /// [`Phase::Write`] before it hands the response back — on the success path
-    /// and on both rejection paths — so every byte of a final response is taken
-    /// under this phase.
+    /// The two effects are scoped differently.
+    ///
+    /// *Re-arming* is a [`Phase::Write`] concept only: it is response progress
+    /// buying more `write_timeout`. A write taken under `header_timeout` or
+    /// `body_timeout` must not extend the deadline the peer is being measured
+    /// against.
+    ///
+    /// *Latching* `wrote_bytes` covers [`Phase::Write`] **and**
+    /// [`Phase::Head`]. The bridge enters `Phase::Write` before it hands a
+    /// response back — success path and both rejection paths — so every byte
+    /// of *this crate's* final responses is taken there. But hyper writes its
+    /// own final 4xx/5xx (400, 431, 505) for a head it refuses to parse, and
+    /// it does that while the clock is still in `Phase::Head`. Those bytes are
+    /// a final response too: a head-phase expiry racing them would truncate
+    /// the 400 and append a bare 408, giving the peer two final responses for
+    /// one request. Writes in [`Phase::Handler`] are the interim
+    /// `100 Continue`, which deliberately does not latch (see `wrote_bytes`).
     pub(crate) fn note_write(&self) {
-        if self.phase.get() == Phase::Write {
+        if self.detached.get() {
+            return;
+        }
+        if matches!(self.phase.get(), Phase::Write | Phase::Head) {
             self.wrote_bytes.set(true);
+        }
+        if self.phase.get() == Phase::Write {
             self.bump();
         }
     }
@@ -150,6 +199,9 @@ impl PhaseClock {
     /// [`Phase::Idle`] so a keep-alive wait is bounded by `idle_timeout` rather
     /// than `write_timeout`.
     pub(crate) fn note_flush(&self) {
+        if self.detached.get() {
+            return;
+        }
         if self.phase.get() == Phase::Write && self.body_done.get() {
             self.set(Phase::Idle);
         }
@@ -228,11 +280,21 @@ async fn write_error_close<IO: AsyncRead + AsyncWrite + Unpin>(
 
 /// Walk the error source chain for an `io::Error` to preserve error-kind
 /// parity with the native loop where possible.
+///
+/// The error cannot be moved out of the chain (it is borrowed), so it is
+/// rebuilt. An OS-level error is rebuilt from its errno, which keeps
+/// `raw_os_error()` intact: the native loop propagates the original error, and
+/// an embedder matching on errno must get the same answer under both backends.
+/// Errors with no errno — hyper's own synthesized IO errors — fall back to
+/// kind plus message, which is all there is to preserve.
 fn find_io_error(e: &::hyper::Error) -> Option<stdio::Error> {
     let mut source: Option<&(dyn std::error::Error + 'static)> = Some(e);
     while let Some(s) = source {
         if let Some(io_err) = s.downcast_ref::<stdio::Error>() {
-            return Some(stdio::Error::new(io_err.kind(), io_err.to_string()));
+            return Some(match io_err.raw_os_error() {
+                Some(code) => stdio::Error::from_raw_os_error(code),
+                None => stdio::Error::new(io_err.kind(), io_err.to_string()),
+            });
         }
         source = s.source();
     }
@@ -277,6 +339,18 @@ impl Backend for HyperBackend {
             // hyper refuses to go below its own 8 KiB floor, so a smaller
             // configured cap is enforced only by `convert_head`.
             .max_buf_size(cfg.limits.max_head_bytes.max(MIN_HYPER_BUF))
+            // Field-count cap, pushed down so hyper's parser and
+            // `convert_head` agree on where "too many headers" starts.
+            // hyper's own default is 100 while `Limits::max_headers` may be
+            // configured up to `MAX_HEADERS_CEILING` (128), so without this a
+            // 101..=128 configuration has hyper rejecting heads this crate
+            // accepts. Both rejections are a 431, so pushing the real cap down
+            // costs no status divergence. There is no floor on this setter
+            // (unlike `max_buf_size`), but setting it at all moves hyper's
+            // header scratch from the stack to the heap — one allocation per
+            // request, which hyper documents as roughly a 5% parse cost. That
+            // is the price of the two parsers agreeing.
+            .max_headers(cfg.limits.max_headers)
             // Native semantics: EOF on read closes; responses flush per
             // response, not batched across pipelined requests.
             //
@@ -330,17 +404,43 @@ impl Backend for HyperBackend {
                     _ => Version::Http11,
                 };
                 // Unless bytes of a *final* response are already on the wire,
-                // which a 408 would be spliced into. An interim `100 Continue`
-                // does not count: it is defined to be followed by a final
-                // response, and native writes the 408 after one too.
+                // which a 408 would be spliced into. In `Phase::Head` that is
+                // reachable: hyper writes its own 400/431/505 for a head it
+                // refuses, under this very phase, and a head-phase expiry can
+                // race it. In `Phase::Handler` it is not — entering `Handler`
+                // clears the flag and the only write taken there is hyper's
+                // interim `100 Continue`, which `note_write` deliberately does
+                // not latch (it is defined to be followed by a final response,
+                // and native writes its 408 after one too).
+                debug_assert!(
+                    phase != Phase::Handler || !clock.wrote_bytes(),
+                    "no final-response bytes can be on the wire in Phase::Handler; \
+                     a new transition into it, or latching interim writes, would \
+                     silently start suppressing the body-timeout 408",
+                );
                 if !clock.wrote_bytes() {
-                    write_error_close(&shared, &date, version, 408).await;
+                    // Deadline the write too. This is the one serving-path
+                    // await reached *because* the peer misbehaved, and a peer
+                    // with a zero receive window can leave it Pending forever
+                    // — pinning the task, the fd and the shared IO with no
+                    // timeout at all. `write_timeout` is the deadline that
+                    // governs every other write on the connection.
+                    deadline.arm(cfg.limits.write_timeout);
+                    tokio::select! {
+                        biased;
+                        () = deadline.expired() => {}
+                        () = write_error_close(&shared, &date, version, 408) => {}
+                    }
                 }
                 Ok(None)
             }
             Ok(Ok(())) => {
                 if sent_101.get() && upgrade_slot.borrow_mut().take().is_some() {
                     let parts = conn.into_parts();
+                    // The transport outlives the watchdog from here on; stop
+                    // the handed-out `SharedIo` from driving a clock nobody
+                    // watches.
+                    clock.detach();
                     return Ok(Some(Upgraded {
                         // hyper's read-ahead satisfies the `buffered`
                         // contract: bytes the peer sent past the 101 head,
@@ -364,9 +464,6 @@ impl Backend for HyperBackend {
         }
     }
 }
-
-/// hyper's hard floor for `max_buf_size`; passing less panics.
-const MIN_HYPER_BUF: usize = 8 * 1024;
 
 #[cfg(test)]
 mod tests {
@@ -449,7 +546,14 @@ mod tests {
         }
     }
 
-    async fn exchange<S>(input: &'static [u8], service: S, limits: Limits) -> String
+    /// Everything the server wrote, and whether it closed the connection.
+    ///
+    /// The `closed` half is load-bearing, not decoration: without it a server
+    /// that *hangs* is indistinguishable from one that closed silently, and
+    /// every "closes silently" assertion degenerates into "wrote nothing
+    /// within two seconds" — which a deleted timeout also satisfies. Same
+    /// shape as `tests/rfc9112.rs`'s `Exchange`.
+    async fn exchange<S>(input: &'static [u8], service: S, limits: Limits) -> (String, bool)
     where
         S: crate::H1Service + 'static,
     {
@@ -460,7 +564,7 @@ mod tests {
         input: &'static [u8],
         service: S,
         config: Rc<ConnConfig>,
-    ) -> String
+    ) -> (String, bool)
     where
         S: crate::H1Service + 'static,
     {
@@ -477,17 +581,27 @@ mod tests {
             .run_until(async move {
                 client.write_all(input).await.unwrap();
                 let mut out = Vec::new();
-                let _ = tokio::time::timeout(Duration::from_secs(2), client.read_to_end(&mut out))
-                    .await;
-                let _ = task.await;
-                String::from_utf8_lossy(&out).into_owned()
+                // `read_to_end` returning `Ok` means the server closed its
+                // side; the timeout elapsing means it is still holding on.
+                let closed = matches!(
+                    tokio::time::timeout(Duration::from_secs(2), client.read_to_end(&mut out))
+                        .await,
+                    Ok(Ok(_))
+                );
+                // Bound the join as well. A serve future that never resolves
+                // has to surface as a failed `closed` assertion in the caller,
+                // not as a test binary that hangs until CI's own timeout —
+                // which is the same "hang looks like success" hole `closed`
+                // exists to close.
+                let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
+                (String::from_utf8_lossy(&out).into_owned(), closed)
             })
             .await
     }
 
     #[tokio::test]
     async fn serves_a_single_request() {
-        let out = exchange(
+        let (out, _closed) = exchange(
             b"GET / HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n",
             hello,
             Limits::default(),
@@ -499,7 +613,7 @@ mod tests {
 
     #[tokio::test]
     async fn full_body_uses_content_length_framing() {
-        let out = exchange(
+        let (out, _closed) = exchange(
             b"GET / HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n",
             hello,
             Limits::default(),
@@ -517,7 +631,7 @@ mod tests {
 
     #[tokio::test]
     async fn echoes_content_length_and_chunked_bodies() {
-        let out = exchange(
+        let (out, _closed) = exchange(
             b"POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello",
             echo,
             Limits::default(),
@@ -525,7 +639,7 @@ mod tests {
         .await;
         assert!(out.ends_with("hello"), "{out}");
 
-        let out = exchange(
+        let (out, _closed) = exchange(
             b"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n5\r\nhello\r\n0\r\n\r\n",
             echo,
             Limits::default(),
@@ -542,7 +656,7 @@ mod tests {
         let started = tokio::time::Instant::now();
         // idle_timeout is 200ms (via `quick`), write_timeout the 30s default:
         // only an actual return to `Phase::Idle` closes this in time.
-        let out = exchange(
+        let (out, _closed) = exchange(
             b"GET / HTTP/1.1\r\nHost: a\r\n\r\n",
             hello,
             Limits::default(),
@@ -558,15 +672,68 @@ mod tests {
 
     #[tokio::test]
     async fn idle_timeout_closes_silently() {
-        let out = exchange(b"", hello, Limits::default()).await;
+        let (out, closed) = exchange(b"", hello, Limits::default()).await;
         assert!(out.is_empty(), "no response owed on idle close: {out}");
+        // Both halves are needed: "wrote nothing" alone is also what a server
+        // that never times out at all produces.
+        assert!(
+            closed,
+            "the idle deadline must actually close the connection"
+        );
     }
 
     #[tokio::test]
     async fn header_timeout_writes_408() {
         // A started-but-never-finished head.
-        let out = exchange(b"GET / HTT", hello, Limits::default()).await;
+        let (out, _closed) = exchange(b"GET / HTT", hello, Limits::default()).await;
         assert!(out.starts_with("HTTP/1.1 408"), "{out}");
+    }
+
+    /// The 408 write needs a deadline of its own.
+    ///
+    /// It is the one serving-path await reached *because* the peer misbehaved,
+    /// and it is aimed straight back at that peer. A slowloris that advertises
+    /// a zero receive window leaves the write Pending forever, and an
+    /// un-deadlined write there pins the task, the fd and the shared IO for
+    /// the life of the process — no timeout, no close, no bound.
+    #[tokio::test]
+    async fn the_408_write_is_bounded_when_the_peer_never_reads() {
+        let limits = Limits {
+            write_timeout: Duration::from_millis(100),
+            ..Default::default()
+        };
+        // An 8-byte transport the client never drains: far too small for the
+        // 408 head, so the write parks after the first few bytes.
+        let (mut client, server) = tokio::io::duplex(8);
+        let local = tokio::task::LocalSet::new();
+        let task = local.spawn_local(HyperBackend::serve(
+            server,
+            Rc::new(hello),
+            cfg(limits),
+            Rc::new(RefCell::new(DateCache::new())),
+            Bytes::new(),
+        ));
+        let finished = local
+            .run_until(async move {
+                // A head that never finishes, so `header_timeout` (200ms via
+                // `quick`) fires and the 408 path is taken.
+                client.write_all(b"GET / HTT").await.unwrap();
+                // `client` stays alive for the whole wait — dropping it would
+                // fail the write with a broken pipe and prove nothing. It is
+                // simply never read from.
+                let r = tokio::time::timeout(Duration::from_secs(2), task).await;
+                // Keep the read half open until the assertion window closes.
+                drop(client);
+                r
+            })
+            .await;
+        // ~200ms header_timeout + ~100ms write_timeout, bounded well under the
+        // 2s outer timeout. Without the deadline on the write this never
+        // resolves.
+        assert!(
+            finished.is_ok(),
+            "an un-deadlined 408 write pins the connection forever"
+        );
     }
 
     /// The 408 is owed on *every* request, not just the first.
@@ -578,11 +745,27 @@ mod tests {
     #[tokio::test]
     async fn header_timeout_writes_408_on_a_reused_connection() {
         let (mut client, server) = tokio::io::duplex(64 * 1024);
+        // A deliberately roomy `idle_timeout`: the whole first exchange —
+        // request write, handler, response write, and the client's read loop —
+        // has to fit inside it on a CI box running four feature rows at once,
+        // and 200ms is not the margin that buys. What this test discriminates
+        // is unaffected: the 408 comes from `header_timeout` (200ms) starting
+        // when the *partial second head* arrives, and 1s of idle grace before
+        // it can only make a wrongly-suppressed 408 easier to see, not harder.
+        let config = Rc::new(ConnConfig {
+            limits: Limits {
+                idle_timeout: Duration::from_secs(1),
+                header_timeout: Duration::from_millis(200),
+                ..Default::default()
+            },
+            tick: Duration::from_millis(10),
+            server_name: None,
+        });
         let local = tokio::task::LocalSet::new();
         let task = local.spawn_local(HyperBackend::serve(
             server,
             Rc::new(hello),
-            cfg(Limits::default()),
+            config,
             Rc::new(RefCell::new(DateCache::new())),
             Bytes::new(),
         ));
@@ -625,7 +808,7 @@ mod tests {
             body_timeout: Duration::from_millis(100),
             ..Default::default()
         };
-        let out = exchange(
+        let (out, _closed) = exchange(
             b"POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\n\r\nhel",
             echo,
             limits,
@@ -650,7 +833,7 @@ mod tests {
             ..Default::default()
         };
         // A declared body that never arrives, after an `Expect` hyper answers.
-        let out = exchange(
+        let (out, _closed) = exchange(
             b"POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\nExpect: 100-continue\r\n\r\n",
             echo,
             limits,
@@ -680,7 +863,7 @@ mod tests {
         }
         let started = tokio::time::Instant::now();
         // idle_timeout is 200ms (via `quick`), write_timeout the 30s default.
-        let out = exchange(
+        let (out, _closed) = exchange(
             b"HEAD / HTTP/1.1\r\nHost: a\r\n\r\n",
             head_hello,
             Limits::default(),
@@ -702,7 +885,7 @@ mod tests {
     /// `HEAD` must leave the connection reusable for a pipelined follow-up.
     #[tokio::test]
     async fn a_head_response_keeps_the_connection_reusable() {
-        let out = exchange(
+        let (out, _closed) = exchange(
             b"HEAD / HTTP/1.1\r\nHost: a\r\n\r\nGET / HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n",
             hello,
             Limits::default(),
@@ -720,7 +903,7 @@ mod tests {
     /// response's version, so the request's has to be carried across.
     #[tokio::test]
     async fn response_echoes_the_request_version() {
-        let out = exchange(
+        let (out, _closed) = exchange(
             b"GET / HTTP/1.0\r\nHost: a\r\n\r\n",
             hello,
             Limits::default(),
@@ -742,13 +925,16 @@ mod tests {
             ))
         }
         let limits = Limits {
-            write_timeout: Duration::from_millis(100),
+            write_timeout: Duration::from_millis(300),
             ..Default::default()
         };
-        // ~300ms of streaming under a 100ms write_timeout, a 200ms
+        // ~300ms of streaming under a 300ms write_timeout, a 200ms
         // idle_timeout and a 200ms header_timeout: only per-write re-arming
-        // gets the whole body out.
-        let out = exchange(
+        // gets the whole body out, because the *total* run outlives both
+        // 200ms deadlines. The write_timeout is 10x the 30ms inter-chunk gap
+        // rather than 3.3x so a scheduling hiccup on a loaded CI box cannot
+        // expire a stream that is in fact progressing.
+        let (out, _closed) = exchange(
             b"GET / HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n",
             stream,
             limits,
@@ -789,7 +975,7 @@ mod tests {
             Rc::new(RefCell::new(DateCache::new())),
             Bytes::new(),
         ));
-        let out = local
+        let (out, closed) = local
             .run_until(async move {
                 client
                     .write_all(
@@ -800,10 +986,13 @@ mod tests {
                 // Read nothing until well past write_timeout.
                 tokio::time::sleep(Duration::from_millis(400)).await;
                 let mut out = Vec::new();
-                let _ = tokio::time::timeout(Duration::from_secs(2), client.read_to_end(&mut out))
-                    .await;
-                let _ = task.await;
-                String::from_utf8_lossy(&out).into_owned()
+                let closed = matches!(
+                    tokio::time::timeout(Duration::from_secs(2), client.read_to_end(&mut out))
+                        .await,
+                    Ok(Ok(_))
+                );
+                let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
+                (String::from_utf8_lossy(&out).into_owned(), closed)
             })
             .await;
         assert!(out.starts_with("HTTP/1.1 200 OK"), "{out}");
@@ -812,6 +1001,87 @@ mod tests {
             "a 408 must never be spliced into a response in flight: {out}"
         );
         assert!(out.len() < 4096, "the stall must cut the body short: {out}");
+        // The silent half of the claim: the write deadline has to actually
+        // close the connection. Without this, a server that simply parked
+        // forever would satisfy every assertion above.
+        assert!(closed, "the stalled write must close the connection");
+    }
+
+    /// A pipelined head split across a response write is bounded by
+    /// `idle_timeout`, not `header_timeout`: `note_read` only re-phases from
+    /// `Phase::Idle` (deliberately — see its doc, and
+    /// `reads_during_a_write_do_not_re_phase` in `io.rs`), so a partial head
+    /// landing in `Phase::Write` never starts the header clock. Once the
+    /// response finishes and the connection returns to `Phase::Idle`, those
+    /// same bytes are already buffered — no further read arrives to start
+    /// the clock there either — so the wait is bounded by `idle_timeout` with
+    /// a silent close, not `header_timeout` and a 408. Pins the module doc's
+    /// caveat on the "exact for idle/header/body" claim.
+    #[tokio::test]
+    async fn a_partial_head_arriving_mid_write_is_bounded_by_the_idle_deadline() {
+        async fn stream(_req: Request) -> Response {
+            // 10 chunks rather than 5: the client's partial second head has to
+            // land while the response is still going out, and a ~600ms stream
+            // leaves that window wide even when the runtime is contended.
+            Response::ok().with_body(TickStream::body(
+                10,
+                Duration::from_millis(60),
+                Bytes::from_static(b"chunk"),
+            ))
+        }
+        let (mut client, server) = tokio::io::duplex(64 * 1024);
+        let local = tokio::task::LocalSet::new();
+        let task = local.spawn_local(HyperBackend::serve(
+            server,
+            Rc::new(stream),
+            cfg(Limits::default()),
+            Rc::new(RefCell::new(DateCache::new())),
+            Bytes::new(),
+        ));
+        let (first, rest, closed) = local
+            .run_until(async move {
+                client
+                    .write_all(b"GET / HTTP/1.1\r\nHost: a\r\n\r\n")
+                    .await
+                    .unwrap();
+                // Wait for the response write to be under way, then send half
+                // a second head while it is still going out.
+                let mut buf = [0u8; 256];
+                let n = client.read(&mut buf).await.unwrap();
+                assert!(n > 0, "no response bytes arrived");
+                client.write_all(b"GET /two HTT").await.unwrap();
+                // Drain the rest of the (chunked, short) response.
+                let mut first = String::from_utf8_lossy(&buf[..n]).into_owned();
+                while !first.ends_with("0\r\n\r\n") {
+                    let n = client.read(&mut buf).await.unwrap();
+                    assert!(n > 0, "server closed before the response finished: {first}");
+                    first.push_str(&String::from_utf8_lossy(&buf[..n]));
+                }
+                // Now stall: the second head is never completed. idle_timeout
+                // (200ms via `quick`) should close the connection silently,
+                // not answer a 408 for the buffered partial head.
+                let mut rest = Vec::new();
+                let closed = matches!(
+                    tokio::time::timeout(Duration::from_secs(2), client.read_to_end(&mut rest))
+                        .await,
+                    Ok(Ok(_))
+                );
+                let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
+                (first, String::from_utf8_lossy(&rest).into_owned(), closed)
+            })
+            .await;
+        assert!(first.starts_with("HTTP/1.1 200 OK"), "{first}");
+        assert!(
+            rest.is_empty(),
+            "a partial head buffered during Phase::Write must not produce a \
+             408 once the connection returns to idle: {rest:?}"
+        );
+        // "Silently" means closed, not hung: the bound has to be `idle_timeout`
+        // and not "no deadline applies here at all".
+        assert!(
+            closed,
+            "the buffered partial head must still be bounded by idle_timeout"
+        );
     }
 
     #[tokio::test]
@@ -852,7 +1122,7 @@ mod tests {
         async fn ignore(_req: Request) -> Response {
             Response::status_only(404)
         }
-        let out = exchange(
+        let (out, _closed) = exchange(
             b"POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\n\r\nhelloGET / HTTP/1.1\r\nHost: a\r\n\r\n",
             ignore,
             Limits::default(),
@@ -878,7 +1148,7 @@ mod tests {
                 Bytes::from_static(b"keep-alive"),
             )
         }
-        let out = exchange(
+        let (out, _closed) = exchange(
             b"POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\n\r\nhelloGET / HTTP/1.1\r\nHost: a\r\n\r\n",
             ignore,
             Limits::default(),
@@ -915,7 +1185,7 @@ mod tests {
                 Bytes::from_static(b"keep\r\nalive"),
             )
         }
-        let out = exchange(
+        let (out, _closed) = exchange(
             b"GET / HTTP/1.0\r\nHost: a\r\nConnection: keep-alive\r\n\r\n",
             bad,
             Limits::default(),
@@ -941,7 +1211,7 @@ mod tests {
             tick: Duration::from_millis(10),
             server_name: Some(Bytes::from_static(b"armature")),
         });
-        let out = exchange_with_cfg(
+        let (out, _closed) = exchange_with_cfg(
             b"GET / HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n",
             bad,
             config,
@@ -964,7 +1234,7 @@ mod tests {
         async fn ignore(_req: Request) -> Response {
             Response::status_only(204)
         }
-        let out = exchange(
+        let (out, _closed) = exchange(
             b"POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 0\r\n\r\nGET / HTTP/1.1\r\nHost: a\r\n\r\n",
             ignore,
             Limits::default(),
@@ -990,12 +1260,231 @@ mod tests {
             body_timeout: Duration::from_millis(100),
             ..Default::default()
         };
-        let out = exchange(
+        let (out, _closed) = exchange(
             b"POST / HTTP/1.0\r\nHost: a\r\nContent-Length: 5\r\n\r\nhel",
             echo,
             limits,
         )
         .await;
         assert!(out.starts_with("HTTP/1.0 408"), "{out}");
+    }
+
+    /// The hyper counterpart of `conn.rs`'s
+    /// `retained_body_across_an_upgrade_closes_instead_of_panicking`.
+    ///
+    /// A handler that stashes the request `Body` in state outliving the
+    /// response still holds a handle on the transport when the 101 handoff is
+    /// attempted. The native loop forfeits the handoff for that reason
+    /// (`into_parts` returns `None` while another handle is live) and answers
+    /// `Ok(None)`. hyper's stack has no such shared-handle check to fail: the
+    /// request body is `Incoming`, which is a channel endpoint rather than a
+    /// borrow of the socket, so `conn.into_parts()` succeeds and the transport
+    /// *is* handed back. That divergence is deliberate and recorded in
+    /// BACKENDS.md; what both backends must guarantee — and what this pins —
+    /// is that the serve future resolves, without panicking and without
+    /// hanging.
+    #[tokio::test]
+    async fn a_retained_body_across_an_upgrade_neither_panics_nor_hangs() {
+        thread_local! {
+            static LEAKED: RefCell<Option<crate::Body>> = const { RefCell::new(None) };
+        }
+
+        async fn switching(req: Request) -> Response {
+            LEAKED.with(|slot| *slot.borrow_mut() = Some(req.body));
+            Response::new(101)
+                .header(crate::HeaderId::Upgrade, Bytes::from_static(b"raw"))
+                .header(crate::HeaderId::Connection, Bytes::from_static(b"upgrade"))
+        }
+
+        let (mut client, server) = tokio::io::duplex(4096);
+        let local = tokio::task::LocalSet::new();
+        let task = local.spawn_local(HyperBackend::serve(
+            server,
+            Rc::new(switching),
+            cfg(Limits::default()),
+            Rc::new(RefCell::new(DateCache::new())),
+            Bytes::new(),
+        ));
+        let served = local
+            .run_until(async move {
+                client
+                    .write_all(
+                        b"GET / HTTP/1.1\r\nHost: a\r\nConnection: upgrade\r\nUpgrade: raw\r\n\r\n",
+                    )
+                    .await
+                    .unwrap();
+                let mut buf = [0u8; 256];
+                let n = client.read(&mut buf).await.unwrap();
+                let head = String::from_utf8_lossy(&buf[..n]).into_owned();
+                assert!(head.starts_with("HTTP/1.1 101"), "{head}");
+                tokio::time::timeout(Duration::from_secs(2), task).await
+            })
+            .await;
+        let served = served
+            .expect("the serve future must resolve, not hang")
+            .expect("the worker task must not panic")
+            .expect("serve");
+        // Where native forfeits the handoff, hyper completes it.
+        assert!(
+            served.is_some(),
+            "hyper's request body does not borrow the transport, so the \
+             handoff still happens — the divergence from native's Ok(None)"
+        );
+        LEAKED.with(|slot| slot.borrow_mut().take());
+    }
+
+    /// `PhaseClock`'s rules, direct.
+    ///
+    /// Everything else that exercises them does so through the timing tests,
+    /// which are the slowest and least precise instruments in the suite: a
+    /// broken rule shows up there as a wrong status or a wall-clock margin,
+    /// several hundred milliseconds later. These are the rules themselves.
+    mod phase_clock {
+        use super::super::{Phase, PhaseClock};
+
+        /// `note_write` latches only where a *final* response can be in
+        /// flight: `Write` (this crate's responses) and `Head` (hyper's own
+        /// 400/431/505 for a head it refuses). `Idle` cannot carry a write at
+        /// all, and `Handler` carries only the interim `100 Continue`.
+        #[test]
+        fn note_write_latches_only_in_the_write_and_head_phases() {
+            for (phase, expected) in [
+                (Phase::Idle, false),
+                (Phase::Head, true),
+                (Phase::Handler, false),
+                (Phase::Write, true),
+            ] {
+                let c = PhaseClock::new(phase);
+                assert!(!c.wrote_bytes(), "{phase:?} starts clean");
+                c.note_write();
+                assert_eq!(
+                    c.wrote_bytes(),
+                    expected,
+                    "note_write in {phase:?} should {} latch",
+                    if expected { "" } else { "not" }
+                );
+            }
+        }
+
+        /// Re-arming is narrower than latching: only `Write` progress buys
+        /// more time. A write under `header_timeout` must not extend it.
+        #[test]
+        fn only_a_write_phase_write_re_arms_the_deadline() {
+            for (phase, expected) in [
+                (Phase::Idle, false),
+                (Phase::Head, false),
+                (Phase::Handler, false),
+                (Phase::Write, true),
+            ] {
+                let c = PhaseClock::new(phase);
+                let before = c.generation.get();
+                c.note_write();
+                assert_eq!(
+                    c.generation.get() > before,
+                    expected,
+                    "note_write in {phase:?} bumped the generation unexpectedly"
+                );
+            }
+        }
+
+        /// Entering `Idle` or `Handler` starts a fresh response. Latched for
+        /// the life of a keep-alive connection instead, `wrote_bytes` would
+        /// suppress every 408 after the first response.
+        #[test]
+        fn entering_idle_or_handler_clears_the_per_response_flags() {
+            for reset in [Phase::Idle, Phase::Handler] {
+                let c = PhaseClock::new(Phase::Write);
+                c.note_write();
+                c.note_body_end();
+                assert!(c.wrote_bytes());
+                c.set(reset);
+                assert!(!c.wrote_bytes(), "{reset:?} must clear wrote_bytes");
+                // `body_done` is private; observe it through `note_flush`,
+                // which only returns to `Idle` when it is set.
+                c.set(Phase::Write);
+                c.note_flush();
+                assert_eq!(
+                    c.phase(),
+                    Phase::Write,
+                    "{reset:?} must clear body_done, so a flush alone cannot \
+                     end the response"
+                );
+            }
+        }
+
+        /// Entering `Head` or `Write` is not a fresh response and must not
+        /// clear anything — `Head` in particular, or hyper's own error
+        /// response would stop suppressing the spliced 408.
+        #[test]
+        fn entering_head_or_write_preserves_the_per_response_flags() {
+            for keep in [Phase::Head, Phase::Write] {
+                let c = PhaseClock::new(Phase::Write);
+                c.note_write();
+                c.set(keep);
+                assert!(c.wrote_bytes(), "{keep:?} must not clear wrote_bytes");
+            }
+        }
+
+        /// "Response finished" is body-exhausted *and* buffer-drained, in
+        /// `Phase::Write`. Any weaker rule returns a live connection to the
+        /// idle deadline mid-response.
+        #[test]
+        fn note_flush_returns_to_idle_only_on_a_finished_write() {
+            // Flush with no end-of-stream: still writing.
+            let c = PhaseClock::new(Phase::Write);
+            c.note_flush();
+            assert_eq!(c.phase(), Phase::Write);
+
+            // End-of-stream and a flush: finished.
+            let c = PhaseClock::new(Phase::Write);
+            c.note_body_end();
+            c.note_flush();
+            assert_eq!(c.phase(), Phase::Idle);
+
+            // The same signals outside `Phase::Write` change nothing.
+            for phase in [Phase::Idle, Phase::Head, Phase::Handler] {
+                let c = PhaseClock::new(phase);
+                c.note_body_end();
+                c.note_flush();
+                assert_eq!(c.phase(), phase, "note_flush must be inert in {phase:?}");
+            }
+        }
+
+        /// Every phase change has to bump: the watchdog snapshots the
+        /// generation before arming and discards an expiry whose generation
+        /// moved, which is what stops a 408 for a phase that already ended.
+        #[test]
+        fn every_set_bumps_the_generation() {
+            let c = PhaseClock::new(Phase::Idle);
+            let mut last = c.generation.get();
+            for phase in [
+                Phase::Head,
+                Phase::Handler,
+                Phase::Write,
+                Phase::Idle,
+                // Re-entering the same phase counts too.
+                Phase::Idle,
+            ] {
+                c.set(phase);
+                assert!(c.generation.get() > last, "set({phase:?}) must bump");
+                last = c.generation.get();
+            }
+        }
+
+        /// After the transport leaves for an upgrade consumer nobody is
+        /// watching, so post-101 traffic must not drive the clock.
+        #[test]
+        fn a_detached_clock_ignores_everything() {
+            let c = PhaseClock::new(Phase::Write);
+            c.note_body_end();
+            c.detach();
+            let generation = c.generation.get();
+            c.note_write();
+            c.note_flush();
+            c.set(Phase::Idle);
+            assert_eq!(c.phase(), Phase::Write);
+            assert!(!c.wrote_bytes());
+            assert_eq!(c.generation.get(), generation, "a detached clock is quiet");
+        }
     }
 }
