@@ -3,6 +3,7 @@ name = "armature-h1"
 version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
+autobenches = false  # Disable auto-discovery, use explicit [[bench]] only
 authors.workspace = true
 license.workspace = true
 repository = "https://github.com/quinnjr/armature-h1"
@@ -51,8 +52,8 @@ criterion = { version = "0.8", features = ["html_reports"] }
 name = "tls_dispatch"
 required-features = ["tls"]
 
-# Explicit bench targets, matching the root package's `autobenches = false`
-# convention: a stray file under benches/ should not silently become a target.
+# Explicit bench targets only, per `autobenches = false` above: a stray file
+# under benches/ should not silently become a target.
 [[bench]]
 name = "parse"
 harness = false

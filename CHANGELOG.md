@@ -7,6 +7,13 @@ and this crate adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.h
 
 ## [Unreleased]
 
+### Changed
+
+- Set `autobenches = false` so the `parse`, `write` and `e2e` bench targets are
+  governed solely by their `[[bench]]` entries, matching the convention the rest
+  of the framework's benchmark-owning crates now follow. The comment above those
+  entries had claimed this was already the case; it was not.
+
 ### Fixed
 
 - **Chunked line-length limits were bypassable by packetization.** The bound on
