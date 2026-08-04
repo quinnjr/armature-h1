@@ -94,9 +94,16 @@ pub trait BodyIo {
 
     /// Flush a pending `Expect: 100-continue` interim response.
     ///
-    /// Called on the first body read and nowhere else, which is what makes the
-    /// interim response lazy: a handler that rejects a request without reading
-    /// its body never causes one to be sent.
+    /// Called on the first body read and nowhere else. On the native backend
+    /// that is what makes the interim response lazy: the connection holds the
+    /// `100 Continue` until the handler asks for body bytes, so a handler that
+    /// rejects a request without reading its body never causes one to be sent.
+    ///
+    /// The laziness is a property of that backend, not a guarantee of this
+    /// trait. Under the `hyper-backend` feature hyper sends the interim response
+    /// eagerly, before the handler runs, and this method is a no-op there — the
+    /// `100 Continue` is already on the wire whatever the handler does. See
+    /// `BACKENDS.md` for the full list of behaviours that differ by backend.
     fn poll_send_continue(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>>;
 
     /// Take up to `max` already-buffered bytes.
@@ -632,7 +639,7 @@ impl std::fmt::Debug for Request {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Request")
             .field("method", &self.head.method)
-            .field("target", &self.head.target)
+            .field("target", self.head.target())
             .finish_non_exhaustive()
     }
 }
