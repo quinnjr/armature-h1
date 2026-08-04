@@ -158,6 +158,12 @@ fn peeked_bytes_are_not_lost_from_the_http1_request() {
 }
 
 #[test]
+#[cfg_attr(
+    feature = "hyper-backend",
+    ignore = "see BACKENDS.md: status for an unparseable h2c preface without \
+              detection (hyper closes the connection with no response instead \
+              of writing a 4xx/5xx)"
+)]
 fn h2c_without_detection_is_parsed_as_http1_and_rejected() {
     let rec = Recorder::default();
     let seen = rec.seen.clone();
@@ -175,8 +181,37 @@ fn h2c_without_detection_is_parsed_as_http1_and_rejected() {
     });
 
     assert!(
-        reply.starts_with("HTTP/1.1 4") || reply.starts_with("HTTP/1.1 5") || reply.is_empty(),
+        reply.starts_with("HTTP/1.1 4") || reply.starts_with("HTTP/1.1 5"),
         "must not be served as a valid request: {reply}"
+    );
+    assert!(seen.lock().unwrap().is_empty());
+}
+
+/// Positive twin of `h2c_without_detection_is_parsed_as_http1_and_rejected`
+/// for the hyper backend: BACKENDS.md documents hyper's h1 parser abandoning
+/// the connection on this input before any error-response hook fires, so it
+/// closes with zero response bytes rather than writing a 4xx/5xx. If a
+/// future hyper starts producing a status here, that is exactly the signal
+/// the ignored original test is watching for.
+#[test]
+#[cfg(feature = "hyper-backend")]
+fn hyper_h2c_without_detection_closes_with_no_response() {
+    let rec = Recorder::default();
+    let seen = rec.seen.clone();
+
+    let reply = with_server(test_config(), rec, |addr| {
+        Box::pin(async move {
+            let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+            s.write_all(H2C_PREFACE).await.unwrap();
+            let mut out = Vec::new();
+            let _ = tokio::time::timeout(Duration::from_secs(2), s.read_to_end(&mut out)).await;
+            String::from_utf8_lossy(&out).into_owned()
+        })
+    });
+
+    assert!(
+        reply.is_empty(),
+        "hyper abandons the connection before writing any response: {reply}"
     );
     assert!(seen.lock().unwrap().is_empty());
 }

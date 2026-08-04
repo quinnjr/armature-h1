@@ -6,7 +6,7 @@
 //! date caches and service state safe to keep non-atomic.
 
 use crate::Limits;
-use crate::conn::{ConnConfig, Connection};
+use crate::conn::ConnConfig;
 use crate::service::{H1Service, Transport};
 use crate::tls::{H2Fallback, Preface, is_h2c_preface};
 use crate::write::DateCache;
@@ -116,7 +116,12 @@ impl Config {
     }
 
     /// Set the per-connection limits.
-    pub fn limits(mut self, limits: Limits) -> Self {
+    ///
+    /// `limits.max_headers` above [`crate::limits::MAX_HEADERS_CEILING`] is
+    /// clamped to that ceiling, with a `tracing::warn!` — the parser's fixed
+    /// scratch array cannot serve more than that regardless of configuration.
+    pub fn limits(mut self, mut limits: Limits) -> Self {
+        limits.clamp_max_headers();
         self.limits = limits;
         self
     }
@@ -227,8 +232,10 @@ impl Server {
     /// to route them somewhere instead.
     ///
     /// A connection a handler upgrades with status 101 is *also* closed: there
-    /// is no upgrade-consumer hook here. Drive [`Connection`] yourself and take
-    /// the `Upgraded` from [`Connection::serve`] if you need the raw socket.
+    /// is no upgrade-consumer hook here. Drive [`Connection`](crate::conn::Connection)
+    /// yourself and take the `Upgraded` from
+    /// [`Connection::serve`](crate::conn::Connection::serve) if you need the raw
+    /// socket.
     ///
     /// `make` runs once per worker thread to produce that worker's service. Note
     /// the bounds: the *factory* is `Send`, because it crosses thread boundaries
@@ -268,9 +275,18 @@ impl Server {
         // one shared listener where that option does not exist.
         let mut per_worker: Vec<Option<std::net::TcpListener>> = match listeners {
             Listeners::PerWorker(v) => v.into_iter().map(Some).collect(),
-            Listeners::Shared(shared) => {
-                (0..cfg.workers).map(|_| shared.try_clone().ok()).collect()
-            }
+            Listeners::Shared(shared) => (0..cfg.workers)
+                .map(|_| match shared.try_clone() {
+                    Ok(l) => Some(l),
+                    Err(e) => {
+                        // A missing worker beats a crashed server, so this
+                        // stays a skip rather than a hard failure — but it
+                        // must be visible, or a fleet silently runs short.
+                        tracing::warn!(error = %e, "failed to clone the shared listener for a worker; that worker will not start");
+                        None
+                    }
+                })
+                .collect(),
         };
 
         let mut handles = Vec::with_capacity(cfg.workers);
@@ -331,8 +347,15 @@ async fn worker_loop<F, S, G, H>(
 
     // Per-core state: created once here, shared by every connection on this
     // thread, and never touched by another. No atomics, no locks.
+    let mut limits = cfg.limits.clone();
+    let cfg = Rc::new(cfg);
+    // Defense in depth: `Config::limits` already clamps on the way in, but
+    // `cfg.limits` can also be set directly since `Config`'s fields are
+    // public, so the parser's fixed scratch array still needs protecting
+    // here.
+    limits.clamp_max_headers();
     let conn_cfg = Rc::new(ConnConfig {
-        limits: cfg.limits.clone(),
+        limits,
         tick: cfg.tick,
         server_name: cfg.server_name.clone(),
     });
@@ -384,7 +407,7 @@ async fn dispatch<S, H>(
     fallback: Rc<H>,
     conn_cfg: Rc<ConnConfig>,
     date: Rc<RefCell<DateCache>>,
-    cfg: Config,
+    cfg: Rc<Config>,
 ) where
     S: H1Service + 'static,
     H: H2Fallback + 'static,
@@ -397,7 +420,7 @@ async fn dispatch<S, H>(
             // HTTP; the peer gets a TLS alert from rustls and the socket closes.
             return;
         };
-        let is_h2 = tls_stream.get_ref().1.alpn_protocol() == Some(b"h2");
+        let is_h2 = crate::tls::negotiated_h2(tls_stream.get_ref().1);
         if is_h2 {
             // Nothing has been read past the handshake, so there is no buffered
             // application data to forward.
@@ -465,7 +488,6 @@ async fn serve_h1<IO, S>(
     IO: AsyncRead + AsyncWrite + Unpin + 'static,
     S: H1Service + 'static,
 {
-    let conn = Connection::with_buffered(io, RcService(service), conn_cfg, date, buffered);
     // A clean close and an I/O error are the same outcome here: the connection is
     // over and there is nobody left to tell.
     //
@@ -475,7 +497,9 @@ async fn serve_h1<IO, S>(
     // and take the `Upgraded` from `Connection::serve`. Closing is the honest
     // outcome for a handoff this server cannot complete; the alternative is to
     // leave a socket open that nothing will ever read.
-    if let Ok(Some(upgraded)) = conn.serve().await {
+    if let Ok(Some(upgraded)) =
+        crate::backend::serve_connection(io, service, conn_cfg, date, buffered).await
+    {
         drop(upgraded);
     }
 }
@@ -494,18 +518,6 @@ impl H2Fallback for CloseH2 {
             drop(buffered);
             drop(io);
         })
-    }
-}
-
-/// Shares one service across every connection on a worker.
-struct RcService<S>(Rc<S>);
-
-impl<S: H1Service> H1Service for RcService<S> {
-    type Future = S::Future;
-
-    #[inline]
-    fn call(&self, req: crate::Request) -> Self::Future {
-        self.0.call(req)
     }
 }
 
@@ -715,6 +727,16 @@ mod tests {
         assert_eq!(c.tick, Duration::from_millis(100));
         assert_eq!(c.shutdown_grace, Duration::from_secs(10));
         assert_eq!(Config::new(loopback()).workers(0).workers, 1, "never zero");
+    }
+
+    #[test]
+    fn limits_clamps_max_headers_to_the_parser_ceiling() {
+        let c = Config::new(loopback()).limits(Limits {
+            max_headers: 200,
+            ..Default::default()
+        });
+        assert_eq!(c.limits.max_headers, crate::limits::MAX_HEADERS_CEILING);
+        assert_eq!(crate::limits::MAX_HEADERS_CEILING, 128);
     }
 
     #[test]

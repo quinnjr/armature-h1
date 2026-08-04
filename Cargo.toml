@@ -1,13 +1,13 @@
 [package]
 name = "armature-h1"
-version = "0.1.0"
-edition.workspace = true
-rust-version.workspace = true
+version = "0.2.0"
+edition = "2024"
+rust-version = "1.94.1"
 autobenches = false  # Disable auto-discovery, use explicit [[bench]] only
-authors.workspace = true
-license.workspace = true
+authors = ["Joseph Quinn <quinn.josephr@proton.me>"]
+license = "Apache-2.0"
 repository = "https://github.com/quinnjr/armature-h1"
-homepage.workspace = true
+homepage = "https://quinnjr.github.io/armature"
 description = "Zero-allocation thread-per-core HTTP/1.1 server for the Armature framework"
 keywords = ["http", "server", "http1", "performance", "async"]
 categories = ["web-programming::http-server", "asynchronous", "network-programming"]
@@ -30,10 +30,12 @@ core_affinity = "0.8"
 
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"], optional = true }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"], optional = true }
+hyper = { version = "1.10", features = ["server", "http1"], optional = true }
 
 [features]
 default = []
 tls = ["dep:rustls", "dep:tokio-rustls"]
+hyper-backend = ["dep:hyper"]
 
 [dev-dependencies]
 cargo-husky = { version = "1.5", default-features = false, features = ["user-hooks"] }
@@ -65,3 +67,9 @@ harness = false
 [[bench]]
 name = "e2e"
 harness = false
+
+[package.metadata.docs.rs]
+# The `hyper-backend` feature is non-additive (see the crate-level docs and
+# BACKENDS.md), so it is never on by default, but docs.rs should still build
+# the divergence documentation it gates.
+features = ["hyper-backend"]

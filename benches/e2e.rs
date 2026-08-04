@@ -21,7 +21,7 @@
 //! and task setup sit outside the measurement — the same steady state the allocation
 //! regression test asserts costs zero allocations.
 
-use armature_h1::{ConnConfig, Connection, DateCache, Limits, Request, Response};
+use armature_h1::{ConnConfig, DateCache, Limits, Request, Response, serve_connection};
 use criterion::{Criterion, criterion_group, criterion_main};
 use std::cell::RefCell;
 use std::hint::black_box;
@@ -90,17 +90,18 @@ where
             .expect("runtime");
         let local = tokio::task::LocalSet::new();
         local.block_on(&rt, async move {
-            let conn = Connection::new(
+            let _ = serve_connection(
                 server,
-                service,
+                Rc::new(service),
                 Rc::new(ConnConfig {
                     limits: limits(),
                     tick: Duration::from_millis(50),
                     server_name: None,
                 }),
                 Rc::new(RefCell::new(DateCache::new())),
-            );
-            let _ = conn.serve().await;
+                bytes::Bytes::new(),
+            )
+            .await;
         });
     });
     (client, handle)

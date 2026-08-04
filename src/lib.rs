@@ -1,6 +1,8 @@
 //! Zero-allocation thread-per-core HTTP/1.1 server.
 //!
-//! See `docs/superpowers/specs/2026-07-29-armature-h1-design.md`.
+//! For the `hyper-backend` feature's design and build plan, see
+//! `docs/superpowers/specs/2026-08-03-hyper-backend-design.md` and
+//! `docs/superpowers/plans/2026-08-03-hyper-backend.md`.
 //!
 //! # Design
 //!
@@ -12,9 +14,24 @@
 //! is a buffer a handler can still be holding a slice of. Framing decisions live
 //! in one pure function and every rejection closes the connection rather than
 //! resynchronizing the stream.
+//!
+//! # Backends
+//!
+//! The `hyper-backend` cargo feature swaps the per-connection serving path
+//! from this crate's bespoke protocol stack to hyper's `conn::http1`, behind
+//! the identical public API. **This feature is non-additive**: enabling it
+//! anywhere in a dependency graph changes what every consumer of this crate
+//! gets, because Cargo unifies features across the whole build — it is not
+//! possible for one crate to opt in while another stays on the native
+//! backend. The two backends diverge in parsing, status-code choice, and
+//! timing in ways that cannot be fully shimmed; see `BACKENDS.md` at the
+//! crate root for the exhaustive, version-pinned list. Anyone depending on
+//! this crate, directly or transitively, should read it before enabling the
+//! feature.
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+mod backend;
 mod bytestr;
 pub mod chunked;
 pub mod conn;
@@ -30,6 +47,7 @@ pub mod service;
 pub mod tls;
 pub mod write;
 
+pub use backend::serve_connection;
 pub use bytestr::ByteStr;
 pub use chunked::{ChunkEvent, ChunkedDecoder, ChunkedError};
 pub use conn::{ConnConfig, Connection, Disposition};

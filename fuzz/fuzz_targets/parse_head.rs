@@ -49,7 +49,7 @@ fuzz_target!(|data: &[u8]| {
         a >= base && a < end
     };
 
-    assert!(inside(head.target.as_bytes()), "target was copied");
+    assert!(inside(head.target().as_bytes()), "target was copied");
     for (name, value) in head.headers.iter() {
         assert!(inside(value), "header value was copied");
         // A mixed-case custom name is lowercased, which does allocate; an

@@ -197,6 +197,29 @@ Connection: keep-alive\r\n\
 Cache-Control: max-age=0\r\n\
 \r\n";
 
+// Mirrors `BROWSER_GET` but with the mixed-case unknown headers a real browser
+// actually sends (Sec-Fetch-*, Sec-Ch-Ua*, Upgrade-Insecure-Requests, DNT).
+// `HeaderId::from_bytes` (src/parse.rs) only recognizes well-known names; an
+// unrecognized name takes the `HeaderId::Other` branch, which lowercases into
+// a fresh allocation whenever the name has an uppercase byte. `BROWSER_GET`'s
+// header set is entirely well-known names, so it never exercises that branch
+// and reports zero. This fixture is the honest one for "GET with N browser
+// headers."
+const BROWSER_GET_MIXED_CASE: &[u8] = b"GET /index.html HTTP/1.1\r\n\
+Host: a.example\r\n\
+User-Agent: Mozilla/5.0\r\n\
+Accept: text/html,application/xhtml+xml\r\n\
+Accept-Language: en-US,en;q=0.9\r\n\
+Accept-Encoding: gzip, deflate, br\r\n\
+Connection: keep-alive\r\n\
+Sec-Fetch-Mode: navigate\r\n\
+Sec-Fetch-Site: none\r\n\
+Sec-Fetch-Dest: document\r\n\
+Sec-Ch-Ua: \"Not.A/Brand\";v=\"8\"\r\n\
+Upgrade-Insecure-Requests: 1\r\n\
+DNT: 1\r\n\
+\r\n";
+
 const FIXED_BODY_POST: &[u8] =
     b"POST / HTTP/1.1\r\nHost: a.example\r\nContent-Length: 5\r\n\r\nhello";
 
@@ -235,6 +258,37 @@ fn browser_sized_get_stays_within_budget() {
     assert!(
         allocs <= BUDGET_PER_GET * n as u64,
         "header count must not drive allocations: {per_request:.2} per request"
+    );
+}
+
+/// Six mixed-case unknown header names (Sec-Fetch-Mode, Sec-Fetch-Site,
+/// Sec-Fetch-Dest, Sec-Ch-Ua, Upgrade-Insecure-Requests, DNT), each taking the
+/// lowercasing-copy branch in `finish_parse_head` (src/parse.rs, ~line 235)
+/// because `HeaderId::from_bytes` does not recognize them and each contains an
+/// uppercase byte. That is one allocation per unknown mixed-case header, per
+/// request: six here. `browser_sized_get_stays_within_budget` above stays at
+/// zero only because every one of its seven header names is well-known and
+/// never reaches that branch.
+///
+/// This budget is deliberately nonzero — see the module doc on
+/// `BUDGET_PER_GET` for why a nonzero number still gets pinned exactly rather
+/// than bounded by a threshold.
+const BUDGET_PER_MIXED_CASE_HEADER_GET: u64 = 6;
+
+#[test]
+fn browser_sized_get_with_mixed_case_unknown_headers_stays_within_budget() {
+    let n = 100;
+    let allocs = steady_state_allocs(BROWSER_GET_MIXED_CASE, hello, 50, n);
+    let per_request = allocs as f64 / n as f64;
+    println!(
+        "browser GET (7 well-known + 6 mixed-case unknown headers): {allocs} over {n} ({per_request:.2}/request)"
+    );
+    assert_eq!(
+        allocs,
+        BUDGET_PER_MIXED_CASE_HEADER_GET * n as u64,
+        "mixed-case unknown headers must cost exactly one allocation each per request \
+         (the lowercasing-copy branch in src/parse.rs): {per_request:.2} per request, \
+         budget is {BUDGET_PER_MIXED_CASE_HEADER_GET}"
     );
 }
 

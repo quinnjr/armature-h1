@@ -94,9 +94,16 @@ pub trait BodyIo {
 
     /// Flush a pending `Expect: 100-continue` interim response.
     ///
-    /// Called on the first body read and nowhere else, which is what makes the
-    /// interim response lazy: a handler that rejects a request without reading
-    /// its body never causes one to be sent.
+    /// Called on the first body read and nowhere else. On the native backend
+    /// that is what makes the interim response lazy: the connection holds the
+    /// `100 Continue` until the handler asks for body bytes, so a handler that
+    /// rejects a request without reading its body never causes one to be sent.
+    ///
+    /// The laziness is a property of that backend, not a guarantee of this
+    /// trait. Under the `hyper-backend` feature hyper sends the interim response
+    /// eagerly, before the handler runs, and this method is a no-op there — the
+    /// `100 Continue` is already on the wire whatever the handler does. See
+    /// `BACKENDS.md` for the full list of behaviours that differ by backend.
     fn poll_send_continue(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>>;
 
     /// Take up to `max` already-buffered bytes.
@@ -134,6 +141,16 @@ struct BodyState {
     /// the next request line is precisely the smuggling scenario this crate
     /// exists to prevent.
     fully_read: Rc<Cell<bool>>,
+    /// Raw-frames mode: the transport already de-framed the body (hyper), so
+    /// yield bytes until EOF instead of applying length/chunk accounting.
+    #[cfg(feature = "hyper-backend")]
+    raw: bool,
+    #[cfg(feature = "hyper-backend")]
+    consumed: u64,
+    #[cfg(feature = "hyper-backend")]
+    cap: u64,
+    #[cfg(feature = "hyper-backend")]
+    trailers_slot: Option<Rc<RefCell<Option<HeaderVec>>>>,
 }
 
 impl BodyState {
@@ -193,6 +210,14 @@ impl Body {
                 needs_continue: false,
                 done: true,
                 fully_read: Rc::new(Cell::new(true)),
+                #[cfg(feature = "hyper-backend")]
+                raw: false,
+                #[cfg(feature = "hyper-backend")]
+                consumed: 0,
+                #[cfg(feature = "hyper-backend")]
+                cap: u64::MAX,
+                #[cfg(feature = "hyper-backend")]
+                trailers_slot: None,
             },
         }
     }
@@ -228,6 +253,55 @@ impl Body {
                 needs_continue,
                 done,
                 fully_read,
+                #[cfg(feature = "hyper-backend")]
+                raw: false,
+                #[cfg(feature = "hyper-backend")]
+                consumed: 0,
+                #[cfg(feature = "hyper-backend")]
+                cap: u64::MAX,
+                #[cfg(feature = "hyper-backend")]
+                trailers_slot: None,
+            },
+        }
+    }
+
+    /// A body whose transport already de-framed it (the hyper backend).
+    ///
+    /// `kind` is reported, not enforced: framing was hyper's job. The cap is
+    /// enforced cumulatively so chunked bodies keep 413 parity with the
+    /// bespoke decoder.
+    #[cfg(feature = "hyper-backend")]
+    pub(crate) fn from_backend(
+        kind: BodyKind,
+        io: Rc<RefCell<dyn BodyIo>>,
+        needs_continue: bool,
+        max_body_bytes: u64,
+        fully_read: Rc<Cell<bool>>,
+        trailers_slot: Rc<RefCell<Option<HeaderVec>>>,
+    ) -> Self {
+        // `Length(0)` is already exhausted, exactly as in `new` above
+        // (`n == 0`). Treating it as unread would leave `fully_read` false for a
+        // handler that never touched the body of an explicit
+        // `Content-Length: 0` request, and the bridge would force a close where
+        // the native loop reuses the connection.
+        let done = matches!(kind, BodyKind::None | BodyKind::Length(0));
+        fully_read.set(done);
+        Self {
+            state: BodyState {
+                kind,
+                buffered: Bytes::new(),
+                remaining: 0,
+                decoder: None,
+                trailers: if done { Some(HeaderVec::new()) } else { None },
+                io: Some(io),
+                continue_sent: !needs_continue,
+                needs_continue,
+                done,
+                fully_read,
+                raw: true,
+                consumed: 0,
+                cap: max_body_bytes,
+                trailers_slot: Some(trailers_slot),
             },
         }
     }
@@ -247,6 +321,14 @@ impl Body {
                 needs_continue: false,
                 done: len == 0,
                 fully_read: Rc::new(Cell::new(true)),
+                #[cfg(feature = "hyper-backend")]
+                raw: false,
+                #[cfg(feature = "hyper-backend")]
+                consumed: 0,
+                #[cfg(feature = "hyper-backend")]
+                cap: u64::MAX,
+                #[cfg(feature = "hyper-backend")]
+                trailers_slot: None,
             },
         }
     }
@@ -308,6 +390,11 @@ impl Body {
                 Poll::Ready(Ok(())) => {}
             }
             s.continue_sent = true;
+        }
+
+        #[cfg(feature = "hyper-backend")]
+        if s.raw {
+            return Self::poll_raw(s, cx);
         }
 
         loop {
@@ -426,6 +513,52 @@ impl Body {
         }
     }
 
+    /// Poll for the next chunk of a raw-frames body (see [`from_backend`](Self::from_backend)).
+    ///
+    /// No decoder runs here: the transport already de-framed the data, so this
+    /// just relays reads until EOF while enforcing the cumulative cap.
+    #[cfg(feature = "hyper-backend")]
+    fn poll_raw(s: &mut BodyState, cx: &mut Context<'_>) -> Poll<Option<Result<Bytes, BodyError>>> {
+        loop {
+            if s.buffered.is_empty()
+                && let Some(io) = &s.io
+            {
+                let got = io.borrow_mut().take_buffered(usize::MAX);
+                if !got.is_empty() {
+                    s.buffered = got;
+                }
+            }
+            if !s.buffered.is_empty() {
+                let chunk = std::mem::take(&mut s.buffered);
+                s.consumed += chunk.len() as u64;
+                if s.consumed > s.cap {
+                    s.fail();
+                    return Poll::Ready(Some(Err(BodyError::TooLarge)));
+                }
+                return Poll::Ready(Some(Ok(chunk)));
+            }
+            match Self::fill(s, cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Err(e)) => {
+                    s.fail();
+                    return Poll::Ready(Some(Err(e)));
+                }
+                Poll::Ready(Ok(false)) => {
+                    // Clean EOF: hyper delivered the whole body.
+                    s.finish();
+                    s.trailers = Some(
+                        s.trailers_slot
+                            .as_ref()
+                            .and_then(|slot| slot.borrow_mut().take())
+                            .unwrap_or_default(),
+                    );
+                    return Poll::Ready(None);
+                }
+                Poll::Ready(Ok(true)) => continue,
+            }
+        }
+    }
+
     /// Read more bytes into `buffered`. `Ok(false)` means EOF.
     fn fill(s: &mut BodyState, cx: &mut Context<'_>) -> Poll<Result<bool, BodyError>> {
         let Some(io) = &s.io else {
@@ -506,7 +639,7 @@ impl std::fmt::Debug for Request {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Request")
             .field("method", &self.head.method)
-            .field("target", &self.head.target)
+            .field("target", self.head.target())
             .finish_non_exhaustive()
     }
 }
@@ -912,5 +1045,79 @@ mod tests {
     async fn from_bytes_body_round_trips() {
         let mut b = Body::from_bytes(Bytes::from_static(b"payload"));
         assert_eq!(&b.collect(1024).await.unwrap()[..], b"payload");
+    }
+
+    #[cfg(feature = "hyper-backend")]
+    mod backend_body {
+        use super::*;
+
+        fn raw_body(buffered: &'static [u8], reads: Vec<&'static [u8]>, cap: u64) -> Body {
+            Body::from_backend(
+                BodyKind::Chunked,
+                MockIo::with_buffered(buffered, reads),
+                false,
+                cap,
+                Rc::new(Cell::new(false)),
+                Rc::new(RefCell::new(None)),
+            )
+        }
+
+        /// Raw mode must NOT run the chunked decoder: the input is already
+        /// de-framed data, and decoding it again would corrupt or reject it.
+        #[tokio::test]
+        async fn streams_frames_until_eof_without_reframing() {
+            // "5\r\n..." would be chunk framing; here it is literal payload.
+            let mut b = raw_body(b"hel", vec![b"lo world", b""], 1024);
+            assert_eq!(b.kind(), BodyKind::Chunked, "kind reports the wire framing");
+            assert_eq!(&b.collect(1024).await.unwrap()[..], b"hello world");
+            assert!(b.was_fully_read());
+            assert!(b.trailers().is_some(), "empty trailers after clean EOF");
+        }
+
+        #[tokio::test]
+        async fn enforces_the_cumulative_body_cap() {
+            let mut b = raw_body(b"hello", vec![b" world", b""], 8);
+            let err = b.collect(1024).await.unwrap_err();
+            assert!(matches!(err, BodyError::TooLarge), "got {err:?}");
+            assert_eq!(err.status(), 413);
+            assert!(!b.was_fully_read());
+        }
+
+        #[tokio::test]
+        async fn surfaces_trailers_from_the_slot() {
+            let slot = Rc::new(RefCell::new(None));
+            let io = MockIo::with_buffered(b"hi", vec![b""]);
+            let mut b = Body::from_backend(
+                BodyKind::Chunked,
+                io,
+                false,
+                1024,
+                Rc::new(Cell::new(false)),
+                slot.clone(),
+            );
+            let mut t = HeaderVec::new();
+            t.push((HeaderId::Etag, Bytes::from_static(b"x")));
+            *slot.borrow_mut() = Some(t);
+            b.collect(1024).await.unwrap();
+            let t = b.trailers().expect("trailers after end");
+            assert_eq!(crate::header::get_str(t, &HeaderId::Etag), Some("x"));
+        }
+
+        /// `poll_send_continue` still runs before the first read, so the lazy
+        /// contract holds wherever the transport can honor it.
+        #[tokio::test]
+        async fn sends_continue_before_first_read() {
+            let io = MockIo::with_buffered(b"hi", vec![b""]);
+            let mut b = Body::from_backend(
+                BodyKind::Length(2),
+                io.clone(),
+                true,
+                1024,
+                Rc::new(Cell::new(false)),
+                Rc::new(RefCell::new(None)),
+            );
+            b.collect(1024).await.unwrap();
+            assert_eq!(io.borrow().continues, 1);
+        }
     }
 }

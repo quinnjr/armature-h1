@@ -7,15 +7,64 @@ and this crate adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.h
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-08-04
+
+### Added
+
+- `hyper-backend` cargo feature: serve connections through hyper's
+  `conn::http1` behind the same public API. Compile-time swap; strict parity;
+  divergences documented in `BACKENDS.md`. Adds `serve_connection`, the
+  backend-selected per-connection entry point.
+- `Head::new`, which caches the target's `?` split so `path()`/`query()` no
+  longer re-scan on every call. **Breaking:** `Head` gained a private field,
+  so literal construction outside the crate is no longer possible — construct
+  through `Head::new` (or `parse_head`, as before).
+- `backend_differential` fuzz target: drives the same bytes through the native
+  `Connection` loop and the hyper backend in one process and cross-checks the
+  parity claims BACKENDS.md leaves intact (matching 200-response payloads;
+  hyper never serving more requests than the stricter native parser accepts on
+  CRLF-framed input).
+
 ### Changed
 
 - Set `autobenches = false` so the `parse`, `write` and `e2e` bench targets are
   governed solely by their `[[bench]]` entries, matching the convention the rest
   of the framework's benchmark-owning crates now follow. The comment above those
   entries had claimed this was already the case; it was not.
+- Streamed responses on the default (native) backend now coalesce before
+  flushing: chunks that become ready within the same poll are written together
+  as one flush, while an idle stream still flushes immediately rather than
+  waiting for more data. This reduces syscalls on a handler that produces
+  several small chunks back-to-back without changing what is observed on the
+  wire.
+- `Connection::serve` returns `Ok(None)` instead of panicking when a handler
+  retains the request `Body` past a `101` response: the upgrade is forfeited
+  and the connection is closed cleanly rather than the worker aborting.
+- **`Head`'s `target` field is sealed behind accessors.** `Head::target` is no
+  longer a public field; use `Head::target()` (and the existing `path()`/
+  `query()`) instead. **Breaking**, alongside the `Head::new`-private-field
+  change above — both land in the same 0.x minor per this family's policy that
+  each 0.x minor is the breaking unit.
 
 ### Fixed
 
+- `Config::limits()` silently clamps `max_headers` above
+  `Limits::MAX_HEADERS_CEILING` rather than only warning: a caller that reads
+  the field back after setting it can no longer observe a value the parser's
+  fixed scratch array could never have served in the first place. The
+  clamp-with-`tracing::warn!` behavior is unchanged; only the fact that the
+  public field's read-back now always matches what will actually be enforced
+  is new.
+- Duplicate framing-relevant header fields (`Content-Length`,
+  `Transfer-Encoding`) supplied more than once by a handler are now dropped
+  down to the single value the writer actually frames with, instead of being
+  written verbatim alongside it.
+- A `304` response's `Content-Length`, when a handler supplies one, is now
+  always written in decimal — a non-decimal value the handler happened to
+  hand in was previously passed through unchanged.
+- The `hyper-backend` bridge now matches native on `204` and `Content-Length`
+  framing parity: a `204` drops any handler-attached body and framing field
+  identically on both backends, closing a divergence between them.
 - **Chunked line-length limits were bypassable by packetization.** The bound on
   a chunk-size line and on a trailer line was enforced only while the decoder
   was still waiting for the terminating LF. A peer that delivered an over-long
@@ -115,3 +164,17 @@ Fuzzing: three `cargo-fuzz` targets (`parse_head`, `chunked`,
 `framing_differential`). The differential target compares framing decisions
 against hyper and panics only when both implementations accept a message but
 disagree on its body length — which is what a smuggling primitive looks like.
+
+## [0.1.1] - 2026-08-04
+
+### Fixed
+
+- Requirements on sibling armature crates name a minor instead of `0`. Under
+  Cargo's 0.x rules `version = "0"` matches any release ever made, and edition
+  2024 selects the MSRV-aware resolver, so a consumer declaring an older
+  `rust-version` was handed the oldest version satisfying it — resolving
+  `armature-core = "0"` on Rust 1.89 produced `armature-core 0.2.3` while an
+  explicit `armature-core = "0.8"` elsewhere in the same graph pulled 0.8.2.
+  Two copies of core, and a build failing on symbols the older one lacks. Each
+  0.x minor in this family is a breaking change, so the requirement now names
+  one. No API change.

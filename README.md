@@ -18,14 +18,24 @@ rather than a claim:
 | Request shape | Allocations per request |
 |---|---|
 | keep-alive `GET` | **0** |
-| `GET` with 7 browser headers | **0** |
+| `GET` with 7 well-known browser headers | **0** |
 | `POST` with `Content-Length` | **0** |
 | `POST` with `Transfer-Encoding: chunked` | **0** |
 | after 500 requests on one connection | **0** (flat) |
+| `GET` with 6 mixed-case unknown headers (`Sec-Fetch-*`, `Sec-Ch-Ua`, `Upgrade-Insecure-Requests`, `DNT`) | **6** — one lowercasing copy per unknown header name |
 
 The 7-header row matching the 1-header row is the load-bearing evidence: header
-count does not drive allocation, because every header value is a `Bytes` slice of
-the connection's read buffer rather than a `String`.
+count does not drive allocation *for well-known names*, because every header
+value is a `Bytes` slice of the connection's read buffer rather than a `String`.
+A header name the crate doesn't already recognize takes a different path —
+`HeaderId::from_bytes` in `src/parse.rs` lowercases it into a fresh allocation —
+so a real browser's mixed-case `Sec-Fetch-*`/`Sec-Ch-Ua`/`DNT` headers cost
+exactly one allocation each, as the row above measures. The zero-allocation
+claim is about known headers; unknown headers are cheap, not free.
+
+These numbers are measured against the native backend. Under the
+`hyper-backend` feature, the bridge copies the request head once per request by
+design; see `BACKENDS.md` for what that feature trades away.
 
 See `tests/alloc_regression.rs`. If you change this crate and that test fails,
 the change regressed the entire premise.
@@ -186,17 +196,17 @@ cross-thread wakeup per request, since `Connection` is `!Send` and the client ha
 has to be driven from another thread — read `benches/parse.rs` and
 `benches/write.rs` for per-stage numbers without that overhead.
 
-Against hyper over a real socket:
+Against hyper, without a separate script: `benches/e2e.rs` also runs under the
+`hyper-backend` feature, so the same benchmark is the A/B —
 
 ```sh
-scripts/bench-h1.sh                   # needs `cargo install oha`
-DURATION=30s CONNECTIONS=200 scripts/bench-h1.sh
+cargo bench -p armature-h1 --bench e2e                     # native
+cargo bench -p armature-h1 --bench e2e --features hyper-backend  # hyper backend
 ```
 
-It prints every version and command line it used, builds both servers before
-either runs, and compares against a bare-hyper server sending the same body. Read
-the p99, not the throughput headline: thread-per-core's cost is in the tail (see
-above), which is exactly what a requests/sec number hides.
+— comparing both backends behind the identical public API. Read the p99, not the
+throughput headline: thread-per-core's cost is in the tail (see above), which is
+exactly what a requests/sec number hides.
 
 Fuzzing:
 
@@ -209,8 +219,21 @@ into the input rather than a copy), `chunked` (semantics invariant under how the
 input is split across reads), and `framing_differential` — the same bytes to
 `framing::decide` and to hyper, failing when both accept and disagree on body
 length, which is request smuggling by definition. That target is what found the
-two request-target validations in the table above. CI runs each for 60 seconds on
-pull requests touching this crate.
+two request-target validations in the table above. The `Fuzz` workflow
+(`.github/workflows/fuzz.yml`) runs all three targets for 60 seconds each, on
+every push to `main`/`develop` and on every pull request — not scoped to changes
+touching this crate.
+
+## Backends
+
+The `hyper-backend` cargo feature swaps the per-connection serving path from
+this crate's bespoke protocol stack to hyper's `conn::http1`, behind the
+identical public API. **It is non-additive**: Cargo unifies features across a
+whole dependency graph, so any one crate anywhere enabling `hyper-backend`
+silently swaps the backend for every consumer of this crate, not just itself.
+The two backends diverge in parsing, status-code choice, and timing in ways
+that cannot be fully shimmed — see `BACKENDS.md` for the exhaustive,
+version-pinned list before enabling it.
 
 ## Status
 
@@ -218,5 +241,7 @@ HTTP/1.1 only, and deliberately so. HTTP/2 remains served by `hyper` in
 `armature-core`, reached via ALPN `h2` or the h2c prior-knowledge preface. HTTP/3
 and gRPC are untouched.
 
-See `docs/superpowers/specs/2026-07-29-armature-h1-design.md` for the full design
-and `docs/superpowers/plans/2026-07-29-armature-h1-crate.md` for the build plan.
+See `docs/superpowers/specs/2026-08-03-hyper-backend-design.md` for the
+`hyper-backend` feature's design and `docs/superpowers/plans/2026-08-03-hyper-backend.md`
+for its build plan. (The original crate design/plan docs predate this
+repository's `docs/superpowers/` history and are no longer present.)

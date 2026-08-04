@@ -97,8 +97,22 @@ fn raw_exchange(raw: &'static [u8]) -> Exchange {
     raw_exchange_with(quick_limits(), raw)
 }
 
-/// Send `pieces` with `gap` between them, then read the reply to EOF.
-fn raw_exchange_slow(limits: Limits, pieces: Vec<Vec<u8>>, gap: Duration) -> Exchange {
+/// Send `pieces` with `gap` between them to a server built from `make`, then
+/// read the reply to EOF.
+///
+/// Generalized over the service so tests that need a handler other than
+/// `echo` still get the bind/thread/runtime/shutdown/join wiring — and the
+/// `Exchange::closed` signal — for free, instead of open-coding their own
+/// copy of it.
+fn raw_exchange_with_service<S>(
+    limits: Limits,
+    make: impl Fn() -> S + Send + Clone + 'static,
+    pieces: Vec<Vec<u8>>,
+    gap: Duration,
+) -> Exchange
+where
+    S: armature_h1::H1Service + 'static,
+{
     let server = Server::bind(config(limits)).expect("bind");
     let addr = server.local_addr();
     let handle = server.handle();
@@ -135,8 +149,13 @@ fn raw_exchange_slow(limits: Limits, pieces: Vec<Vec<u8>>, gap: Duration) -> Exc
         out
     });
 
-    server.serve(|| echo).expect("serve");
+    server.serve(make).expect("serve");
     client.join().expect("client thread")
+}
+
+/// Send `pieces` with `gap` between them, then read the reply to EOF.
+fn raw_exchange_slow(limits: Limits, pieces: Vec<Vec<u8>>, gap: Duration) -> Exchange {
+    raw_exchange_with_service(limits, || echo, pieces, gap)
 }
 
 // ============================ framing ============================
@@ -177,9 +196,26 @@ fn chunked_not_final_400_close() {
 }
 
 #[test]
+#[cfg_attr(
+    feature = "hyper-backend",
+    ignore = "see BACKENDS.md: status for an unsupported transfer coding \
+              (hyper rejects at parse with 400, before framing::decide runs)"
+)]
 fn unsupported_transfer_coding_501_close() {
     raw_exchange(b"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: gzip\r\n\r\n")
         .assert_rejected_and_closed(501);
+}
+
+/// Positive twin of `unsupported_transfer_coding_501_close` for the hyper
+/// backend: BACKENDS.md documents hyper rejecting an unsupported transfer
+/// coding with `400` at head-parse time, before `framing::decide` runs. A
+/// hyper version that starts answering this `501`, or with something else
+/// entirely, should fail the build rather than pass an ignored test silently.
+#[test]
+#[cfg(feature = "hyper-backend")]
+fn hyper_unsupported_transfer_coding_400_close() {
+    raw_exchange(b"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: gzip\r\n\r\n")
+        .assert_rejected_and_closed(400);
 }
 
 /// RFC 9112 section 6.1: a server must not reuse a connection after receiving
@@ -251,8 +287,26 @@ fn bare_cr_400_close() {
 /// RFC 9112 section 2.2 permits accepting a bare LF. This crate declines:
 /// leniency that differs from a peer's is the smuggling vector.
 #[test]
+#[cfg_attr(
+    feature = "hyper-backend",
+    ignore = "see BACKENDS.md: bare LF as a head line terminator \
+              (httparse accepts it and hyper offers no strictness knob)"
+)]
 fn bare_lf_400_close() {
     raw_exchange(b"GET / HTTP/1.1\nHost: a\r\n\r\n").assert_rejected_and_closed(400);
+}
+
+/// Positive twin of `bare_lf_400_close` for the hyper backend: BACKENDS.md
+/// documents httparse accepting a bare LF as a head line terminator, with no
+/// server-side knob to turn that off, so hyper serves this request `200`
+/// instead of rejecting it. If a future httparse/hyper exposes strictness
+/// here and this starts failing, that is exactly the signal the ignored
+/// original test is watching for.
+#[test]
+#[cfg(feature = "hyper-backend")]
+fn hyper_bare_lf_accepted() {
+    let e = raw_exchange(b"GET / HTTP/1.1\nHost: a\r\n\r\n");
+    assert_eq!(e.status(), Some(200), "{}", e.body);
 }
 
 /// RFC 9112 section 5.2.
@@ -273,8 +327,24 @@ fn bad_request_line_400_close() {
 }
 
 #[test]
+#[cfg_attr(
+    feature = "hyper-backend",
+    ignore = "see BACKENDS.md: status for an unsupported HTTP version \
+              (hyper's on_error maps Parse::Version to 400, not 505)"
+)]
 fn http_12_505_close() {
     raw_exchange(b"GET / HTTP/1.2\r\nHost: a\r\n\r\n").assert_rejected_and_closed(505);
+}
+
+/// Positive twin of `http_12_505_close` for the hyper backend: BACKENDS.md
+/// documents `Server::on_error` mapping `Parse::Version` to `400` rather than
+/// `505`, and that the mapping is not configurable. If a hyper release
+/// starts writing `505` for this, the ignored original passes and this one
+/// should be the thing that notices first.
+#[test]
+#[cfg(feature = "hyper-backend")]
+fn hyper_http_12_400_close() {
+    raw_exchange(b"GET / HTTP/1.2\r\nHost: a\r\n\r\n").assert_rejected_and_closed(400);
 }
 
 #[test]
@@ -289,8 +359,45 @@ fn absolute_form_target_accepted() {
 /// RFC 9112 section 3.2 form contains one. Accepting it would route on bytes an
 /// upstream hop would have stripped.
 #[test]
+#[cfg_attr(
+    feature = "hyper-backend",
+    ignore = "see BACKENDS.md: fragment in the request target \
+              (http::uri truncates at '#' before the bridge sees the target)"
+)]
 fn fragment_in_target_400_close() {
     raw_exchange(b"GET /a#frag HTTP/1.1\r\nHost: a\r\n\r\n").assert_rejected_and_closed(400);
+}
+
+/// Positive twin of `fragment_in_target_400_close` for the hyper backend:
+/// BACKENDS.md documents `http::uri::PathAndQuery::from_shared` truncating
+/// at `#` before hyper builds the `Request`, so the bridge never sees the
+/// fragment and the request is served on the truncated target. The handler
+/// echoes the target it actually received, so this pins the truncation
+/// itself, not just the status code.
+#[test]
+#[cfg(feature = "hyper-backend")]
+fn hyper_fragment_in_target_truncated_and_served() {
+    async fn echo_target(req: Request) -> Response {
+        let mut r = Response::new(200);
+        r.body = armature_h1::ResponseBody::Full(bytes::Bytes::copy_from_slice(
+            req.head.target().as_bytes(),
+        ));
+        r
+    }
+
+    let e = raw_exchange_with_service(
+        quick_limits(),
+        || echo_target,
+        vec![b"GET /a#frag HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n".to_vec()],
+        Duration::ZERO,
+    );
+
+    assert_eq!(e.status(), Some(200), "{}", e.body);
+    assert!(
+        e.body.ends_with("/a"),
+        "the fragment must be gone by the time the handler sees the target: {}",
+        e.body
+    );
 }
 
 #[test]
@@ -527,4 +634,137 @@ fn unread_body_is_not_mined_for_a_second_request() {
         "an unread body must not be mined for a second request: {body}"
     );
     assert!(body.contains("connection: close"), "{body}");
+}
+
+/// RFC 9110 section 9.3.6. This crate does not establish CONNECT tunnels
+/// itself: a handler's response to a `CONNECT` is written like any other
+/// response — framed, with `Content-Length: 0` for an empty body — and the
+/// connection carries on under the ordinary keep-alive rules, so a pipelined
+/// follow-up is served.
+#[test]
+#[cfg_attr(
+    feature = "hyper-backend",
+    ignore = "see BACKENDS.md: a 2xx response to CONNECT \
+              (hyper hijacks it as a tunnel: no framing field is written and \
+               the connection is not reused)"
+)]
+fn connect_2xx_is_an_ordinary_response_and_the_connection_continues() {
+    async fn ok(_req: Request) -> Response {
+        Response::status_only(200)
+    }
+
+    let e = raw_exchange_with_service(
+        quick_limits(),
+        || ok,
+        vec![
+            b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n\
+              GET / HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n"
+                .to_vec(),
+        ],
+        Duration::ZERO,
+    );
+
+    assert!(e.body.starts_with("HTTP/1.1 200 OK"), "{}", e.body);
+    assert!(
+        e.body.to_lowercase().contains("content-length: 0"),
+        "the response is framed like any other, not left undelimited as a \
+         tunnel would be: {}",
+        e.body
+    );
+    assert_eq!(
+        e.responses(),
+        2,
+        "no tunnel was established, so the pipelined request is served too: \
+         {}",
+        e.body
+    );
+    assert!(
+        e.closed,
+        "the pipelined request carried `Connection: close`, so the \
+         connection must end, not continue as a tunnel would: {}",
+        e.body
+    );
+}
+
+/// Positive twin of `connect_2xx_is_an_ordinary_response_and_the_connection_continues`
+/// for the hyper backend: BACKENDS.md documents hyper's role/encoder hijacking
+/// a 2xx response to `CONNECT` as a tunnel-establishment upgrade — no framing
+/// field is written, the connection is not reused, and the pipelined request
+/// behind it is never served.
+#[test]
+#[cfg(feature = "hyper-backend")]
+fn hyper_connect_2xx_is_hijacked_as_a_tunnel() {
+    async fn ok(_req: Request) -> Response {
+        Response::status_only(200)
+    }
+
+    let e = raw_exchange_with_service(
+        quick_limits(),
+        || ok,
+        vec![
+            b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n\
+              GET / HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n"
+                .to_vec(),
+        ],
+        Duration::ZERO,
+    );
+
+    assert!(e.body.starts_with("HTTP/1.1 200 OK"), "{}", e.body);
+    assert!(
+        !e.body.to_lowercase().contains("content-length"),
+        "a tunnel hijack writes no framing field: {}",
+        e.body
+    );
+    assert_eq!(
+        e.responses(),
+        1,
+        "the tunnel swallows the connection, so the pipelined request behind \
+         it is never served: {}",
+        e.body
+    );
+}
+
+/// A handler `Content-Length` that disagrees with the body it framed must
+/// never reach the wire: the peer would read the difference as the start of
+/// the next response. Both backends replace it with the true length — the
+/// native writer by reclaiming framing, the hyper bridge by dropping the field
+/// so hyper frames from the body's own size.
+#[test]
+fn a_wrong_handler_content_length_is_replaced_with_the_true_one() {
+    async fn lying(_req: Request) -> Response {
+        Response::new(200)
+            .header(
+                armature_h1::HeaderId::ContentLength,
+                bytes::Bytes::from_static(b"5"),
+            )
+            .with_body(armature_h1::ResponseBody::Full(bytes::Bytes::from_static(
+                b"hello world",
+            )))
+    }
+
+    let e = raw_exchange_with_service(
+        quick_limits(),
+        || lying,
+        vec![b"GET / HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n".to_vec()],
+        Duration::ZERO,
+    );
+
+    let lower = e.body.to_lowercase();
+    assert_eq!(
+        lower.matches("content-length:").count(),
+        1,
+        "exactly one framing field: {}",
+        e.body
+    );
+    assert!(lower.contains("content-length: 11"), "{}", e.body);
+    assert!(
+        e.body.ends_with("hello world"),
+        "the whole body goes out, untruncated: {}",
+        e.body
+    );
+    assert!(
+        e.closed,
+        "`Connection: close` on the request means the connection ends: {}",
+        e.body
+    );
 }
