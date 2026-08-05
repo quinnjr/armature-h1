@@ -9,6 +9,7 @@
 use crate::service::Transport;
 use bytes::Bytes;
 use std::future::Future;
+use std::net::SocketAddr;
 use std::pin::Pin;
 
 /// The HTTP/2 connection preface sent by a client using prior knowledge
@@ -56,7 +57,20 @@ pub trait H2Fallback {
     /// preface itself. The implementation **must** process them before reading
     /// `io`, or it will see a stream that appears to be missing its opening
     /// frames.
-    fn handle(&self, io: Box<dyn Transport>, buffered: Bytes) -> Pin<Box<dyn Future<Output = ()>>>;
+    ///
+    /// `peer` is the address of the socket this connection arrived on, the same
+    /// value [`Request::peer`](crate::Request::peer) carries on the HTTP/1
+    /// path. It is passed because a fallback serves whole connections and
+    /// otherwise has no way to obtain it — `Transport` is `AsyncRead +
+    /// AsyncWrite` and nothing more — which would leave every request it serves
+    /// with no client identifier except the caller-chosen headers. `None` means
+    /// unknown, never local.
+    fn handle(
+        &self,
+        io: Box<dyn Transport>,
+        buffered: Bytes,
+        peer: Option<SocketAddr>,
+    ) -> Pin<Box<dyn Future<Output = ()>>>;
 }
 
 /// Somewhere to send a connection a handler upgraded out of HTTP/1.

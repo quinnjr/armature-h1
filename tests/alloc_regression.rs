@@ -11,6 +11,7 @@
 use armature_h1::{ConnConfig, Connection, DateCache, Limits, Request, Response};
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::{Cell, RefCell};
+use std::net::SocketAddr;
 use std::rc::Rc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -111,6 +112,25 @@ where
     S: Fn(Request) -> Fut + Copy + 'static,
     Fut: std::future::Future<Output = Response> + 'static,
 {
+    steady_state_allocs_with_peer(request, service, warm, count, None)
+}
+
+/// As [`steady_state_allocs`], with the connection's peer address populated.
+///
+/// Split out rather than folded into every call site because `None` is the
+/// shape all the other cases measure; the point of the parameter is that one
+/// case measures the other shape.
+fn steady_state_allocs_with_peer<S, Fut>(
+    request: &'static [u8],
+    service: S,
+    warm: usize,
+    count: usize,
+    peer: Option<SocketAddr>,
+) -> u64
+where
+    S: Fn(Request) -> Fut + Copy + 'static,
+    Fut: std::future::Future<Output = Response> + 'static,
+{
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -133,7 +153,8 @@ where
             server_name: None,
         }),
         Rc::new(RefCell::new(DateCache::new())),
-    );
+    )
+    .with_peer(peer);
     // Spawned on the LocalSet handle before `run_until`, matching the pattern the
     // connection tests use. Spawning from inside the `run_until` future instead
     // left the server task unscheduled and the whole harness wedged.
@@ -242,6 +263,30 @@ fn steady_state_keepalive_get_stays_within_budget() {
     assert!(
         allocs <= BUDGET_PER_GET * n as u64,
         "keep-alive GET budget exceeded: {per_request:.2} allocations per request, \
+         budget is {BUDGET_PER_GET}"
+    );
+}
+
+/// The same case, with the connection's peer address populated.
+///
+/// Every other case here builds its connection with `Connection::new` alone,
+/// which leaves `peer` as `None` — so the field is only ever measured empty,
+/// and an empty `Option` costs nothing however its payload is represented.
+/// `SocketAddr` is `Copy` and rides inline in the `Request`, so filling it in
+/// must not move the count off zero. The day someone reaches for an
+/// `Rc<String>` or a formatted address, this is the row that fails.
+#[test]
+fn steady_state_keepalive_get_with_peer_stays_within_budget() {
+    let n = 100;
+    let peer: SocketAddr = "203.0.113.7:54321".parse().expect("addr");
+    let allocs = steady_state_allocs_with_peer(KEEPALIVE_GET, hello, 50, n, Some(peer));
+    let per_request = allocs as f64 / n as f64;
+    println!(
+        "keep-alive GET with peer: {allocs} allocations over {n} requests ({per_request:.2}/request)"
+    );
+    assert!(
+        allocs <= BUDGET_PER_GET * n as u64,
+        "a populated peer address must not cost an allocation: {per_request:.2} per request, \
          budget is {BUDGET_PER_GET}"
     );
 }

@@ -149,9 +149,22 @@ pub struct ServerHandle {
 
 impl ServerHandle {
     /// Signal every worker to stop accepting and drain.
+    ///
+    /// Safe to call before [`Server::serve`] starts: the flag is set on the
+    /// channel itself, and each worker checks its current value before its
+    /// first accept, so a server told to stop before it began stops without
+    /// ever accepting.
     pub fn shutdown(&self) {
-        // Idempotent by construction: sending `true` twice is the same state.
-        let _ = self.tx.send(true);
+        // `send_replace`, not `send`. `send` fails and **leaves the value
+        // unchanged** when no receiver exists, which is precisely the state
+        // between `bind` and `serve` — the workers have not subscribed yet, so
+        // a shutdown in that window would be silently discarded and
+        // `is_shutting_down` would go on reporting false. `send_replace` sets
+        // the value regardless of who is listening.
+        //
+        // Idempotent by construction: replacing `true` with `true` is the same
+        // state.
+        let _ = self.tx.send_replace(true);
     }
 
     /// Whether shutdown has been signalled.
@@ -269,11 +282,21 @@ impl Server {
     /// the WebSocket handoff. It runs once per worker with the same `Send`
     /// factory / non-`Send` product asymmetry as `make` and `make_fallback`.
     ///
-    /// A handler that retains the request [`Body`](crate::service::Body) past
-    /// its response forfeits the handoff and the connection closes instead: the
-    /// body holds a second handle on the transport, and two readers on one
-    /// socket is not a state this crate will produce. See
-    /// [`Connection::serve`](crate::conn::Connection::serve).
+    /// On the default (native) backend a handler that retains the request
+    /// [`Body`](crate::service::Body) past its response, or that never reads it
+    /// to its end, forfeits the handoff and the connection closes instead: a
+    /// live body holds a second handle on the transport, and an unread one
+    /// leaves body bytes on the wire that the consumer would read as the peer's
+    /// first post-upgrade frames. Neither is a state this crate will produce.
+    /// See [`Connection::serve`](crate::conn::Connection::serve).
+    ///
+    /// That check is native-only, and this crate's rendered documentation is
+    /// built with `hyper-backend` enabled, so it describes something the
+    /// documented build does not do: hyper's request body is a channel endpoint
+    /// rather than a borrow of the socket, so there is no live handle to detect
+    /// and the upgrade proceeds. `BACKENDS.md` records that divergence in full;
+    /// a handler that upgrades should drop and drain its body regardless, since
+    /// only one of the two backends will catch it.
     pub fn serve_with<F, S, G, H, U, C>(
         self,
         make: F,
@@ -316,13 +339,22 @@ impl Server {
                 .collect(),
         };
 
+        // Subscribed once, before any worker starts, and cloned per worker. A
+        // `subscribe()` inside the loop would mark the sender's *current* value
+        // as already seen, so a `shutdown()` landing midway through the loop
+        // would stop the workers subscribed before it and leave the rest
+        // accepting forever — `serve` would then block in `join` with
+        // `is_shutting_down()` reporting true. A clone inherits the seen
+        // version from this one, taken before anything can be signalled.
+        let base_rx = tx.subscribe();
+
         let mut handles = Vec::with_capacity(cfg.workers);
         for (worker, slot) in per_worker.iter_mut().enumerate() {
             let cfg = cfg.clone();
             let make = make.clone();
             let make_fallback = make_fallback.clone();
             let make_upgrade = make_upgrade.clone();
-            let rx = tx.subscribe();
+            let rx = base_rx.clone();
             let core = core_ids.get(worker).copied();
             let Some(std_listener) = slot.take() else {
                 continue;
@@ -407,9 +439,23 @@ async fn worker_loop<F, S, G, H, U, C>(
     local
         .run_until(async {
             loop {
+                // Checked at the top of every iteration rather than only on
+                // `changed()`. A shutdown signalled *before* this worker's
+                // receiver existed is already the channel's current value and
+                // will never produce a transition, so a transition-only loop
+                // would accept forever on a server the caller has already
+                // stopped. `changed()` still covers the signal arriving while
+                // this worker is parked in `select!`.
+                if *rx.borrow() {
+                    break;
+                }
                 tokio::select! {
-                    _ = rx.changed() => {
-                        if *rx.borrow() {
+                    changed = rx.changed() => {
+                        // `Err` means every sender is gone, which can only
+                        // happen once nobody can ever signal shutdown again;
+                        // treat it as the signal rather than spinning on a
+                        // channel that will never yield.
+                        if changed.is_err() || *rx.borrow() {
                             break;
                         }
                     }
@@ -469,7 +515,9 @@ async fn dispatch<S, H, C>(
         if is_h2 {
             // Nothing has been read past the handshake, so there is no buffered
             // application data to forward.
-            fallback.handle(Box::new(tls_stream), Bytes::new()).await;
+            fallback
+                .handle(Box::new(tls_stream), Bytes::new(), Some(peer))
+                .await;
         } else {
             serve_h1(
                 tls_stream,
@@ -490,7 +538,9 @@ async fn dispatch<S, H, C>(
             Some((stream, buffered, Preface::Http2)) => {
                 // The preface is part of the HTTP/2 stream and cannot be re-read
                 // from the socket, so it must travel with the connection.
-                fallback.handle(Box::new(stream), buffered).await;
+                fallback
+                    .handle(Box::new(stream), buffered, Some(peer))
+                    .await;
             }
             Some((stream, buffered, _)) => {
                 serve_h1(stream, service, upgrades, conn_cfg, date, buffered, peer).await;
@@ -575,7 +625,12 @@ async fn serve_h1<IO, S, C>(
 pub struct CloseH2;
 
 impl H2Fallback for CloseH2 {
-    fn handle(&self, io: Box<dyn Transport>, buffered: Bytes) -> Pin<Box<dyn Future<Output = ()>>> {
+    fn handle(
+        &self,
+        io: Box<dyn Transport>,
+        buffered: Bytes,
+        _peer: Option<SocketAddr>,
+    ) -> Pin<Box<dyn Future<Output = ()>>> {
         Box::pin(async move {
             drop(buffered);
             drop(io);
@@ -793,6 +848,74 @@ mod tests {
         assert!(
             client.join().unwrap(),
             "no request may be served after shutdown"
+        );
+    }
+
+    /// A shutdown signalled before `serve` runs must still be honoured.
+    ///
+    /// `watch::Sender::subscribe` marks the sender's *current* value as already
+    /// seen, so a receiver created after the signal never observes a
+    /// transition. A loop that waited only on `changed()` would accept forever
+    /// on a server the caller had already stopped, and `serve` would never
+    /// return.
+    #[test]
+    fn shutdown_before_serve_returns_immediately() {
+        let server = Server::bind(test_config(2)).expect("bind");
+        let handle = server.handle();
+
+        handle.shutdown();
+        assert!(handle.is_shutting_down());
+
+        // The failure mode is a hang, so the assertion is that this returns at
+        // all. A watchdog thread turns a regression into a failure rather than
+        // a suite that never finishes.
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            server.serve(|| hello).expect("serve");
+            let _ = tx.send(());
+        });
+        assert!(
+            rx.recv_timeout(Duration::from_secs(10)).is_ok(),
+            "serve must return when shutdown was signalled before it started"
+        );
+    }
+
+    /// Every worker must observe a shutdown, not just the ones that happened to
+    /// subscribe before it landed.
+    ///
+    /// With the subscription taken inside the spawn loop, a signal arriving
+    /// midway stopped the workers already subscribed and left the rest
+    /// accepting, so `serve` blocked in `join` while `is_shutting_down()`
+    /// reported true.
+    #[test]
+    fn shutdown_stops_every_worker() {
+        let server = Server::bind(test_config(4)).expect("bind");
+        let addr = server.local_addr();
+        let handle = server.handle();
+
+        let client = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            // Enough requests that every worker has almost certainly accepted
+            // at least one, so none is merely idle when the signal lands.
+            for _ in 0..8 {
+                let _ = rt.block_on(request(addr, GET));
+            }
+            handle.shutdown();
+        });
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            server.serve(|| hello).expect("serve");
+            let _ = tx.send(());
+        });
+        client.join().expect("client thread");
+        assert!(
+            rx.recv_timeout(Duration::from_secs(10)).is_ok(),
+            "serve must return once every worker has stopped; a worker that \
+             missed the signal keeps accepting and join blocks forever"
         );
     }
 

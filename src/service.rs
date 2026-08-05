@@ -29,6 +29,14 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Transport for T {}
 
 /// A connection handed off after a successful protocol upgrade.
 pub struct Upgraded {
+    /// The address of the peer that opened this connection.
+    ///
+    /// Carried for the same reason [`Request::peer`] is, and more urgently: an
+    /// upgrade consumer owns the connection for its whole lifetime — a
+    /// WebSocket session rather than one request — which is exactly where
+    /// per-peer accounting matters most, and it has no `Request` left to read
+    /// the address from. `None` means unknown, never local.
+    pub peer: Option<SocketAddr>,
     /// The raw transport, positioned after the upgrade request's head.
     pub io: Box<dyn Transport>,
     /// Bytes already read past the head.
@@ -43,6 +51,7 @@ pub struct Upgraded {
 impl std::fmt::Debug for Upgraded {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Upgraded")
+            .field("peer", &self.peer)
             .field("buffered", &self.buffered.len())
             .finish_non_exhaustive()
     }

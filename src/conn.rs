@@ -274,12 +274,14 @@ where
     /// Serve requests until the connection ends.
     ///
     /// `Ok(Some(_))` means the connection was upgraded and the caller must hand
-    /// it to the upgrade consumer. This return value is the *only* way an
-    /// upgraded transport leaves the crate: a handler signals an upgrade by
-    /// answering a request that asked for one with status 101, and whoever drove
-    /// this `Connection` receives the socket here. [`crate::Server`] has no
-    /// upgrade consumer to hand it to and closes instead, so a service that
-    /// upgrades must drive `Connection` itself.
+    /// it to the upgrade consumer: a handler signals an upgrade by answering a
+    /// request that asked for one with status 101, and whoever drove this
+    /// `Connection` receives the socket here. Under [`crate::Server`], pass an
+    /// [`UpgradeConsumer`](crate::UpgradeConsumer) to
+    /// [`serve_with`](crate::Server::serve_with) and it receives the same
+    /// thing; [`serve`](crate::Server::serve) and
+    /// [`serve_with_fallback`](crate::Server::serve_with_fallback) default to
+    /// [`CloseUpgrade`](crate::CloseUpgrade), which closes.
     ///
     /// A handler that retains the request [`Body`] past its response forfeits
     /// the handoff: the body holds a handle on the same transport, and two
@@ -402,7 +404,14 @@ where
             let keep_alive = keep_alive && body_consumed;
 
             let disposition = self
-                .write_response(version, resp, keep_alive, is_head_request, wants_upgrade)
+                .write_response(
+                    version,
+                    resp,
+                    keep_alive,
+                    is_head_request,
+                    wants_upgrade,
+                    body_consumed,
+                )
                 .await?;
 
             match disposition {
@@ -414,10 +423,13 @@ where
                     // transport. Handing the socket to an upgrade consumer while
                     // that handle can read from it would interleave two readers,
                     // so the handoff is forfeited and the connection closes.
+                    // Read before `into_parts` consumes `self`.
+                    let peer = self.peer;
                     let Some((io, buffered)) = self.into_parts() else {
                         return Ok(None);
                     };
                     return Ok(Some(Upgraded {
+                        peer,
                         io: Box::new(io),
                         buffered,
                     }));
@@ -528,11 +540,20 @@ where
         req_keep_alive: bool,
         is_head_request: bool,
         wants_upgrade: bool,
+        body_consumed: bool,
     ) -> io::Result<Disposition> {
         // Status 101 alone does not take the connection: the peer must have
         // asked for the upgrade, or the transport would be handed off to a
         // protocol the client is not speaking.
-        let upgrading = resp.status == 101 && wants_upgrade;
+        //
+        // `body_consumed` gates it for the same reason it gates reuse. Bytes of
+        // an unread request body are still on the wire, and `into_parts` hands
+        // whatever is buffered to the upgrade consumer as
+        // `Upgraded::buffered` — which that consumer is documented to treat as
+        // the peer's first post-upgrade frames. Handing it body bytes under
+        // that contract is the smuggling shape pointed at the consumer instead
+        // of at the parser, so an unread body forfeits the handoff and closes.
+        let upgrading = resp.status == 101 && wants_upgrade && body_consumed;
         // An unread request body means the next bytes on the wire are body
         // bytes, not a request line. Rather than guess where the body ended,
         // close.
@@ -827,6 +848,73 @@ mod tests {
                 (String::from_utf8_lossy(&out).into_owned(), closed)
             })
             .await
+    }
+
+    /// Serve one request and report what the handler saw in
+    /// [`Request::peer`](crate::Request::peer).
+    ///
+    /// `with_peer` outer-`None` leaves the builder uncalled, which is what
+    /// `Connection::new` alone produces; `Some(p)` calls it with `p`. The
+    /// distinction is the point of the two tests below: the default and the
+    /// populated case reach the handler by different routes, and only the
+    /// accept loop exercises the second one otherwise — which under
+    /// `hyper-backend` never runs, leaving this public escape hatch with no
+    /// coverage at all in that feature row.
+    async fn peer_seen_by_handler(with_peer: Option<Option<SocketAddr>>) -> Option<SocketAddr> {
+        let seen: Rc<Cell<Option<SocketAddr>>> = Rc::new(Cell::new(None));
+        let recorder = seen.clone();
+
+        let (mut client, server) = tokio::io::duplex(64 * 1024);
+        let local = tokio::task::LocalSet::new();
+
+        let conn = Connection::new(
+            server,
+            move |req: Request| {
+                recorder.set(req.peer);
+                async move { Response::text("hi") }
+            },
+            cfg(Limits::default()),
+            Rc::new(RefCell::new(DateCache::new())),
+        );
+        let conn = match with_peer {
+            Some(peer) => conn.with_peer(peer),
+            None => conn,
+        };
+        let server_task = local.spawn_local(async move { conn.serve().await });
+
+        local
+            .run_until(async move {
+                client
+                    .write_all(b"GET / HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n")
+                    .await
+                    .unwrap();
+                let mut out = Vec::new();
+                let _ = tokio::time::timeout(Duration::from_secs(2), client.read_to_end(&mut out))
+                    .await;
+                let _ = server_task.await;
+                // Without this a handler that never ran would report `None` and
+                // pass the default case for the wrong reason.
+                assert!(
+                    String::from_utf8_lossy(&out).starts_with("HTTP/1.1 200 OK"),
+                    "the handler must have run"
+                );
+            })
+            .await;
+
+        seen.get()
+    }
+
+    #[tokio::test]
+    async fn with_peer_reaches_the_handler() {
+        let addr: SocketAddr = "203.0.113.7:54321".parse().expect("addr");
+        assert_eq!(peer_seen_by_handler(Some(Some(addr))).await, Some(addr));
+    }
+
+    #[tokio::test]
+    async fn peer_is_none_without_with_peer() {
+        // `None` here means unknown, not local: a `duplex` pair has no address
+        // to report, and nothing downstream may read the absence as trust.
+        assert_eq!(peer_seen_by_handler(None).await, None);
     }
 
     async fn ok_service(_req: Request) -> Response {

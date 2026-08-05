@@ -7,6 +7,8 @@ and this crate adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.h
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-08-04
+
 ### Added
 
 - `Request::peer`: the address of the socket the request arrived on, stamped
@@ -21,6 +23,10 @@ and this crate adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.h
   silently dropped; driving `Connection` directly was the only way to get the
   socket. `serve` and `serve_with_fallback` still close, via `CloseUpgrade`.
 - `Connection::with_peer`, for a caller driving `Connection` itself.
+- `Upgraded::peer`, carrying the same address to an upgrade consumer. A
+  consumer owns the connection for the rest of its life and has no `Request`
+  left to read the address off, so without this the address a WebSocket
+  session is attributed to would again be one the client chose.
 
 ### Changed
 
@@ -30,6 +36,35 @@ and this crate adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.h
 - **Breaking**: `serve_connection` takes a sixth argument, `peer:
   Option<SocketAddr>`. Pass `None` for a transport with no address to report;
   it is not a "trusted source" signal, it means unknown.
+- **Breaking**: `H2Fallback::handle` takes a fourth argument, `peer:
+  Option<SocketAddr>`. A fallback serves whole connections rather than
+  requests, so it never sees a `Request` and had no way at all to learn the
+  client address — leaving every request it served attributable only to
+  caller-chosen headers, which is the same hole `Request::peer` closes on the
+  HTTP/1 path.
+- An upgrade handoff is now forfeited when the request body was not read to
+  its end, not only when the body outlives the response. Bytes of an unread
+  body are still on the wire, and `Upgraded::buffered` is documented as the
+  peer's *first post-upgrade frames* — handing body bytes over under that
+  contract is the smuggling shape aimed at the upgrade consumer instead of at
+  the parser. A handler upgrading a request that carried a body must now drain
+  it; previously such a connection was handed off. Native backend only; see
+  `BACKENDS.md`.
+
+### Fixed
+
+- A shutdown signalled before `serve` began was silently discarded.
+  `ServerHandle::shutdown` used `watch::Sender::send`, which fails *and leaves
+  the value unchanged* when no receiver exists — and the window between `bind`
+  and `serve` is exactly when none does. `send_replace` stores the flag
+  regardless, so the workers observe it the moment they subscribe.
+- A shutdown landing partway through the worker-spawn loop stopped only the
+  workers that had already subscribed, while the rest went on accepting.
+  `serve` then blocked in `join` forever with `is_shutting_down()` reporting
+  true. Each worker now re-reads the flag at the top of every accept
+  iteration rather than trusting `changed()` alone, and the subscription is
+  taken once before the spawn loop so no worker can start after the signal
+  without seeing it.
 
 ## [0.2.0] - 2026-08-04
 

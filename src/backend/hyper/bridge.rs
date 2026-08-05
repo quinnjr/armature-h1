@@ -206,7 +206,17 @@ impl<S: H1Service + 'static>
 
             let resp = service.call(Request { head, body, peer }).await;
 
-            let upgrading = resp.status == 101 && wants_upgrade;
+            // `fully_read` gates the handoff for the same reason it gates reuse
+            // below, and on exactly the signal `conn::write_response` calls
+            // `body_consumed`. Bytes of an unread request body are still on the
+            // wire, and whatever hyper has buffered past the head reaches the
+            // upgrade consumer as `Upgraded::buffered` — which that consumer is
+            // documented to treat as the peer's first post-upgrade frames.
+            // Handing it body bytes under that contract is the smuggling shape
+            // pointed at the consumer instead of at the parser, so an unread
+            // body forfeits the handoff; `force_close` then closes, as native
+            // does.
+            let upgrading = resp.status == 101 && wants_upgrade && fully_read.get();
             if upgrading {
                 *upgrade_slot.borrow_mut() = Some(on_upgrade);
                 sent_101.set(true);

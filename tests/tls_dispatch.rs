@@ -20,11 +20,21 @@ const GET: &[u8] = b"GET / HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n";
 #[derive(Clone, Default)]
 struct Recorder {
     seen: Arc<Mutex<Vec<Vec<u8>>>>,
+    /// The peer address the fallback was handed. An ALPN-negotiated `h2`
+    /// connection is served entirely by the fallback, so this is its only
+    /// chance to learn which client it is serving.
+    peers: Arc<Mutex<Vec<Option<SocketAddr>>>>,
 }
 
 impl H2Fallback for Recorder {
-    fn handle(&self, io: Box<dyn Transport>, buffered: Bytes) -> Pin<Box<dyn Future<Output = ()>>> {
+    fn handle(
+        &self,
+        io: Box<dyn Transport>,
+        buffered: Bytes,
+        peer: Option<SocketAddr>,
+    ) -> Pin<Box<dyn Future<Output = ()>>> {
         let seen = self.seen.clone();
+        self.peers.lock().expect("lock").push(peer);
         Box::pin(async move {
             seen.lock().expect("lock").push(buffered.to_vec());
             // Reply with something recognizable so the client can tell the

@@ -29,11 +29,20 @@ const GET: &[u8] = b"GET / HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n";
 #[derive(Clone, Default)]
 struct Recorder {
     seen: Arc<Mutex<Vec<Vec<u8>>>>,
+    /// The peer address the fallback was handed, so a test can assert an
+    /// HTTP/2 connection is not served with an unknown client.
+    peers: Arc<Mutex<Vec<Option<SocketAddr>>>>,
 }
 
 impl H2Fallback for Recorder {
-    fn handle(&self, io: Box<dyn Transport>, buffered: Bytes) -> Pin<Box<dyn Future<Output = ()>>> {
+    fn handle(
+        &self,
+        io: Box<dyn Transport>,
+        buffered: Bytes,
+        peer: Option<SocketAddr>,
+    ) -> Pin<Box<dyn Future<Output = ()>>> {
         let seen = self.seen.clone();
+        self.peers.lock().expect("lock").push(peer);
         Box::pin(async move {
             seen.lock().expect("lock").push(buffered.to_vec());
             // Reply with something recognizable so the client can tell the
@@ -281,12 +290,18 @@ async fn echo_peer(req: Request) -> Response {
 #[derive(Clone, Default)]
 struct RawUpgrade {
     seen: Arc<Mutex<Vec<Vec<u8>>>>,
+    /// The peer each handed-off connection reported. An upgrade consumer owns
+    /// the connection for its whole lifetime, so this is the only chance it has
+    /// to learn the address.
+    peers: Arc<Mutex<Vec<Option<SocketAddr>>>>,
 }
 
 impl UpgradeConsumer for RawUpgrade {
     fn handle(&self, upgraded: Upgraded) -> Pin<Box<dyn Future<Output = ()>>> {
         let seen = self.seen.clone();
+        let peers = self.peers.clone();
         Box::pin(async move {
+            peers.lock().expect("lock").push(upgraded.peer);
             seen.lock().expect("lock").push(upgraded.buffered.to_vec());
             let mut io = upgraded.io;
             let _ = io.write_all(b"UPGRADED").await;
@@ -398,5 +413,76 @@ fn without_an_upgrade_consumer_an_upgraded_connection_still_closes() {
     assert!(
         reply.ends_with("\r\n\r\n"),
         "nothing follows the 101 when no consumer is plugged in: {reply}"
+    );
+}
+
+#[test]
+fn the_http2_fallback_is_told_which_peer_it_is_serving() {
+    let rec = Recorder::default();
+    let peers = rec.peers.clone();
+
+    let local = with_server(test_config().detect_h2c(true), rec, |addr| {
+        Box::pin(async move {
+            let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let local = s.local_addr().unwrap();
+            s.write_all(H2C_PREFACE).await.unwrap();
+            let mut out = Vec::new();
+            let _ = tokio::time::timeout(Duration::from_secs(2), s.read_to_end(&mut out)).await;
+            local
+        })
+    });
+
+    let peers = peers.lock().unwrap();
+    assert_eq!(
+        peers.len(),
+        1,
+        "exactly one connection reached the fallback"
+    );
+    assert_eq!(
+        peers[0],
+        Some(local),
+        "a fallback serves whole connections and has no other way to learn the \
+         client address; without it every HTTP/2 request it serves is attributed \
+         to whatever the caller put in a header"
+    );
+}
+
+#[test]
+fn an_upgrade_on_a_request_with_an_unread_body_closes_instead_of_handing_off() {
+    let rec = Recorder::default();
+    let up = RawUpgrade::default();
+    let seen = up.seen.clone();
+
+    // `echo_peer` answers 101 after dropping the body without reading it. The
+    // five declared body bytes are therefore still on the wire, and handing
+    // them to the consumer would present request-body bytes as the peer's first
+    // post-upgrade frames — the smuggling shape aimed at the consumer rather
+    // than at the parser.
+    let reply = with_server_upgrades(test_config(), rec, up, |addr| {
+        Box::pin(async move {
+            let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+            s.write_all(
+                b"POST / HTTP/1.1\r\nHost: a\r\nConnection: upgrade\r\nUpgrade: raw\r\n\
+                  Content-Length: 5\r\n\r\nHELLO",
+            )
+            .await
+            .unwrap();
+            let mut out = Vec::new();
+            let _ = tokio::time::timeout(Duration::from_secs(2), s.read_to_end(&mut out)).await;
+            String::from_utf8_lossy(&out).into_owned()
+        })
+    });
+
+    assert!(
+        reply.starts_with("HTTP/1.1 101"),
+        "the response is still written: {reply}"
+    );
+    assert!(
+        !reply.ends_with("UPGRADED"),
+        "the handoff must be forfeited when the body was never read: {reply}"
+    );
+    assert!(
+        seen.lock().unwrap().is_empty(),
+        "no connection may reach the consumer with unread body bytes buffered"
     );
 }
