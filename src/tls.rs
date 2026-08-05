@@ -83,6 +83,45 @@ pub trait H2Fallback {
 ///
 /// Like `H2Fallback`, deliberately without a `Send` bound: the consumer runs on
 /// the worker that owns the connection and never migrates.
+///
+/// # Examples
+///
+/// The one thing an implementation must get right is the order: `buffered`
+/// first, then `io`.
+///
+/// ```
+/// use armature_h1::{UpgradeConsumer, Upgraded};
+/// use std::future::Future;
+/// use std::pin::Pin;
+/// use tokio::io::{AsyncReadExt, AsyncWriteExt};
+///
+/// /// Echoes every frame the peer sends back to it.
+/// struct EchoFrames;
+///
+/// impl UpgradeConsumer for EchoFrames {
+///     fn handle(&self, upgraded: Upgraded) -> Pin<Box<dyn Future<Output = ()>>> {
+///         Box::pin(async move {
+///             let Upgraded { mut io, buffered, peer: _ } = upgraded;
+///
+///             // These bytes are already off the socket — they arrived
+///             // pipelined behind the upgrade request's head. Reading `io`
+///             // will never produce them again, so anything that starts with
+///             // `io` has silently dropped the peer's first frames.
+///             if !buffered.is_empty() {
+///                 let _ = io.write_all(&buffered).await;
+///             }
+///
+///             // Only now is `io` the head of the stream.
+///             let mut frame = [0u8; 1024];
+///             while let Ok(n) = io.read(&mut frame).await {
+///                 if n == 0 || io.write_all(&frame[..n]).await.is_err() {
+///                     break;
+///                 }
+///             }
+///         })
+///     }
+/// }
+/// ```
 pub trait UpgradeConsumer {
     /// Take over the upgraded transport.
     ///

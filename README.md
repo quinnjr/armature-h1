@@ -137,13 +137,14 @@ HTTP/1.0 semantics.
 the head — when a handler answers a request carrying `Connection: upgrade` with
 status 101. Under `Server`, pass an `UpgradeConsumer` to `serve_with` and it
 receives the same thing; `serve` and `serve_with_fallback` default to
-`CloseUpgrade`, which closes. On the native backend, a handler that retains the
-request body past its response, or that never reads it to its end, forfeits the
-handoff — a live body holds a second handle on the transport, and an unread one
-leaves body bytes on the wire that the consumer would read as the peer's first
-post-upgrade frames. Under `hyper-backend` there is no such check and the
-upgrade proceeds (see `BACKENDS.md`), so drop and drain the body before
-answering 101 regardless: only one of the two backends will catch you.
+`CloseUpgrade`, which closes. A handler that never reads the request body to
+its end forfeits the handoff on **both** backends: the unread bytes are still
+on the wire and the consumer would read them as the peer's first post-upgrade
+frames. A handler that *retains* a still-live body past its response forfeits
+it on the native backend only — there the body holds a second handle on the
+transport, while under `hyper-backend` it is a channel endpoint with no live
+handle to detect (see `BACKENDS.md`). Drain the body and drop it before
+answering 101 and neither rule can bite.
 
 **Peer address.** `Request::peer` carries the address of the socket the request
 arrived on, or `None` for a transport that has none (a `duplex` pair, or a

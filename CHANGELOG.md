@@ -23,16 +23,24 @@ and this crate adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.h
   silently dropped; driving `Connection` directly was the only way to get the
   socket. `serve` and `serve_with_fallback` still close, via `CloseUpgrade`.
 - `Connection::with_peer`, for a caller driving `Connection` itself.
-- `Upgraded::peer`, carrying the same address to an upgrade consumer. A
-  consumer owns the connection for the rest of its life and has no `Request`
-  left to read the address off, so without this the address a WebSocket
-  session is attributed to would again be one the client chose.
+- `CloseH2` is re-exported at the crate root. It was previously reachable only
+  as `armature_h1::server::CloseH2`, unlike the `H2Fallback` trait it
+  implements; `CloseUpgrade` is exported the same way.
 
 ### Changed
 
 - **Breaking**: `Request` has a new public field, `peer`, so a struct-literal
   construction outside this crate needs it. `Request` is normally received
   from the crate rather than built.
+- **Breaking**: `Upgraded` has a new public field, `peer`, carrying the same
+  address to an upgrade consumer. A consumer owns the connection for the rest
+  of its life and has no `Request` left to read the address off, so without
+  this the address a WebSocket session is attributed to would again be one the
+  client chose. `Upgraded` has all-public fields and is not
+  `#[non_exhaustive]`, so this breaks struct-literal construction and
+  exhaustive destructuring — and unlike `Request`, an `Upgraded` genuinely is
+  built by hand outside this crate, by any test harness driving an
+  `UpgradeConsumer`.
 - **Breaking**: `serve_connection` takes a sixth argument, `peer:
   Option<SocketAddr>`. Pass `None` for a transport with no address to report;
   it is not a "trusted source" signal, it means unknown.
@@ -48,8 +56,11 @@ and this crate adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.h
   peer's *first post-upgrade frames* — handing body bytes over under that
   contract is the smuggling shape aimed at the upgrade consumer instead of at
   the parser. A handler upgrading a request that carried a body must now drain
-  it; previously such a connection was handed off. Native backend only; see
-  `BACKENDS.md`.
+  it; previously such a connection was handed off. This applies on **both**
+  backends. (The separate, older rule that a *retained* — still-live — body
+  forfeits the handoff remains native-only, because hyper's request body is a
+  channel endpoint rather than a borrow of the socket, so there is no live
+  handle to detect; see `BACKENDS.md`.)
 
 ### Fixed
 

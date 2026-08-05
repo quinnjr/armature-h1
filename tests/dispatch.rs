@@ -340,9 +340,14 @@ fn an_upgraded_connection_reaches_the_upgrade_consumer_with_its_bytes() {
     let up = RawUpgrade::default();
     let seen = up.seen.clone();
 
-    let reply = with_server_upgrades(test_config(), rec, up, |addr| {
+    let peers = up.peers.clone();
+
+    let (reply, local) = with_server_upgrades(test_config(), rec, up, |addr| {
         Box::pin(async move {
             let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+            // The client's own local address is, from the server's side, the
+            // peer address, so the exact expected value is known here.
+            let local = s.local_addr().unwrap();
             // The first post-upgrade frame is pipelined into the same write, so
             // it lands in the connection's read buffer before the handoff —
             // which is exactly the data `Upgraded::buffered` exists to carry.
@@ -353,7 +358,7 @@ fn an_upgraded_connection_reaches_the_upgrade_consumer_with_its_bytes() {
             .unwrap();
             let mut out = Vec::new();
             let _ = tokio::time::timeout(Duration::from_secs(2), s.read_to_end(&mut out)).await;
-            String::from_utf8_lossy(&out).into_owned()
+            (String::from_utf8_lossy(&out).into_owned(), local)
         })
     });
 
@@ -372,6 +377,15 @@ fn an_upgraded_connection_reaches_the_upgrade_consumer_with_its_bytes() {
         seen[0], b"FIRSTFRAME",
         "bytes read past the upgrade request's head cannot be re-read from the \
          socket, so they must arrive in `buffered` intact"
+    );
+    let peers = peers.lock().unwrap();
+    assert_eq!(
+        peers[0],
+        Some(local),
+        "the address is read off the connection just before `into_parts` \
+         consumes it, and the consumer holds the socket for the whole session \
+         with no `Request` left to ask; losing it here means every upgraded \
+         connection is served with an unknown client"
     );
 }
 

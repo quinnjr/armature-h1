@@ -11,7 +11,7 @@
 use armature_h1::{ConnConfig, Connection, DateCache, Limits, Request, Response};
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::{Cell, RefCell};
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::rc::Rc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -84,6 +84,33 @@ fn disarm() -> u64 {
 }
 
 async fn hello(_req: Request) -> Response {
+    Response::text("hi")
+}
+
+/// The address the peer case populates, and the one its handler insists on.
+///
+/// `const` so the handler can stay a plain `fn` — the measurement harness wants
+/// a `Copy + 'static` service, and a bare function item is both without pulling
+/// anything into a closure.
+const MEASURED_PEER: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7)), 54321);
+
+/// As [`hello`], but reads `req.peer` inside the measured window.
+///
+/// The point is that the peer case must *depend* on the field. With `hello` the
+/// handler never touches it, so the case measures the peerless path under
+/// another name and would keep reporting zero if `with_peer` stopped
+/// propagating entirely.
+///
+/// The comparison is allocation-free — two `SocketAddr`s compared by value —
+/// and `assert_eq!` formats nothing unless it fails, so nothing here can move
+/// the count off zero on the success path.
+async fn hello_with_peer(req: Request) -> Response {
+    assert_eq!(
+        req.peer,
+        Some(MEASURED_PEER),
+        "the connection was built with a peer address and the handler must see \
+         it; a zero-allocation result means nothing if the field never arrived"
+    );
     Response::text("hi")
 }
 
@@ -275,11 +302,16 @@ fn steady_state_keepalive_get_stays_within_budget() {
 /// `SocketAddr` is `Copy` and rides inline in the `Request`, so filling it in
 /// must not move the count off zero. The day someone reaches for an
 /// `Rc<String>` or a formatted address, this is the row that fails.
+///
+/// The service is [`hello_with_peer`], not `hello`: the field has to be read
+/// inside the measured window, or a `with_peer` that quietly stopped
+/// propagating would still report zero and this row would go on passing as a
+/// second copy of the peerless case.
 #[test]
 fn steady_state_keepalive_get_with_peer_stays_within_budget() {
     let n = 100;
-    let peer: SocketAddr = "203.0.113.7:54321".parse().expect("addr");
-    let allocs = steady_state_allocs_with_peer(KEEPALIVE_GET, hello, 50, n, Some(peer));
+    let allocs =
+        steady_state_allocs_with_peer(KEEPALIVE_GET, hello_with_peer, 50, n, Some(MEASURED_PEER));
     let per_request = allocs as f64 / n as f64;
     println!(
         "keep-alive GET with peer: {allocs} allocations over {n} requests ({per_request:.2}/request)"

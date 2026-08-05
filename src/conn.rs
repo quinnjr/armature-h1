@@ -265,6 +265,39 @@ where
     /// is `None` at most call sites is noise. Without this the requests this
     /// connection serves carry [`Request::peer`](crate::Request::peer) of
     /// `None`, which downstream code must read as "unknown", not "local".
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use armature_h1::{ConnConfig, Connection, DateCache, Request, Response};
+    /// use std::cell::RefCell;
+    /// use std::rc::Rc;
+    ///
+    /// async fn handler(_req: Request) -> Response {
+    ///     Response::text("hi")
+    /// }
+    ///
+    /// let rt = tokio::runtime::Builder::new_current_thread()
+    ///     .enable_all()
+    ///     .build()
+    ///     .unwrap();
+    /// // A connection allocates a reusable timer up front, so it has to be
+    /// // built inside a runtime context — in the real server that is the
+    /// // worker's own runtime, here it is entered explicitly.
+    /// let _guard = rt.enter();
+    ///
+    /// let (_client, server) = tokio::io::duplex(8 * 1024);
+    /// let conn = Connection::new(
+    ///     server,
+    ///     handler,
+    ///     Rc::new(ConnConfig::default()),
+    ///     Rc::new(RefCell::new(DateCache::new())),
+    /// )
+    /// .with_peer(Some("203.0.113.7:54321".parse().unwrap()));
+    ///
+    /// // Every request `conn.serve()` now dispatches carries that address in
+    /// // `Request::peer`; without the builder it would carry `None`.
+    /// ```
     #[must_use]
     pub fn with_peer(mut self, peer: Option<SocketAddr>) -> Self {
         self.peer = peer;
@@ -283,12 +316,17 @@ where
     /// [`serve_with_fallback`](crate::Server::serve_with_fallback) default to
     /// [`CloseUpgrade`](crate::CloseUpgrade), which closes.
     ///
-    /// A handler that retains the request [`Body`] past its response forfeits
-    /// the handoff: the body holds a handle on the same transport, and two
-    /// readers on one socket is not a state this crate will produce. The
-    /// response is written as usual and then the connection closes —
-    /// `Ok(None)` — so an upgrading handler must drop the request body before
-    /// answering 101.
+    /// Two things forfeit the handoff, and both end the connection with
+    /// `Ok(None)` after the response is written as usual. A handler that
+    /// *retains* the request [`Body`] past its response forfeits it, because
+    /// the body holds a handle on the same transport and two readers on one
+    /// socket is not a state this crate will produce. A handler that drops the
+    /// body *unread* forfeits it too, because the bytes it never read are
+    /// still on the wire and would reach the consumer as `Upgraded::buffered`
+    /// — which is documented as the peer's first post-upgrade frames.
+    ///
+    /// So an upgrading handler must read the body to its end and then drop it
+    /// before answering 101. Dropping it unread is not enough.
     pub async fn serve(mut self) -> io::Result<Option<Upgraded>> {
         loop {
             // Wait for the next request to begin. An idle keep-alive connection

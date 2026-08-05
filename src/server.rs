@@ -23,6 +23,12 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 use tokio::net::TcpListener;
 use tokio::sync::watch;
 
+/// How long a worker stands down after `accept` returns an error.
+///
+/// See the accept arm of `worker_loop` for why standing down at all is the
+/// point.
+const ACCEPT_BACKOFF: Duration = Duration::from_millis(10);
+
 /// Socket-level tuning.
 #[derive(Clone, Debug)]
 pub struct TcpConfig {
@@ -282,21 +288,70 @@ impl Server {
     /// the WebSocket handoff. It runs once per worker with the same `Send`
     /// factory / non-`Send` product asymmetry as `make` and `make_fallback`.
     ///
-    /// On the default (native) backend a handler that retains the request
-    /// [`Body`](crate::service::Body) past its response, or that never reads it
-    /// to its end, forfeits the handoff and the connection closes instead: a
-    /// live body holds a second handle on the transport, and an unread one
-    /// leaves body bytes on the wire that the consumer would read as the peer's
-    /// first post-upgrade frames. Neither is a state this crate will produce.
+    /// A handler that never reads the request body to its end forfeits the
+    /// handoff and the connection closes instead, on **both** backends: the
+    /// unread bytes are still on the wire, and the consumer would read them as
+    /// the peer's first post-upgrade frames.
+    ///
+    /// A handler that *retains* a still-live [`Body`](crate::service::Body)
+    /// past its response forfeits it too, but only on the default (native)
+    /// backend, where the body holds a second handle on the transport and two
+    /// readers on one socket is not a state this crate will produce. Under
+    /// `hyper-backend` the body is a channel endpoint rather than a borrow of
+    /// the socket, so there is no live handle to detect and the upgrade
+    /// proceeds; `BACKENDS.md` records that divergence, and this crate's
+    /// rendered documentation is built with that feature enabled. Drain the
+    /// body and drop it before answering 101 and neither rule can bite.
     /// See [`Connection::serve`](crate::conn::Connection::serve).
     ///
-    /// That check is native-only, and this crate's rendered documentation is
-    /// built with `hyper-backend` enabled, so it describes something the
-    /// documented build does not do: hyper's request body is a channel endpoint
-    /// rather than a borrow of the socket, so there is no live handle to detect
-    /// and the upgrade proceeds. `BACKENDS.md` records that divergence in full;
-    /// a handler that upgrades should drop and drain its body regardless, since
-    /// only one of the two backends will catch it.
+    /// # Examples
+    ///
+    /// The shape to copy is the three factories: each is a `Fn` that is `Send`
+    /// and `Clone` because it is handed to every worker thread, while what it
+    /// returns stays on one worker and need not be either.
+    ///
+    /// ```no_run
+    /// use armature_h1::{CloseH2, Config, HeaderId, Request, Response, Server};
+    /// use armature_h1::{UpgradeConsumer, Upgraded};
+    /// use bytes::Bytes;
+    /// use std::future::Future;
+    /// use std::pin::Pin;
+    /// use std::rc::Rc;
+    /// use tokio::io::AsyncWriteExt;
+    ///
+    /// async fn handler(req: Request) -> Response {
+    ///     // Drop the body before answering 101, or the handoff is forfeited.
+    ///     drop(req.body);
+    ///     Response::new(101)
+    ///         .header(HeaderId::Connection, Bytes::from_static(b"upgrade"))
+    ///         .header(HeaderId::Upgrade, Bytes::from_static(b"raw"))
+    /// }
+    ///
+    /// /// Non-`Send` on purpose: an upgrade consumer never leaves its worker.
+    /// struct Sessions {
+    ///     count: Rc<std::cell::Cell<u64>>,
+    /// }
+    ///
+    /// impl UpgradeConsumer for Sessions {
+    ///     fn handle(&self, upgraded: Upgraded) -> Pin<Box<dyn Future<Output = ()>>> {
+    ///         self.count.set(self.count.get() + 1);
+    ///         Box::pin(async move {
+    ///             let Upgraded { mut io, buffered, peer: _ } = upgraded;
+    ///             // `buffered` before `io`, always: see `UpgradeConsumer`.
+    ///             let _ = io.write_all(&buffered).await;
+    ///         })
+    ///     }
+    /// }
+    ///
+    /// let server = Server::bind(Config::new("127.0.0.1:8080".parse().unwrap()))?;
+    /// // Blocks until `server.handle().shutdown()` is called.
+    /// server.serve_with(
+    ///     || handler,
+    ///     || CloseH2,
+    ///     || Sessions { count: Rc::new(std::cell::Cell::new(0)) },
+    /// )?;
+    /// # Ok::<(), std::io::Error>(())
+    /// ```
     pub fn serve_with<F, S, G, H, U, C>(
         self,
         make: F,
@@ -360,31 +415,48 @@ impl Server {
                 continue;
             };
 
-            handles.push(
-                std::thread::Builder::new()
-                    .name(format!("h1-{worker}"))
-                    .spawn(move || {
-                        if let Some(core) = core {
-                            // Best effort: a container may forbid it, and failing
-                            // to pin costs locality, not correctness.
-                            core_affinity::set_for_current(core);
-                        }
-                        let Ok(rt) = tokio::runtime::Builder::new_current_thread()
-                            .enable_all()
-                            .build()
-                        else {
-                            return;
-                        };
-                        rt.block_on(worker_loop(
-                            std_listener,
-                            make,
-                            make_fallback,
-                            make_upgrade,
-                            cfg,
-                            rx,
-                        ));
-                    })?,
-            );
+            let spawned = std::thread::Builder::new()
+                .name(format!("h1-{worker}"))
+                .spawn(move || {
+                    if let Some(core) = core {
+                        // Best effort: a container may forbid it, and failing
+                        // to pin costs locality, not correctness.
+                        core_affinity::set_for_current(core);
+                    }
+                    let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                    else {
+                        return;
+                    };
+                    rt.block_on(worker_loop(
+                        std_listener,
+                        make,
+                        make_fallback,
+                        make_upgrade,
+                        cfg,
+                        rx,
+                    ));
+                });
+
+            match spawned {
+                Ok(h) => handles.push(h),
+                Err(e) => {
+                    // The workers spawned before this one are already accepting
+                    // on the bound port. Returning the error on its own would
+                    // leave them there — invisible, unjoinable, and holding the
+                    // port — so a caller that logs the failure and retries
+                    // `bind` would end up with two generations of workers
+                    // serving one address. Stop them and wait for them out
+                    // before admitting the failure.
+                    tracing::error!(error = %e, worker, "failed to spawn a worker; stopping the ones already started");
+                    let _ = tx.send_replace(true);
+                    for h in handles {
+                        let _ = h.join();
+                    }
+                    return Err(e);
+                }
+            }
         }
 
         for h in handles {
@@ -429,10 +501,14 @@ async fn worker_loop<F, S, G, H, U, C>(
         tick: cfg.tick,
         server_name: cfg.server_name.clone(),
     });
-    let date = Rc::new(RefCell::new(DateCache::new()));
-    let service = Rc::new(make());
-    let fallback = Rc::new(make_fallback());
-    let upgrades = Rc::new(make_upgrade());
+    let ctx = Rc::new(WorkerCtx {
+        service: Rc::new(make()),
+        fallback: Rc::new(make_fallback()),
+        upgrades: Rc::new(make_upgrade()),
+        conn_cfg,
+        date: Rc::new(RefCell::new(DateCache::new())),
+        cfg: cfg.clone(),
+    });
 
     let local = tokio::task::LocalSet::new();
 
@@ -460,19 +536,34 @@ async fn worker_loop<F, S, G, H, U, C>(
                         }
                     }
                     accepted = listener.accept() => {
-                        let Ok((stream, peer)) = accepted else { continue };
+                        let (stream, peer) = match accepted {
+                            Ok(pair) => pair,
+                            Err(e) => {
+                                // Not a `continue`. A failed `accept` — the fd
+                                // table full, `EMFILE`/`ENFILE` — leaves the
+                                // listener readable, so re-polling it straight
+                                // away yields the same error at whatever rate
+                                // this core can manage. Thread-per-core means
+                                // one such loop per core, and they would starve
+                                // the `LocalSet` tasks serving the connections
+                                // already accepted on the same current-thread
+                                // runtime: a leaked-fd burst would take the box
+                                // down rather than merely refuse new work. The
+                                // pause is short enough that transient failures
+                                // cost nothing measurable and long enough that
+                                // a persistent one leaves the core to its real
+                                // job.
+                                tracing::warn!(error = %e, "accept failed; pausing before the next attempt");
+                                tokio::time::sleep(ACCEPT_BACKOFF).await;
+                                continue;
+                            }
+                        };
                         if cfg.tcp.nodelay {
                             let _ = stream.set_nodelay(true);
                         }
-                        let conn_cfg = conn_cfg.clone();
-                        let date = date.clone();
-                        let service = service.clone();
-                        let fallback = fallback.clone();
-                        let upgrades = upgrades.clone();
-                        let cfg = cfg.clone();
+                        let ctx = ctx.clone();
                         tokio::task::spawn_local(async move {
-                            dispatch(stream, service, fallback, upgrades, conn_cfg, date, cfg, peer)
-                                .await;
+                            dispatch(stream, ctx, peer).await;
                         });
                     }
                 }
@@ -484,19 +575,30 @@ async fn worker_loop<F, S, G, H, U, C>(
     let _ = tokio::time::timeout(cfg.shutdown_grace, local).await;
 }
 
-/// Decide what protocol a connection speaks, then serve or hand it off.
+/// Everything one worker holds for the lifetime of the thread.
 ///
-/// With TLS off and h2c detection off — the default — this reduces to serving
-/// HTTP/1 directly, with no extra read on the fast path.
-#[allow(clippy::too_many_arguments)]
-async fn dispatch<S, H, C>(
-    stream: tokio::net::TcpStream,
+/// These six were once six arguments to `dispatch`, cloned one by one on every
+/// accept. None of them varies per connection — they are the worker, not the
+/// connection — so they live behind a single `Rc` and an accept costs one
+/// refcount bump and one pointer move rather than six of each. The inner `Rc`s
+/// stay because [`crate::backend::serve_connection`] is public and takes them
+/// individually.
+struct WorkerCtx<S, H, C> {
     service: Rc<S>,
     fallback: Rc<H>,
     upgrades: Rc<C>,
     conn_cfg: Rc<ConnConfig>,
     date: Rc<RefCell<DateCache>>,
     cfg: Rc<Config>,
+}
+
+/// Decide what protocol a connection speaks, then serve or hand it off.
+///
+/// With TLS off and h2c detection off — the default — this reduces to serving
+/// HTTP/1 directly, with no extra read on the fast path.
+async fn dispatch<S, H, C>(
+    stream: tokio::net::TcpStream,
+    ctx: Rc<WorkerCtx<S, H, C>>,
     peer: SocketAddr,
 ) where
     S: H1Service + 'static,
@@ -504,62 +606,53 @@ async fn dispatch<S, H, C>(
     C: UpgradeConsumer + 'static,
 {
     #[cfg(feature = "tls")]
-    if let Some(tls) = cfg.tls.clone() {
+    if let Some(tls) = ctx.cfg.tls.clone() {
         let acceptor = tokio_rustls::TlsAcceptor::from(tls);
-        let Ok(tls_stream) = acceptor.accept(stream).await else {
-            // A failed handshake is not a protocol error we can report over
-            // HTTP; the peer gets a TLS alert from rustls and the socket closes.
+        // The handshake is deadlined by the same limit that governs the request
+        // head, because until it completes there is no `TlsStream` for the
+        // connection's own timeouts to be armed against. Without this, a peer
+        // that connects and then says nothing — or stops halfway through a
+        // ClientHello — holds a task and an fd for as long as it likes, and
+        // under `SO_REUSEPORT` it can aim every such socket at one worker.
+        let handshake =
+            tokio::time::timeout(ctx.cfg.limits.header_timeout, acceptor.accept(stream));
+        let Ok(Ok(tls_stream)) = handshake.await else {
+            // Neither a failed handshake nor an expired one is a protocol error
+            // we can report over HTTP; the peer gets a TLS alert from rustls, or
+            // nothing at all, and the socket closes.
             return;
         };
         let is_h2 = crate::tls::negotiated_h2(tls_stream.get_ref().1);
         if is_h2 {
             // Nothing has been read past the handshake, so there is no buffered
             // application data to forward.
-            fallback
+            ctx.fallback
                 .handle(Box::new(tls_stream), Bytes::new(), Some(peer))
                 .await;
         } else {
-            serve_h1(
-                tls_stream,
-                service,
-                upgrades,
-                conn_cfg,
-                date,
-                Bytes::new(),
-                peer,
-            )
-            .await;
+            serve_h1(tls_stream, &ctx, Bytes::new(), peer).await;
         }
         return;
     }
 
-    if cfg.detect_h2c {
-        match peek_preface(stream, &cfg).await {
+    if ctx.cfg.detect_h2c {
+        match peek_preface(stream, &ctx.cfg).await {
             Some((stream, buffered, Preface::Http2)) => {
                 // The preface is part of the HTTP/2 stream and cannot be re-read
                 // from the socket, so it must travel with the connection.
-                fallback
+                ctx.fallback
                     .handle(Box::new(stream), buffered, Some(peer))
                     .await;
             }
             Some((stream, buffered, _)) => {
-                serve_h1(stream, service, upgrades, conn_cfg, date, buffered, peer).await;
+                serve_h1(stream, &ctx, buffered, peer).await;
             }
             None => {}
         }
         return;
     }
 
-    serve_h1(
-        stream,
-        service,
-        upgrades,
-        conn_cfg,
-        date,
-        Bytes::new(),
-        peer,
-    )
-    .await;
+    serve_h1(stream, &ctx, Bytes::new(), peer).await;
 }
 
 /// Read just enough to classify a plaintext connection.
@@ -591,15 +684,8 @@ async fn peek_preface(
 }
 
 /// Serve one HTTP/1 connection to completion.
-async fn serve_h1<IO, S, C>(
-    io: IO,
-    service: Rc<S>,
-    upgrades: Rc<C>,
-    conn_cfg: Rc<ConnConfig>,
-    date: Rc<RefCell<DateCache>>,
-    buffered: Bytes,
-    peer: SocketAddr,
-) where
+async fn serve_h1<IO, S, H, C>(io: IO, ctx: &WorkerCtx<S, H, C>, buffered: Bytes, peer: SocketAddr)
+where
     IO: AsyncRead + AsyncWrite + Unpin + 'static,
     S: H1Service + 'static,
     C: UpgradeConsumer + 'static,
@@ -609,10 +695,17 @@ async fn serve_h1<IO, S, C>(
     //
     // An upgraded transport goes to the connection consumer, which is
     // `CloseUpgrade` unless the caller plugged one in via `serve_with`.
-    if let Ok(Some(upgraded)) =
-        crate::backend::serve_connection(io, service, conn_cfg, date, buffered, Some(peer)).await
+    if let Ok(Some(upgraded)) = crate::backend::serve_connection(
+        io,
+        ctx.service.clone(),
+        ctx.conn_cfg.clone(),
+        ctx.date.clone(),
+        buffered,
+        Some(peer),
+    )
+    .await
     {
-        upgrades.handle(upgraded).await;
+        ctx.upgrades.handle(upgraded).await;
     }
 }
 
@@ -880,15 +973,15 @@ mod tests {
         );
     }
 
-    /// Every worker must observe a shutdown, not just the ones that happened to
-    /// subscribe before it landed.
+    /// A shutdown signalled after the server has been serving traffic must stop
+    /// every worker, not merely the one the last request landed on.
     ///
-    /// With the subscription taken inside the spawn loop, a signal arriving
-    /// midway stopped the workers already subscribed and left the rest
-    /// accepting, so `serve` blocked in `join` while `is_shutting_down()`
-    /// reported true.
+    /// This is the easy half of the property: by the time eight requests have
+    /// been answered, every worker has long since subscribed, so no receiver
+    /// can miss the transition. The startup race is the hard half and has its
+    /// own test below.
     #[test]
-    fn shutdown_stops_every_worker() {
+    fn shutdown_after_serving_traffic_stops_every_worker() {
         let server = Server::bind(test_config(4)).expect("bind");
         let addr = server.local_addr();
         let handle = server.handle();
@@ -899,11 +992,21 @@ mod tests {
                 .build()
                 .unwrap();
             // Enough requests that every worker has almost certainly accepted
-            // at least one, so none is merely idle when the signal lands.
+            // at least one, so none is merely idle when the signal lands. Each
+            // response is checked: a discarded result would let eight refused
+            // connections stand in for eight served requests, and the premise
+            // that the workers were busy would be asserted nowhere.
+            let mut served = 0;
             for _ in 0..8 {
-                let _ = rt.block_on(request(addr, GET));
+                if rt
+                    .block_on(request(addr, GET))
+                    .is_ok_and(|r| r.starts_with("HTTP/1.1 200 OK"))
+                {
+                    served += 1;
+                }
             }
             handle.shutdown();
+            served
         });
 
         let (tx, rx) = std::sync::mpsc::channel();
@@ -911,12 +1014,77 @@ mod tests {
             server.serve(|| hello).expect("serve");
             let _ = tx.send(());
         });
-        client.join().expect("client thread");
+        let served = client.join().expect("client thread");
+        assert_eq!(
+            served, 8,
+            "every request before the signal must have been answered, or the \
+             workers were never busy and the shutdown proves nothing"
+        );
         assert!(
             rx.recv_timeout(Duration::from_secs(10)).is_ok(),
             "serve must return once every worker has stopped; a worker that \
              missed the signal keeps accepting and join blocks forever"
         );
+    }
+
+    /// Every worker must observe a shutdown, not just the ones that happened to
+    /// subscribe before it landed.
+    ///
+    /// With the subscription taken inside the spawn loop, a signal arriving
+    /// midway stopped the workers already subscribed and left the rest
+    /// accepting, so `serve` blocked in `join` while `is_shutting_down()`
+    /// reported true. Sampling that window means signalling *while* `serve` is
+    /// still spawning threads — a shutdown sent after the server is up cannot
+    /// reach it, because by then every receiver exists and every one of them
+    /// sees the transition.
+    ///
+    /// The window is a few hundred microseconds wide and cannot be observed
+    /// from outside, so this is a race and is treated as one: eight workers to
+    /// widen it, a delay swept across the range rather than one guessed value,
+    /// and the whole thing repeated. A single pass that happened to signal too
+    /// late would prove nothing and say nothing about it.
+    ///
+    /// The failure mode is a hang, not a wrong answer, so every pass is bounded
+    /// by a watchdog on the channel `serve` reports through.
+    #[test]
+    fn shutdown_during_worker_startup_stops_every_worker() {
+        for attempt in 0..20u64 {
+            let server = Server::bind(test_config(8)).expect("bind");
+            let handle = server.handle();
+
+            // Swept from "before `serve` was even called" up past the far end
+            // of the spawn loop, so the interesting middle is covered whatever
+            // this machine's thread-spawn cost turns out to be. A single fixed
+            // sleep would be tuned to one machine and silently stop sampling
+            // anything on another.
+            let delay = Duration::from_micros(attempt * 75);
+            let signal = std::thread::spawn(move || {
+                if !delay.is_zero() {
+                    std::thread::sleep(delay);
+                }
+                handle.shutdown();
+            });
+
+            let (tx, rx) = std::sync::mpsc::channel();
+            let serving = std::thread::spawn(move || {
+                server.serve(|| hello).expect("serve");
+                let _ = tx.send(());
+            });
+
+            // Generous rather than tight: the assertion is that `serve` returns
+            // at all. A bound close to the real duration would turn a loaded CI
+            // box into a failure, which is the one thing a race test must not
+            // do.
+            assert!(
+                rx.recv_timeout(Duration::from_secs(10)).is_ok(),
+                "attempt {attempt} (signal after {delay:?}): serve must return \
+                 once every worker has stopped. A worker whose receiver was \
+                 created after the signal never sees a transition, so it \
+                 accepts forever and join blocks on it"
+            );
+            signal.join().expect("signal thread");
+            serving.join().expect("serve thread");
+        }
     }
 
     #[test]
