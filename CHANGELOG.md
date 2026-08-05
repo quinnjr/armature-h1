@@ -23,6 +23,33 @@ and this crate adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.h
   silently dropped; driving `Connection` directly was the only way to get the
   socket. `serve` and `serve_with_fallback` still close, via `CloseUpgrade`.
 - `Connection::with_peer`, for a caller driving `Connection` itself.
+- A worker-liveness check at startup. Each worker announces itself the moment
+  its listener is registered, and `Server::serve_with` refuses to start unless
+  every spawned worker has done so within five seconds — it signals shutdown,
+  joins, and returns an `io::Error` naming how many of how many made it.
+  Previously a worker that died between the spawn and its first accept did so
+  in silence, and the join loop could not tell "never started" from "started
+  and then stopped": twelve of sixteen workers could die at startup while
+  `serve` blocked on the survivors forever, having logged the full worker count
+  and nothing since.
+- Diagnostics on three paths that previously produced no line at any level:
+  - Worker startup. A runtime that will not build and a listener that will not
+    register are each an `error!` naming the worker index, where both were bare
+    `return`s. A worker thread that ends in a panic is counted and reported
+    rather than discarded by `let _ = h.join()`, and `serve_with` now returns
+    an `io::Error` when any did — returning `Ok` is what a supervisor reads as
+    an intentional shutdown.
+  - TLS handshakes. A handshake error and a handshake timeout were folded into
+    one silent `return`, so an operator with a misordered certificate chain saw
+    nothing anywhere. Both are now `debug!`, the timeout naming the limit it
+    hit. `debug!` rather than `warn!` because any scanner can produce them at
+    will.
+  - Connection outcomes. `Server` discarded the `Err` arm of
+    `serve_connection` entirely, so a write failure, a framing desync and a
+    write timeout were indistinguishable from a client hanging up politely.
+    Anything that is not `UnexpectedEof`/`ConnectionReset`/`BrokenPipe` is now
+    a `debug!` naming the peer and the error, with `TimedOut` getting its own
+    line as the diagnosis for a stalled reader.
 - `CloseH2` is re-exported at the crate root. It was previously reachable only
   as `armature_h1::server::CloseH2`, unlike the `H2Fallback` trait it
   implements; `CloseUpgrade` is exported the same way.
@@ -76,6 +103,30 @@ and this crate adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.h
   iteration rather than trusting `changed()` alone, and the subscription is
   taken once before the spawn loop so no worker can start after the signal
   without seeing it.
+- A worker no longer spins a core when `accept` fails persistently. A failed
+  `accept` leaves the listener readable, so re-polling it immediately returns
+  the same error at whatever rate the core can manage — under thread-per-core,
+  one such loop per core, starving the connections already being served on the
+  same current-thread runtime. A resource failure (`EMFILE`/`ENFILE` and the
+  like) now costs a 10 ms stand-down instead, raced against the shutdown signal
+  so the pause can never become shutdown latency. *Transient per-connection*
+  errors — `ECONNABORTED`, `ECONNRESET`, `EINTR`, `ETIMEDOUT`, and `EPROTO`
+  where the platform's value is known — are retried immediately and logged at
+  `debug!`: they mean the client went away between the SYN-ACK and the
+  `accept`, and pausing for them would let one peer looping connect-then-RST at
+  line rate cap a worker at roughly a hundred accepts per second against a
+  ceiling in the tens of thousands. An unrecognized error still backs off.
+- A failure to spawn a worker no longer leaves the workers already spawned
+  running and unreachable. `serve_with` returned the error on its own, orphaning
+  every earlier worker on the bound port — so a caller that logged the failure
+  and retried `bind` ended up with two generations of workers serving one
+  address. It now signals shutdown and blocks on the teardown of everything it
+  started before returning the error.
+- A TLS handshake is deadlined by `Limits::header_timeout`. Until it completes
+  there is no `TlsStream` for the connection's own timeouts to be armed
+  against, so a peer that connected and then said nothing — or stopped halfway
+  through a ClientHello — held a task and an fd indefinitely, and under
+  `SO_REUSEPORT` could aim every such socket at one worker.
 
 ## [0.2.0] - 2026-08-04
 

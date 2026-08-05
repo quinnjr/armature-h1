@@ -185,6 +185,77 @@ fn tls_alpn_h2_reaches_the_fallback() {
     );
 }
 
+/// A peer that starts a handshake and then says nothing must be hung up on.
+///
+/// Until the handshake completes there is no `TlsStream`, so none of the
+/// connection's own deadlines — `header_timeout` on the request head,
+/// `idle_timeout` between requests — is armed against anything: they all live
+/// on the far side of `acceptor.accept`. The handshake is therefore deadlined
+/// by `header_timeout` explicitly, and that `timeout` wrapper is a single line
+/// with nothing else depending on it. Remove it and a peer that connects, sends
+/// four bytes and waits holds a task and a file descriptor for as long as it
+/// likes — and under `SO_REUSEPORT` it can aim every such socket at one worker,
+/// which is a whole core's worth of connections held by a client that has sent
+/// no request at all.
+///
+/// `test_config` already sets a 300 ms `header_timeout`, so the bound below is
+/// generous by nearly an order of magnitude: it fails on "never", not on "slow".
+#[test]
+fn a_stalled_tls_handshake_is_dropped_rather_than_held() {
+    let cert = self_signed();
+    let server_tls = armature_h1::tls::TlsConfig::new(vec![cert.der.clone()], cert.key.clone())
+        .server_config()
+        .expect("server config");
+    let rec = Recorder::default();
+    let seen = rec.seen.clone();
+
+    let (hung_up, elapsed) = with_server(test_config().with_tls(server_tls), rec, move |addr| {
+        Box::pin(async move {
+            let mut s = tokio::net::TcpStream::connect(addr).await.expect("connect");
+            // A TLS record header announcing a 512-byte handshake message,
+            // followed by nine bytes of one. Well-formed as far as it goes and
+            // deliberately incomplete: rustls cannot decide anything until the
+            // rest arrives, which is the point — a malformed hello would be
+            // rejected on its contents and would prove nothing about the
+            // deadline.
+            s.write_all(&[
+                0x16, 0x03, 0x01, 0x02, 0x00, // record: handshake, TLS 1.0, 512 bytes
+                0x01, 0x00, 0x01, 0xfc, // ClientHello, 508 bytes to follow
+                0x03, 0x03, 0x00, 0x00, 0x00, // …of which these are five
+            ])
+            .await
+            .expect("write a truncated ClientHello");
+            s.flush().await.expect("flush");
+
+            // …and then nothing. Never another byte, never a close.
+            let started = std::time::Instant::now();
+            let mut out = Vec::new();
+            let hung_up = tokio::time::timeout(Duration::from_secs(2), s.read_to_end(&mut out))
+                .await
+                .is_ok();
+            (hung_up, started.elapsed())
+        })
+    });
+
+    assert!(
+        hung_up,
+        "the server still had the connection 2s after a handshake that stalled \
+         on its first record, with a 300ms handshake deadline configured — so \
+         the deadline is not being applied and a peer can hold a worker's fd \
+         and task indefinitely by connecting and going quiet"
+    );
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "the close must come from the deadline, not from the test's own \
+         patience running out: {elapsed:?}"
+    );
+    assert!(
+        seen.lock().expect("lock").is_empty(),
+        "a connection that never finished its handshake negotiated no ALPN, so \
+         it must not be handed to the h2 fallback"
+    );
+}
+
 /// A client offering both must get `h2`, since the fallback exists to serve it.
 #[test]
 fn tls_alpn_prefers_h2_when_the_client_offers_both() {

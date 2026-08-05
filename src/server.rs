@@ -18,16 +18,78 @@ use std::net::SocketAddr;
 use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 use tokio::net::TcpListener;
 use tokio::sync::watch;
 
-/// How long a worker stands down after `accept` returns an error.
+/// How long a worker stands down after `accept` returns a *resource* error.
 ///
-/// See the accept arm of `worker_loop` for why standing down at all is the
-/// point.
+/// See [`accept_backoff_warranted`] for which errors those are, and the accept
+/// arm of `worker_loop` for why standing down at all is the point. The pause is
+/// raced against the shutdown signal, so its length is not shutdown latency —
+/// but it is still deliberately short, because it is time this core spends
+/// listening to nobody.
 const ACCEPT_BACKOFF: Duration = Duration::from_millis(10);
+
+/// How long [`Server::serve_with`] waits for every spawned worker to reach its
+/// accept loop before calling the startup failed.
+///
+/// Reaching it takes a thread spawn and a runtime build — microseconds in the
+/// ordinary case — so this is sized for a badly oversubscribed machine rather
+/// than for the expected cost. Nothing waits it out on a healthy start: the
+/// check finishes the moment the last worker registers.
+const WORKER_START_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// `EPROTO` on this platform, where its value is known.
+///
+/// `accept` reports it for a connection whose handshake failed underneath us —
+/// per-connection and transient, exactly like `ECONNABORTED`. Rust maps no
+/// distinct [`io::ErrorKind`] to it, so the raw number is the only way to tell
+/// it apart from a listener that has genuinely broken. `None` on a platform
+/// whose value is not spelled out here, which only means such an error is
+/// treated as worth backing off from — the conservative direction.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const EPROTO: Option<i32> = Some(71);
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+const EPROTO: Option<i32> = Some(100);
+#[cfg(target_os = "freebsd")]
+const EPROTO: Option<i32> = Some(92);
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "freebsd"
+)))]
+const EPROTO: Option<i32> = None;
+
+/// Whether an `accept` error is one to stand down after.
+///
+/// The distinction matters more than it looks. A resource error — the fd table
+/// full, the kernel out of buffers — leaves the listener readable, so re-polling
+/// it immediately yields the same error at whatever rate this core can manage,
+/// starving the connections already being served on the same current-thread
+/// runtime. A *per-connection* error does not: the client sent an RST between
+/// the SYN-ACK and the `accept`, or its handshake failed, and the next accept is
+/// as likely to succeed as any other. Pausing for those would let one peer
+/// looping connect-then-RST at line rate cap a worker at one accept per backoff
+/// period — turning a defence against fd exhaustion into a denial-of-service
+/// primitive with a far lower price tag. nginx and libuv make the same split,
+/// and for the same reason.
+///
+/// An unrecognized error backs off, so a listener failure this list has never
+/// seen still gets the pause rather than a spin.
+fn accept_backoff_warranted(e: &io::Error) -> bool {
+    match e.kind() {
+        io::ErrorKind::ConnectionAborted
+        | io::ErrorKind::ConnectionReset
+        | io::ErrorKind::Interrupted
+        | io::ErrorKind::TimedOut => false,
+        _ => !matches!((EPROTO, e.raw_os_error()), (Some(p), Some(r)) if p == r),
+    }
+}
 
 /// Socket-level tuning.
 #[derive(Clone, Debug)]
@@ -319,8 +381,12 @@ impl Server {
     /// use std::rc::Rc;
     /// use tokio::io::AsyncWriteExt;
     ///
-    /// async fn handler(req: Request) -> Response {
-    ///     // Drop the body before answering 101, or the handoff is forfeited.
+    /// async fn handler(mut req: Request) -> Response {
+    ///     // Drain the body, *then* drop it. Dropping it unread forfeits the
+    ///     // handoff: the bytes it never read are still on the wire and would
+    ///     // reach the consumer as `Upgraded::buffered`, which is documented as
+    ///     // the peer's first post-upgrade frames.
+    ///     while let Some(Ok(_)) = req.body.chunk().await {}
     ///     drop(req.body);
     ///     Response::new(101)
     ///         .header(HeaderId::Connection, Bytes::from_static(b"upgrade"))
@@ -403,6 +469,17 @@ impl Server {
         // version from this one, taken before anything can be signalled.
         let base_rx = tx.subscribe();
 
+        // Liveness, not statistics. A worker that dies between the spawn and its
+        // first accept — a runtime that will not build, a listener that will not
+        // register — used to do so silently, and the join loop below cannot tell
+        // "never started" from "started and then stopped". So each worker
+        // announces itself once, the instant its listener is registered, and the
+        // count is checked before this function commits to blocking on the
+        // survivors. Without it, twelve of sixteen workers can die at startup
+        // and the only evidence is a fleet quietly serving at a quarter of the
+        // capacity it logged.
+        let started = Arc::new(AtomicUsize::new(0));
+
         let mut handles = Vec::with_capacity(cfg.workers);
         for (worker, slot) in per_worker.iter_mut().enumerate() {
             let cfg = cfg.clone();
@@ -411,6 +488,7 @@ impl Server {
             let make_upgrade = make_upgrade.clone();
             let rx = base_rx.clone();
             let core = core_ids.get(worker).copied();
+            let started = started.clone();
             let Some(std_listener) = slot.take() else {
                 continue;
             };
@@ -423,11 +501,23 @@ impl Server {
                         // to pin costs locality, not correctness.
                         core_affinity::set_for_current(core);
                     }
-                    let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+                    let rt = match tokio::runtime::Builder::new_current_thread()
                         .enable_all()
                         .build()
-                    else {
-                        return;
+                    {
+                        Ok(rt) => rt,
+                        Err(e) => {
+                            // The thread is about to end without ever having
+                            // accepted anything. Said here because this is the
+                            // only place that knows *why*; the count `started`
+                            // never reaches is what makes it actionable.
+                            tracing::error!(
+                                error = %e,
+                                worker,
+                                "worker could not build its runtime and will not serve"
+                            );
+                            return;
+                        }
                     };
                     rt.block_on(worker_loop(
                         std_listener,
@@ -436,6 +526,10 @@ impl Server {
                         make_upgrade,
                         cfg,
                         rx,
+                        Startup {
+                            worker,
+                            started: &started,
+                        },
                     ));
                 });
 
@@ -451,19 +545,81 @@ impl Server {
                     // before admitting the failure.
                     tracing::error!(error = %e, worker, "failed to spawn a worker; stopping the ones already started");
                     let _ = tx.send_replace(true);
-                    for h in handles {
-                        let _ = h.join();
-                    }
+                    join_all(handles);
                     return Err(e);
                 }
             }
         }
 
-        for h in handles {
-            let _ = h.join();
+        // Every worker that was spawned must reach its accept loop. Checked
+        // here rather than after the join, because the failure this catches is
+        // precisely the one that never reaches a join: the survivors go on
+        // accepting forever, so a post-join check on a half-dead server is a
+        // check that never runs.
+        let expected = handles.len();
+        let deadline = std::time::Instant::now() + WORKER_START_TIMEOUT;
+        while started.load(Ordering::Acquire) < expected {
+            if std::time::Instant::now() >= deadline {
+                let live = started.load(Ordering::Acquire);
+                tracing::error!(
+                    started = live,
+                    expected,
+                    "workers failed to reach their accept loop; stopping the ones that did"
+                );
+                let _ = tx.send_replace(true);
+                join_all(handles);
+                return Err(io::Error::other(format!(
+                    "only {live} of {expected} workers reached their accept loop"
+                )));
+            }
+            // Polled rather than spun: a busy wait would burn the very core a
+            // struggling worker is trying to start on. The loop exits in
+            // microseconds on a healthy start; only a failure waits out the
+            // deadline.
+            std::thread::sleep(Duration::from_millis(1));
+        }
+
+        let panicked = join_all(handles);
+        if panicked > 0 {
+            // A panicked worker took its listener with it, so the server has
+            // been serving on fewer cores than it reported ever since. Returning
+            // it beats logging it and returning `Ok`: `Ok` is what a supervisor
+            // reads as a clean, intentional shutdown.
+            return Err(io::Error::other(format!(
+                "{panicked} worker thread(s) panicked"
+            )));
         }
         Ok(())
     }
+}
+
+/// Join every worker, returning how many ended in a panic.
+///
+/// The count is the whole point: `let _ = h.join()` discards the one signal
+/// there is that a worker died rather than stopped.
+fn join_all(handles: Vec<std::thread::JoinHandle<()>>) -> usize {
+    let mut panicked = 0;
+    for h in handles {
+        if h.join().is_err() {
+            panicked += 1;
+        }
+    }
+    if panicked > 0 {
+        tracing::error!(panicked, "worker thread(s) panicked");
+    }
+    panicked
+}
+
+/// What a worker needs in order to be accounted for at startup.
+///
+/// One parameter rather than two because they are one concern: the index names
+/// which worker a failure log is about, and the counter is how the spawning
+/// thread learns there was no failure.
+struct Startup<'a> {
+    /// This worker's index, matching its thread name.
+    worker: usize,
+    /// Incremented once, when this worker's listener is registered.
+    started: &'a AtomicUsize,
 }
 
 /// One worker's accept loop.
@@ -474,6 +630,7 @@ async fn worker_loop<F, S, G, H, U, C>(
     make_upgrade: U,
     cfg: Config,
     mut rx: watch::Receiver<bool>,
+    startup: Startup<'_>,
 ) where
     F: Fn() -> S,
     S: H1Service + 'static,
@@ -482,10 +639,24 @@ async fn worker_loop<F, S, G, H, U, C>(
     U: Fn() -> C,
     C: UpgradeConsumer + 'static,
 {
+    let Startup { worker, started } = startup;
     std_listener.set_nonblocking(true).ok();
-    let Ok(listener) = TcpListener::from_std(std_listener) else {
-        return;
+    let listener = match TcpListener::from_std(std_listener) {
+        Ok(l) => l,
+        Err(e) => {
+            tracing::error!(
+                error = %e,
+                worker,
+                "worker could not register its listener and will not serve"
+            );
+            return;
+        }
     };
+    // Announced before the shutdown flag is ever read, so a server stopped
+    // before it started still counts every worker as having started — the check
+    // in `serve_with` is about workers that *died*, not about how long they then
+    // went on to live.
+    started.fetch_add(1, Ordering::Release);
 
     // Per-core state: created once here, shared by every connection on this
     // thread, and never touched by another. No atomics, no locks.
@@ -538,8 +709,19 @@ async fn worker_loop<F, S, G, H, U, C>(
                     accepted = listener.accept() => {
                         let (stream, peer) = match accepted {
                             Ok(pair) => pair,
+                            Err(e) if !accept_backoff_warranted(&e) => {
+                                // The connection died, not the listener. Retry
+                                // at once — see `accept_backoff_warranted` for
+                                // why pausing here would be a gift to whoever
+                                // is generating the aborts. `debug!`, and
+                                // deliberately: one `warn!` per RST is itself a
+                                // log-flood vector, and this is a line an
+                                // ordinary busy server emits.
+                                tracing::debug!(error = %e, worker, "accept failed on a connection that went away");
+                                continue;
+                            }
                             Err(e) => {
-                                // Not a `continue`. A failed `accept` — the fd
+                                // Not a `continue`. A resource failure — the fd
                                 // table full, `EMFILE`/`ENFILE` — leaves the
                                 // listener readable, so re-polling it straight
                                 // away yields the same error at whatever rate
@@ -549,12 +731,21 @@ async fn worker_loop<F, S, G, H, U, C>(
                                 // already accepted on the same current-thread
                                 // runtime: a leaked-fd burst would take the box
                                 // down rather than merely refuse new work. The
-                                // pause is short enough that transient failures
-                                // cost nothing measurable and long enough that
+                                // pause is short enough that a brief squeeze
+                                // costs nothing measurable and long enough that
                                 // a persistent one leaves the core to its real
                                 // job.
-                                tracing::warn!(error = %e, "accept failed; pausing before the next attempt");
-                                tokio::time::sleep(ACCEPT_BACKOFF).await;
+                                tracing::warn!(error = %e, worker, "accept failed; pausing before the next attempt");
+                                // Raced against the signal rather than awaited
+                                // bare. At 10 ms the difference is nothing; the
+                                // point is that raising `ACCEPT_BACKOFF` later
+                                // must not silently become shutdown latency,
+                                // multiplied by however many workers are in the
+                                // same state.
+                                tokio::select! {
+                                    _ = tokio::time::sleep(ACCEPT_BACKOFF) => {}
+                                    _ = rx.changed() => {}
+                                }
                                 continue;
                             }
                         };
@@ -579,10 +770,13 @@ async fn worker_loop<F, S, G, H, U, C>(
 ///
 /// These six were once six arguments to `dispatch`, cloned one by one on every
 /// accept. None of them varies per connection — they are the worker, not the
-/// connection — so they live behind a single `Rc` and an accept costs one
-/// refcount bump and one pointer move rather than six of each. The inner `Rc`s
-/// stay because [`crate::backend::serve_connection`] is public and takes them
-/// individually.
+/// connection — so they live behind a single `Rc` and the accept itself now
+/// costs one refcount bump and one pointer move rather than six of each. The
+/// inner `Rc`s stay because [`crate::backend::serve_connection`] is public and
+/// takes them individually: `serve_h1` still clones three of them per
+/// connection, but that is once per connection on a path that is already
+/// setting up buffers, not once per accept in the loop that must keep up with
+/// the listener.
 struct WorkerCtx<S, H, C> {
     service: Rc<S>,
     fallback: Rc<H>,
@@ -616,11 +810,27 @@ async fn dispatch<S, H, C>(
         // under `SO_REUSEPORT` it can aim every such socket at one worker.
         let handshake =
             tokio::time::timeout(ctx.cfg.limits.header_timeout, acceptor.accept(stream));
-        let Ok(Ok(tls_stream)) = handshake.await else {
-            // Neither a failed handshake nor an expired one is a protocol error
-            // we can report over HTTP; the peer gets a TLS alert from rustls, or
-            // nothing at all, and the socket closes.
-            return;
+        // Neither a failed handshake nor an expired one is a protocol error we
+        // can report over HTTP; the peer gets a TLS alert from rustls, or
+        // nothing at all, and the socket closes. That is the right answer for
+        // the *peer* and the wrong one for the operator, who otherwise has
+        // nothing to turn on when a misordered certificate chain makes every
+        // connection fail identically. So both are said at `debug!`: a scanner
+        // must not be able to flood `warn!`, but something has to exist.
+        let tls_stream = match handshake.await {
+            Ok(Ok(s)) => s,
+            Ok(Err(e)) => {
+                tracing::debug!(%peer, error = %e, "TLS handshake failed");
+                return;
+            }
+            Err(_) => {
+                tracing::debug!(
+                    %peer,
+                    timeout = ?ctx.cfg.limits.header_timeout,
+                    "TLS handshake timed out"
+                );
+                return;
+            }
         };
         let is_h2 = crate::tls::negotiated_h2(tls_stream.get_ref().1);
         if is_h2 {
@@ -690,12 +900,14 @@ where
     S: H1Service + 'static,
     C: UpgradeConsumer + 'static,
 {
-    // A clean close and an I/O error are the same outcome here: the connection is
-    // over and there is nobody left to tell.
+    // A clean close and an I/O error are the same outcome for the *peer* — the
+    // connection is over and there is nobody left to tell. They are not the same
+    // outcome for the operator: a write failure, a framing desync and a write
+    // timeout all used to look exactly like a client hanging up politely.
     //
     // An upgraded transport goes to the connection consumer, which is
     // `CloseUpgrade` unless the caller plugged one in via `serve_with`.
-    if let Ok(Some(upgraded)) = crate::backend::serve_connection(
+    let served = crate::backend::serve_connection(
         io,
         ctx.service.clone(),
         ctx.conn_cfg.clone(),
@@ -703,9 +915,29 @@ where
         buffered,
         Some(peer),
     )
-    .await
-    {
-        ctx.upgrades.handle(upgraded).await;
+    .await;
+
+    match served {
+        Ok(Some(upgraded)) => ctx.upgrades.handle(upgraded).await,
+        Ok(None) => {}
+        // `debug!` throughout: one line per connection is a level an operator
+        // opts into, and any peer can produce these at will.
+        Err(e) => match e.kind() {
+            // The ordinary ways a client leaves. Nothing happened that anyone
+            // needs to know about.
+            io::ErrorKind::UnexpectedEof
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::BrokenPipe => {}
+            // Its own line because it is its own diagnosis: a reader that
+            // stalled or a peer that stopped consuming what we were writing,
+            // rather than a peer that went away.
+            io::ErrorKind::TimedOut => {
+                tracing::debug!(%peer, "connection hit a deadline and was closed");
+            }
+            _ => {
+                tracing::debug!(%peer, error = %e, "connection ended with an I/O error");
+            }
+        },
     }
 }
 
@@ -1027,64 +1259,166 @@ mod tests {
         );
     }
 
+    /// Fires a shutdown from inside `serve`'s own spawn loop.
+    ///
+    /// `serve_with` clones the service factory once per worker, before that
+    /// worker is spawned and before its receiver is taken. A factory whose
+    /// `Clone` signals therefore places the shutdown at an exactly known point
+    /// in that loop — after `n - 1` workers exist and before the `n`th does —
+    /// without a single line of it living in the server. That is the whole
+    /// window the startup race occupies, and this is the only way to reach it
+    /// from outside: it is a few hundred microseconds wide, it is not
+    /// observable, and a sleep raced against it samples it on one machine and
+    /// misses it on the next.
+    ///
+    /// It is a `Clone` impl rather than a `Fn` impl because the `Fn` traits
+    /// cannot be implemented on stable; the closure below captures one of these
+    /// and inherits its `Clone`.
+    struct SignalOnNthClone {
+        clones: Arc<AtomicUsize>,
+        at: usize,
+        handle: ServerHandle,
+    }
+
+    impl Clone for SignalOnNthClone {
+        fn clone(&self) -> Self {
+            if self.clones.fetch_add(1, Ordering::SeqCst) + 1 == self.at {
+                self.handle.shutdown();
+            }
+            Self {
+                clones: self.clones.clone(),
+                at: self.at,
+                handle: self.handle.clone(),
+            }
+        }
+    }
+
     /// Every worker must observe a shutdown, not just the ones that happened to
     /// subscribe before it landed.
     ///
     /// With the subscription taken inside the spawn loop, a signal arriving
     /// midway stopped the workers already subscribed and left the rest
     /// accepting, so `serve` blocked in `join` while `is_shutting_down()`
-    /// reported true. Sampling that window means signalling *while* `serve` is
-    /// still spawning threads — a shutdown sent after the server is up cannot
-    /// reach it, because by then every receiver exists and every one of them
-    /// sees the transition.
+    /// reported true. `watch::Sender::subscribe` marks the sender's *current*
+    /// value as already seen, so a receiver created after the signal never
+    /// observes a transition — and a loop waiting only on `changed()` would
+    /// wait forever.
     ///
-    /// The window is a few hundred microseconds wide and cannot be observed
-    /// from outside, so this is a race and is treated as one: eight workers to
-    /// widen it, a delay swept across the range rather than one guessed value,
-    /// and the whole thing repeated. A single pass that happened to signal too
-    /// late would prove nothing and say nothing about it.
+    /// A shutdown sent after the server is up cannot reach that window: by then
+    /// every receiver exists and every one of them sees the transition. So this
+    /// signals from inside the spawn loop, through the factory's `Clone`, at
+    /// each of the eight positions in turn. Every position is hit exactly, on
+    /// every run, on every machine — where the sleep-and-hope version this
+    /// replaces sampled the window on roughly four runs in five and reported
+    /// nothing on the fifth.
+    ///
+    /// Both halves of the current defence are covered by this. The pre-loop
+    /// `subscribe` gives every worker a receiver that has not yet seen the
+    /// signal, and the accept loop re-reads the flag before its first accept
+    /// even if it has; either one alone is enough to pass, which is deliberate
+    /// belt-and-braces, and removing both fails here at `at = 1`.
     ///
     /// The failure mode is a hang, not a wrong answer, so every pass is bounded
     /// by a watchdog on the channel `serve` reports through.
     #[test]
     fn shutdown_during_worker_startup_stops_every_worker() {
-        for attempt in 0..20u64 {
-            let server = Server::bind(test_config(8)).expect("bind");
+        const WORKERS: usize = 8;
+
+        // `at = 1` signals before any worker has been spawned but after `serve`
+        // has begun and the listeners are bound — the degenerate end, and still
+        // distinct from `shutdown_before_serve_returns_immediately`, which
+        // signals before `serve` is entered at all. `at = WORKERS` signals with
+        // seven workers already accepting and one still to come, which is the
+        // shape the original bug took.
+        for at in 1..=WORKERS {
+            let server = Server::bind(test_config(WORKERS)).expect("bind");
             let handle = server.handle();
 
-            // Swept from "before `serve` was even called" up past the far end
-            // of the spawn loop, so the interesting middle is covered whatever
-            // this machine's thread-spawn cost turns out to be. A single fixed
-            // sleep would be tuned to one machine and silently stop sampling
-            // anything on another.
-            let delay = Duration::from_micros(attempt * 75);
-            let signal = std::thread::spawn(move || {
-                if !delay.is_zero() {
-                    std::thread::sleep(delay);
-                }
-                handle.shutdown();
-            });
+            let signal = SignalOnNthClone {
+                clones: Arc::new(AtomicUsize::new(0)),
+                at,
+                handle,
+            };
+            let clones = signal.clones.clone();
 
             let (tx, rx) = std::sync::mpsc::channel();
             let serving = std::thread::spawn(move || {
-                server.serve(|| hello).expect("serve");
+                // The factory is the closure; `signal` is captured by value, so
+                // `serve`'s per-worker `make.clone()` clones it too.
+                server
+                    .serve(move || {
+                        let _ = &signal;
+                        hello
+                    })
+                    .expect("serve");
                 let _ = tx.send(());
             });
 
             // Generous rather than tight: the assertion is that `serve` returns
             // at all. A bound close to the real duration would turn a loaded CI
-            // box into a failure, which is the one thing a race test must not
-            // do.
+            // box into a failure, which is the one thing a shutdown test must
+            // not do.
             assert!(
                 rx.recv_timeout(Duration::from_secs(10)).is_ok(),
-                "attempt {attempt} (signal after {delay:?}): serve must return \
-                 once every worker has stopped. A worker whose receiver was \
-                 created after the signal never sees a transition, so it \
-                 accepts forever and join blocks on it"
+                "signalled from inside the spawn loop, before worker {at} of \
+                 {WORKERS}: serve must return once every worker has stopped. A \
+                 worker whose receiver was created after the signal never sees \
+                 a transition, so it accepts forever and join blocks on it"
             );
-            signal.join().expect("signal thread");
             serving.join().expect("serve thread");
+            // The signal is only in the right place if the factory really was
+            // cloned once per worker before its worker started. If `serve` ever
+            // stops doing that, this test would go on passing while signalling
+            // nowhere near the window it is named for.
+            assert_eq!(
+                clones.load(Ordering::SeqCst),
+                WORKERS,
+                "the factory must be cloned once per worker, or the shutdown \
+                 above was not fired from inside the spawn loop and this test \
+                 is asserting nothing"
+            );
         }
+    }
+
+    /// The whole point of the split: a peer that can make `accept` fail must
+    /// not be able to make the worker pause.
+    #[test]
+    fn transient_accept_errors_do_not_back_off() {
+        for kind in [
+            io::ErrorKind::ConnectionAborted,
+            io::ErrorKind::ConnectionReset,
+            io::ErrorKind::Interrupted,
+            io::ErrorKind::TimedOut,
+        ] {
+            assert!(
+                !accept_backoff_warranted(&io::Error::from(kind)),
+                "{kind:?} is per-connection; pausing for it hands an attacker a \
+                 throttle on the whole worker"
+            );
+        }
+        if let Some(eproto) = EPROTO {
+            assert!(
+                !accept_backoff_warranted(&io::Error::from_raw_os_error(eproto)),
+                "EPROTO is per-connection too, and no ErrorKind names it"
+            );
+        }
+    }
+
+    /// Resource exhaustion is what the pause exists for, and an error nobody
+    /// classified must land on the safe side of the split.
+    #[test]
+    fn resource_and_unknown_accept_errors_back_off() {
+        assert!(accept_backoff_warranted(&io::Error::from(
+            io::ErrorKind::OutOfMemory
+        )));
+        // EMFILE and ENFILE: Rust maps no distinct kind to either, so they
+        // arrive as raw errnos and must fall through to the backoff arm.
+        #[cfg(unix)]
+        for errno in [24, 23] {
+            let e = io::Error::from_raw_os_error(errno);
+            assert!(accept_backoff_warranted(&e));
+        }
+        assert!(accept_backoff_warranted(&io::Error::other("something new")));
     }
 
     #[test]
