@@ -12,6 +12,7 @@ use bytes::Bytes;
 use std::cell::{Cell, RefCell};
 use std::future::Future;
 use std::io;
+use std::net::SocketAddr;
 use std::pin::Pin;
 use std::rc::Rc;
 use std::task::{Context, Poll};
@@ -28,6 +29,14 @@ impl<T: AsyncRead + AsyncWrite + Unpin> Transport for T {}
 
 /// A connection handed off after a successful protocol upgrade.
 pub struct Upgraded {
+    /// The address of the peer that opened this connection.
+    ///
+    /// Carried for the same reason [`Request::peer`] is, and more urgently: an
+    /// upgrade consumer owns the connection for its whole lifetime — a
+    /// WebSocket session rather than one request — which is exactly where
+    /// per-peer accounting matters most, and it has no `Request` left to read
+    /// the address from. `None` means unknown, never local.
+    pub peer: Option<SocketAddr>,
     /// The raw transport, positioned after the upgrade request's head.
     pub io: Box<dyn Transport>,
     /// Bytes already read past the head.
@@ -42,6 +51,7 @@ pub struct Upgraded {
 impl std::fmt::Debug for Upgraded {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Upgraded")
+            .field("peer", &self.peer)
             .field("buffered", &self.buffered.len())
             .finish_non_exhaustive()
     }
@@ -633,6 +643,17 @@ pub struct Request {
     pub head: Head,
     /// The request body.
     pub body: Body,
+    /// The address of the peer that opened this connection.
+    ///
+    /// A property of the connection rather than the request — every request on
+    /// one connection carries the same value — but it is stamped here because a
+    /// handler receives a `Request` and nothing else.
+    ///
+    /// `None` when the transport has no address to report: a `duplex` pair in a
+    /// test or benchmark, or a `Connection` a caller drove without supplying one
+    /// (see [`Connection::with_peer`](crate::Connection::with_peer)). Do not
+    /// treat `None` as a trusted-source signal; it means "unknown", not "local".
+    pub peer: Option<SocketAddr>,
 }
 
 impl std::fmt::Debug for Request {
@@ -640,6 +661,7 @@ impl std::fmt::Debug for Request {
         f.debug_struct("Request")
             .field("method", &self.head.method)
             .field("target", self.head.target())
+            .field("peer", &self.peer)
             .finish_non_exhaustive()
     }
 }
@@ -1032,6 +1054,7 @@ mod tests {
             .unwrap()
             .0,
             body: Body::empty(),
+            peer: None,
         };
 
         // Fully qualified: on a closure, `.call()` would collide with the

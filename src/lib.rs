@@ -58,9 +58,9 @@ pub use header::{HeaderId, HeaderVec};
 pub use limits::Limits;
 pub use method::{Method, Version};
 pub use parse::{ParseError, parse_head};
-pub use server::{Config, Server, ServerHandle, TcpConfig};
+pub use server::{CloseH2, CloseUpgrade, Config, Server, ServerHandle, TcpConfig};
 pub use service::{
     Body, BodyError, BodyIo, H1Service, Request, Response, ResponseBody, Transport, Upgraded,
 };
-pub use tls::{H2C_PREFACE, H2Fallback, Preface, is_h2c_preface};
+pub use tls::{H2C_PREFACE, H2Fallback, Preface, UpgradeConsumer, is_h2c_preface};
 pub use write::{DateCache, OutBody, ResponseHead};

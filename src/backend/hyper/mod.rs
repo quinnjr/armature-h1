@@ -44,6 +44,7 @@ use bytes::Bytes;
 use io::{HyperIo, IoShared, SharedIo};
 use std::cell::{Cell, RefCell};
 use std::io as stdio;
+use std::net::SocketAddr;
 use std::rc::Rc;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -312,6 +313,7 @@ impl Backend for HyperBackend {
         cfg: Rc<ConnConfig>,
         date: Rc<RefCell<DateCache>>,
         buffered: Bytes,
+        peer: Option<SocketAddr>,
     ) -> stdio::Result<Option<Upgraded>>
     where
         IO: AsyncRead + AsyncWrite + Unpin + 'static,
@@ -329,6 +331,7 @@ impl Backend for HyperBackend {
             sent_101: sent_101.clone(),
             phase: clock.clone(),
             req_version: req_version.clone(),
+            peer,
         };
 
         let mut builder = ::hyper::server::conn::http1::Builder::new();
@@ -435,6 +438,11 @@ impl Backend for HyperBackend {
                 Ok(None)
             }
             Ok(Ok(())) => {
+                // `sent_101` is set by the bridge only where the native loop
+                // reaches `Disposition::Upgrade`: a 101, on a request that
+                // asked for the upgrade, whose body the handler read to its
+                // end. The last of those three is what keeps `read_buf` below
+                // honest — see the `fully_read` gate in `bridge::call`.
                 if sent_101.get() && upgrade_slot.borrow_mut().take().is_some() {
                     let parts = conn.into_parts();
                     // The transport outlives the watchdog from here on; stop
@@ -442,6 +450,7 @@ impl Backend for HyperBackend {
                     // watches.
                     clock.detach();
                     return Ok(Some(Upgraded {
+                        peer,
                         // hyper's read-ahead satisfies the `buffered`
                         // contract: bytes the peer sent past the 101 head,
                         // which must not be dropped.
@@ -576,6 +585,7 @@ mod tests {
             config,
             Rc::new(RefCell::new(DateCache::new())),
             Bytes::new(),
+            None,
         ));
         local
             .run_until(async move {
@@ -712,6 +722,7 @@ mod tests {
             cfg(limits),
             Rc::new(RefCell::new(DateCache::new())),
             Bytes::new(),
+            None,
         ));
         let finished = local
             .run_until(async move {
@@ -768,6 +779,7 @@ mod tests {
             config,
             Rc::new(RefCell::new(DateCache::new())),
             Bytes::new(),
+            None,
         ));
         let (first, second) = local
             .run_until(async move {
@@ -974,6 +986,7 @@ mod tests {
             cfg(limits),
             Rc::new(RefCell::new(DateCache::new())),
             Bytes::new(),
+            None,
         ));
         let (out, closed) = local
             .run_until(async move {
@@ -1037,6 +1050,7 @@ mod tests {
             cfg(Limits::default()),
             Rc::new(RefCell::new(DateCache::new())),
             Bytes::new(),
+            None,
         ));
         let (first, rest, closed) = local
             .run_until(async move {
@@ -1099,6 +1113,7 @@ mod tests {
             cfg(Limits::default()),
             Rc::new(RefCell::new(DateCache::new())),
             Bytes::new(),
+            None,
         ));
         let upgraded = local
             .run_until(async move {
@@ -1304,6 +1319,7 @@ mod tests {
             cfg(Limits::default()),
             Rc::new(RefCell::new(DateCache::new())),
             Bytes::new(),
+            None,
         ));
         let served = local
             .run_until(async move {
@@ -1331,6 +1347,93 @@ mod tests {
              handoff still happens — the divergence from native's Ok(None)"
         );
         LEAKED.with(|slot| slot.borrow_mut().take());
+    }
+
+    /// Drive one upgrade exchange to completion, returning what `serve`
+    /// handed back. The 101 head is asserted on the way past: every caller
+    /// here is testing what happens *after* a 101 goes out, so a run that
+    /// never got one would otherwise pass by accident.
+    async fn upgrade_exchange<S>(input: &'static [u8], service: S) -> Option<Upgraded>
+    where
+        S: crate::H1Service + 'static,
+    {
+        let (mut client, server) = tokio::io::duplex(4096);
+        let local = tokio::task::LocalSet::new();
+        let task = local.spawn_local(HyperBackend::serve(
+            server,
+            Rc::new(service),
+            cfg(Limits::default()),
+            Rc::new(RefCell::new(DateCache::new())),
+            Bytes::new(),
+            None,
+        ));
+        local
+            .run_until(async move {
+                client.write_all(input).await.unwrap();
+                let mut buf = [0u8; 256];
+                let n = client.read(&mut buf).await.unwrap();
+                let head = String::from_utf8_lossy(&buf[..n]).into_owned();
+                assert!(head.starts_with("HTTP/1.1 101"), "{head}");
+                tokio::time::timeout(Duration::from_secs(2), task)
+                    .await
+                    .expect("the serve future must resolve, not hang")
+                    .expect("the worker task must not panic")
+                    .expect("serve")
+            })
+            .await
+    }
+
+    async fn switching(_req: Request) -> Response {
+        Response::new(101)
+            .header(crate::HeaderId::Upgrade, Bytes::from_static(b"raw"))
+            .header(crate::HeaderId::Connection, Bytes::from_static(b"upgrade"))
+    }
+
+    /// The hyper counterpart of `conn::write_response`'s `body_consumed` gate
+    /// on the upgrade handoff.
+    ///
+    /// Distinct from `a_retained_body_across_an_upgrade_neither_panics_nor_hangs`
+    /// above, and not a divergence: there the handler *keeps* the body alive,
+    /// which only native's shared-transport handle can detect. Here it drops
+    /// the body unread, which the bridge sees through the same `fully_read`
+    /// cell the native loop reads as `body_consumed`. Body bytes still on the
+    /// wire would otherwise be handed to the upgrade consumer as
+    /// `Upgraded::buffered`, which is documented to carry the peer's first
+    /// post-upgrade frames — a smuggling shape aimed at the consumer rather
+    /// than at the parser.
+    #[tokio::test]
+    async fn an_unread_body_forfeits_the_upgrade_handoff() {
+        let served = upgrade_exchange(
+            b"POST / HTTP/1.1\r\nHost: a\r\nConnection: upgrade\r\nUpgrade: raw\r\n\
+              Content-Length: 5\r\n\r\nhello",
+            switching,
+        )
+        .await;
+        assert!(
+            served.is_none(),
+            "an unread request body forfeits the handoff, as it does natively"
+        );
+    }
+
+    /// The other half of the gate: reading the body to its end leaves nothing
+    /// of the request on the wire, so the handoff proceeds. Without this the
+    /// test above would also pass against a backend that never upgrades at all.
+    #[tokio::test]
+    async fn a_body_read_to_its_end_still_upgrades() {
+        async fn drain_then_switch(mut req: Request) -> Response {
+            req.body.collect(1024).await.expect("body");
+            switching(req).await
+        }
+        let served = upgrade_exchange(
+            b"POST / HTTP/1.1\r\nHost: a\r\nConnection: upgrade\r\nUpgrade: raw\r\n\
+              Content-Length: 5\r\n\r\nhello",
+            drain_then_switch,
+        )
+        .await;
+        assert!(
+            served.is_some(),
+            "a body read to its end leaves the handoff intact"
+        );
     }
 
     /// `PhaseClock`'s rules, direct.

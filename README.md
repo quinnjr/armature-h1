@@ -132,12 +132,24 @@ request without reading its body causes no interim response), `HEAD`, `CONNECT`,
 `Upgrade` with raw-socket handoff, origin/absolute/asterisk-form targets,
 HTTP/1.0 semantics.
 
-**Caveat on `Upgrade`.** The handoff is available on `Connection::serve`, which
-returns `Ok(Some(Upgraded))` — the transport plus the bytes the peer already sent
-past the head — when a handler answers a request carrying `Connection: upgrade`
-with status 101. `Server` has no upgrade-consumer hook, unlike the pluggable
-HTTP/2 fallback, so under `Server::serve` an upgraded connection is **closed**.
-Drive `Connection` yourself if you need the socket.
+**On `Upgrade`.** The handoff is available on `Connection::serve`, which returns
+`Ok(Some(Upgraded))` — the transport plus the bytes the peer already sent past
+the head — when a handler answers a request carrying `Connection: upgrade` with
+status 101. Under `Server`, pass an `UpgradeConsumer` to `serve_with` and it
+receives the same thing; `serve` and `serve_with_fallback` default to
+`CloseUpgrade`, which closes. A handler that never reads the request body to
+its end forfeits the handoff on **both** backends: the unread bytes are still
+on the wire and the consumer would read them as the peer's first post-upgrade
+frames. A handler that *retains* a still-live body past its response forfeits
+it on the native backend only — there the body holds a second handle on the
+transport, while under `hyper-backend` it is a channel endpoint with no live
+handle to detect (see `BACKENDS.md`). Drain the body and drop it before
+answering 101 and neither rule can bite.
+
+**Peer address.** `Request::peer` carries the address of the socket the request
+arrived on, or `None` for a transport that has none (a `duplex` pair, or a
+`Connection` driven without `with_peer`). Read `None` as *unknown*, never as
+*local*: it is the only client identifier that is not chosen by the client.
 
 Rejected, per RFC 9110/9111/9112, each with a named test:
 
