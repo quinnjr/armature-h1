@@ -20,17 +20,17 @@ exclude = ["fuzz/"]
 bytes = "1.12"
 httparse = "1.10"
 memchr = "2.8"
-smallvec = { version = "1.15", features = ["union", "const_generics"] }
+smallvec = { version = "1.16", features = ["union", "const_generics"] }
 httpdate = "1.0"
 thiserror = "2.0"
 tracing = "0.1"
-tokio = { version = "1.52", features = ["rt", "net", "io-util", "time", "sync", "macros"] }
+tokio = { version = "1.53", features = ["rt", "net", "io-util", "time", "sync", "macros"] }
 socket2 = { version = "0.6", features = ["all"] }
 core_affinity = "0.8"
 
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"], optional = true }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"], optional = true }
-hyper = { version = "1.10", features = ["server", "http1"], optional = true }
+hyper = { version = "1.11", features = ["server", "http1"], optional = true }
 
 [features]
 default = []
@@ -39,7 +39,7 @@ hyper-backend = ["dep:hyper"]
 
 [dev-dependencies]
 cargo-husky = { version = "1.5", default-features = false, features = ["user-hooks"] }
-tokio = { version = "1.52", features = ["rt", "net", "io-util", "time", "sync", "macros", "test-util"] }
+tokio = { version = "1.53", features = ["rt", "net", "io-util", "time", "sync", "macros", "test-util"] }
 # Self-signed certificates for the TLS dispatch tests. Dev-only: the crate itself
 # never generates certificates.
 rcgen = "0.14"
