@@ -16,6 +16,7 @@ use crate::{Body, Limits, Method, Request, Response, Version, framing, parse, pa
 use bytes::{Bytes, BytesMut};
 use std::cell::{Cell, RefCell};
 use std::io;
+use std::net::SocketAddr;
 use std::rc::Rc;
 use std::task::{Context, Poll};
 use std::time::{Duration, SystemTime};
@@ -23,6 +24,12 @@ use tokio::io::{AsyncRead, AsyncWrite};
 
 /// How much to read per syscall.
 const READ_CHUNK: usize = 8 * 1024;
+
+/// How many bytes of chunk frames to accumulate before flushing a streamed
+/// response body.
+///
+/// Matches [`READ_CHUNK`] so a stream and a read move data in comparable units.
+const STREAM_FLUSH_BYTES: usize = 8 * 1024;
 
 /// The interim response for `Expect: 100-continue`.
 const CONTINUE: &[u8] = b"HTTP/1.1 100 Continue\r\n\r\n";
@@ -68,8 +75,27 @@ struct IoState<IO> {
     io: IO,
     /// Unconsumed bytes: a partial head, or body bytes read past one.
     buf: BytesMut,
+    /// How much of `buf` the head scanner has already searched.
+    ///
+    /// A head that arrives in `k` reads would otherwise be rescanned from byte 0
+    /// after every one of them — O(k · head_len) for a head the peer can split
+    /// as finely as it likes. The cursor makes the scan resume where it left
+    /// off. It is a pure optimization and is reset to zero by every operation
+    /// that consumes or rewrites `buf`, so a stale value can never hide a
+    /// terminator: correctness only ever depends on `buf` itself.
+    scanned: usize,
     /// A `100 Continue` owed to the peer but not yet written.
     pending_continue: bool,
+}
+
+impl<IO> IoState<IO> {
+    /// Forget the head-scan cursor.
+    ///
+    /// Called wherever `buf` shrinks or its front moves, because the cursor is
+    /// an offset into a buffer that no longer exists in that form.
+    fn reset_scan(&mut self) {
+        self.scanned = 0;
+    }
 }
 
 impl<IO: AsyncRead + AsyncWrite + Unpin> IoState<IO> {
@@ -113,6 +139,7 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> BodyIo for IoState<IO> {
                 // Hand the new bytes to the body as a slice of this same
                 // allocation.
                 let fresh = self.buf.split_off(before).freeze();
+                self.reset_scan();
                 Poll::Ready(Ok(fresh))
             }
         }
@@ -120,14 +147,33 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> BodyIo for IoState<IO> {
 
     fn take_buffered(&mut self, max: usize) -> Bytes {
         let n = self.buf.len().min(max);
-        self.buf.split_to(n).freeze()
+        let taken = self.buf.split_to(n).freeze();
+        self.reset_scan();
+        taken
     }
 
     fn push_back(&mut self, bytes: Bytes) {
         if bytes.is_empty() {
             return;
         }
-        // Prepend: these bytes precede whatever is already buffered.
+        self.reset_scan();
+        // These bytes precede whatever is already buffered, and the head scanner
+        // needs the result contiguous — the next pipelined request's head can
+        // straddle the join — so a second "pending" slot consulted ahead of
+        // `buf` is not an option here.
+        //
+        // In practice `buf` is empty at every push-back: a body only has residue
+        // to return when it over-read through `poll_fill`, which splits the new
+        // bytes off and leaves `buf` at the length it had before the read — and
+        // that length is zero, because the body drained `buf` through
+        // `take_buffered` first. Appending into the existing allocation is
+        // therefore the normal path, and it costs one copy and no allocation
+        // instead of the rebuild's two copies and an allocation. The general
+        // case is kept honest below rather than asserted away.
+        if self.buf.is_empty() {
+            self.buf.extend_from_slice(&bytes);
+            return;
+        }
         let mut joined = BytesMut::with_capacity(bytes.len() + self.buf.len());
         joined.extend_from_slice(&bytes);
         joined.extend_from_slice(&self.buf);
@@ -160,6 +206,10 @@ pub struct Connection<IO, S> {
     /// Reused across requests: allocating a fresh flag per request would put an
     /// allocation back on the steady-state path.
     body_read: Rc<Cell<bool>>,
+    /// Stamped onto every [`Request`] served here. A `SocketAddr` is `Copy` and
+    /// 32 bytes at worst, so this is carried by value rather than behind an
+    /// `Rc`: sharing it would cost a pointer chase per request to save nothing.
+    peer: Option<SocketAddr>,
 }
 
 impl<IO, S> Connection<IO, S>
@@ -195,6 +245,7 @@ where
             shared: Rc::new(RefCell::new(IoState {
                 io,
                 buf,
+                scanned: 0,
                 pending_continue: false,
             })),
             service,
@@ -203,18 +254,79 @@ where
             deadline,
             out: BytesMut::with_capacity(1024),
             body_read: Rc::new(Cell::new(false)),
+            peer: None,
         }
+    }
+
+    /// Report `peer` as the connection's remote address on every request.
+    ///
+    /// A builder rather than a constructor parameter because the address is
+    /// optional and the constructors already take four arguments; a fifth that
+    /// is `None` at most call sites is noise. Without this the requests this
+    /// connection serves carry [`Request::peer`](crate::Request::peer) of
+    /// `None`, which downstream code must read as "unknown", not "local".
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use armature_h1::{ConnConfig, Connection, DateCache, Request, Response};
+    /// use std::cell::RefCell;
+    /// use std::rc::Rc;
+    ///
+    /// async fn handler(_req: Request) -> Response {
+    ///     Response::text("hi")
+    /// }
+    ///
+    /// let rt = tokio::runtime::Builder::new_current_thread()
+    ///     .enable_all()
+    ///     .build()
+    ///     .unwrap();
+    /// // A connection allocates a reusable timer up front, so it has to be
+    /// // built inside a runtime context — in the real server that is the
+    /// // worker's own runtime, here it is entered explicitly.
+    /// let _guard = rt.enter();
+    ///
+    /// let (_client, server) = tokio::io::duplex(8 * 1024);
+    /// let conn = Connection::new(
+    ///     server,
+    ///     handler,
+    ///     Rc::new(ConnConfig::default()),
+    ///     Rc::new(RefCell::new(DateCache::new())),
+    /// )
+    /// .with_peer(Some("203.0.113.7:54321".parse().unwrap()));
+    ///
+    /// // Every request `conn.serve()` now dispatches carries that address in
+    /// // `Request::peer`; without the builder it would carry `None`.
+    /// ```
+    #[must_use]
+    pub fn with_peer(mut self, peer: Option<SocketAddr>) -> Self {
+        self.peer = peer;
+        self
     }
 
     /// Serve requests until the connection ends.
     ///
     /// `Ok(Some(_))` means the connection was upgraded and the caller must hand
-    /// it to the upgrade consumer. This return value is the *only* way an
-    /// upgraded transport leaves the crate: a handler signals an upgrade by
-    /// answering a request that asked for one with status 101, and whoever drove
-    /// this `Connection` receives the socket here. [`crate::Server`] has no
-    /// upgrade consumer to hand it to and closes instead, so a service that
-    /// upgrades must drive `Connection` itself.
+    /// it to the upgrade consumer: a handler signals an upgrade by answering a
+    /// request that asked for one with status 101, and whoever drove this
+    /// `Connection` receives the socket here. Under [`crate::Server`], pass an
+    /// [`UpgradeConsumer`](crate::UpgradeConsumer) to
+    /// [`serve_with`](crate::Server::serve_with) and it receives the same
+    /// thing; [`serve`](crate::Server::serve) and
+    /// [`serve_with_fallback`](crate::Server::serve_with_fallback) default to
+    /// [`CloseUpgrade`](crate::CloseUpgrade), which closes.
+    ///
+    /// Two things forfeit the handoff, and both end the connection with
+    /// `Ok(None)` after the response is written as usual. A handler that
+    /// *retains* the request [`Body`] past its response forfeits it, because
+    /// the body holds a handle on the same transport and two readers on one
+    /// socket is not a state this crate will produce. A handler that drops the
+    /// body *unread* forfeits it too, because the bytes it never read are
+    /// still on the wire and would reach the consumer as `Upgraded::buffered`
+    /// — which is documented as the peer's first post-upgrade frames.
+    ///
+    /// So an upgrading handler must read the body to its end and then drop it
+    /// before answering 101. Dropping it unread is not enough.
     pub async fn serve(mut self) -> io::Result<Option<Upgraded>> {
         loop {
             // Wait for the next request to begin. An idle keep-alive connection
@@ -240,7 +352,9 @@ where
             let head_bytes = {
                 let mut st = self.shared.borrow_mut();
                 let end = parse::find_head_end(&st.buf).unwrap_or(st.buf.len());
-                st.buf.split_to(end).freeze()
+                let head = st.buf.split_to(end).freeze();
+                st.reset_scan();
+                head
             };
             let head = match parse_head(&head_bytes, &self.cfg.limits) {
                 Ok(Some((head, _))) => head,
@@ -294,7 +408,11 @@ where
             //
             // Cancelling the handler mid-await drops its `Body`, and with it the
             // last borrow of the transport, so the 408 can be written here.
-            let call = self.service.call(Request { head, body });
+            let call = self.service.call(Request {
+                head,
+                body,
+                peer: self.peer,
+            });
             self.deadline.arm(self.cfg.limits.body_timeout);
             let resp = {
                 let deadline = &mut self.deadline;
@@ -324,15 +442,32 @@ where
             let keep_alive = keep_alive && body_consumed;
 
             let disposition = self
-                .write_response(version, resp, keep_alive, is_head_request, wants_upgrade)
+                .write_response(
+                    version,
+                    resp,
+                    keep_alive,
+                    is_head_request,
+                    wants_upgrade,
+                    body_consumed,
+                )
                 .await?;
 
             match disposition {
                 Disposition::KeepAlive => continue,
                 Disposition::Close => return Ok(None),
                 Disposition::Upgrade => {
-                    let (io, buffered) = self.into_parts();
+                    // A handler that stashed the request `Body` somewhere
+                    // outliving the response still holds a handle on the
+                    // transport. Handing the socket to an upgrade consumer while
+                    // that handle can read from it would interleave two readers,
+                    // so the handoff is forfeited and the connection closes.
+                    // Read before `into_parts` consumes `self`.
+                    let peer = self.peer;
+                    let Some((io, buffered)) = self.into_parts() else {
+                        return Ok(None);
+                    };
                     return Ok(Some(Upgraded {
+                        peer,
                         io: Box::new(io),
                         buffered,
                     }));
@@ -342,12 +477,14 @@ where
     }
 
     /// Consume the connection, yielding the transport and unread bytes.
-    fn into_parts(self) -> (IO, Bytes) {
-        let shared = self.shared;
-        let state = Rc::try_unwrap(shared)
-            .map(RefCell::into_inner)
-            .unwrap_or_else(|_| unreachable!("body handles are dropped before upgrade"));
-        (state.io, state.buf.freeze())
+    ///
+    /// `None` when the transport is still shared — a handler kept the request
+    /// `Body` alive past its response, and that `Body` holds a handle on the
+    /// very state being unwrapped here. The transport cannot be handed off while
+    /// a second owner could still read from it, so the caller closes instead.
+    fn into_parts(self) -> Option<(IO, Bytes)> {
+        let state = Rc::try_unwrap(self.shared).ok().map(RefCell::into_inner)?;
+        Some((state.io, state.buf.freeze()))
     }
 
     /// Read until a complete head is buffered, or a deadline or EOF intervenes.
@@ -409,8 +546,28 @@ where
         }
     }
 
+    /// Whether a complete head is buffered, resuming the search where the last
+    /// call left off.
+    ///
+    /// `parse::find_head_end` is a plain search for `\r\n\r\n`, so restricting
+    /// it to a suffix is exact as long as the suffix starts three bytes before
+    /// the last scanned position — the shortest overlap that can still hold a
+    /// terminator straddling the boundary. Nothing else about head validation
+    /// happens here; the bare-CR/LF and obs-fold rules are `parse::prescan`'s,
+    /// and it always sees the whole head region.
     fn has_complete_head(&self) -> bool {
-        parse::find_head_end(&self.shared.borrow().buf).is_some()
+        let mut st = self.shared.borrow_mut();
+        // A miss leaves `scanned == buf.len()`, so this also covers "called
+        // twice without an intervening read".
+        if st.buf.len() <= st.scanned {
+            return false;
+        }
+        let from = st.scanned.saturating_sub(3);
+        if parse::find_head_end(&st.buf[from..]).is_some() {
+            return true;
+        }
+        st.scanned = st.buf.len();
+        false
     }
 
     /// Serialize and write a response, returning what to do next.
@@ -421,11 +578,20 @@ where
         req_keep_alive: bool,
         is_head_request: bool,
         wants_upgrade: bool,
+        body_consumed: bool,
     ) -> io::Result<Disposition> {
         // Status 101 alone does not take the connection: the peer must have
         // asked for the upgrade, or the transport would be handed off to a
         // protocol the client is not speaking.
-        let upgrading = resp.status == 101 && wants_upgrade;
+        //
+        // `body_consumed` gates it for the same reason it gates reuse. Bytes of
+        // an unread request body are still on the wire, and `into_parts` hands
+        // whatever is buffered to the upgrade consumer as
+        // `Upgraded::buffered` — which that consumer is documented to treat as
+        // the peer's first post-upgrade frames. Handing it body bytes under
+        // that contract is the smuggling shape pointed at the consumer instead
+        // of at the parser, so an unread body forfeits the handoff and closes.
+        let upgrading = resp.status == 101 && wants_upgrade && body_consumed;
         // An unread request body means the next bytes on the wire are body
         // bytes, not a request line. Rather than guess where the body ended,
         // close.
@@ -481,28 +647,68 @@ where
                     // just the last one: a peer that stops reading mid-stream
                     // would otherwise pin the connection and its buffer
                     // indefinitely. The deadline is re-armed per flush, so a
-                    // slow but progressing consumer is never cut off.
+                    // slow but progressing consumer is never cut off. That is
+                    // unchanged by the coalescing below — it changes how many
+                    // flushes there are, never whether one is guarded.
                     //
                     // Flush the head first so the peer can begin processing.
                     self.flush().await?;
                     loop {
-                        let next = std::future::poll_fn(|cx| s.as_mut().poll_next(cx)).await;
+                        // Poll once without committing to a wait. If the stream
+                        // is not ready, whatever has been coalesced so far is
+                        // flushed *before* parking — otherwise a handler that
+                        // emits a small frame and then goes quiet would sit
+                        // unwritten until enough later frames arrived to cross
+                        // the byte threshold, which for an SSE or long-poll body
+                        // can be minutes. Re-polling after `Pending` is sound:
+                        // the first poll registered the waker.
+                        let next =
+                            match std::future::poll_fn(|cx| Poll::Ready(s.as_mut().poll_next(cx)))
+                                .await
+                            {
+                                Poll::Ready(item) => item,
+                                Poll::Pending => {
+                                    if !self.out.is_empty() {
+                                        self.flush().await?;
+                                    }
+                                    std::future::poll_fn(|cx| s.as_mut().poll_next(cx)).await
+                                }
+                            };
                         match next {
                             None => break,
                             Some(Ok(chunk)) => {
-                                self.out.clear();
+                                // Accumulate frames and pay for one write+flush
+                                // per `STREAM_FLUSH_BYTES` rather than per
+                                // chunk: a stream yielding small pieces would
+                                // otherwise turn each one into its own pair of
+                                // syscalls. The threshold bounds bytes, not
+                                // time — coalescing only ever spans chunks that
+                                // are ready back to back without the stream
+                                // parking. The moment it returns `Pending` the
+                                // buffer goes out, so an idle stream never holds
+                                // a frame back regardless of how little it has
+                                // produced.
                                 write::write_chunk(&mut self.out, &chunk);
-                                self.flush().await?;
+                                if self.out.len() >= STREAM_FLUSH_BYTES {
+                                    self.flush().await?;
+                                }
                             }
                             Some(Err(_)) => {
                                 // The body failed mid-stream. The head is
                                 // already sent, so the only honest signal left
                                 // is to close without a terminating chunk.
+                                //
+                                // Frames the stream already yielded are written
+                                // first. Coalescing must not turn a mid-stream
+                                // failure into silent data loss: every chunk the
+                                // body handed over successfully goes on the wire
+                                // exactly as it did when each was flushed
+                                // immediately.
+                                self.flush().await?;
                                 return Ok(Disposition::Close);
                             }
                         }
                     }
-                    self.out.clear();
                     write::write_last_chunk(&mut self.out, &HeaderVec::new());
                 }
             }
@@ -680,6 +886,73 @@ mod tests {
                 (String::from_utf8_lossy(&out).into_owned(), closed)
             })
             .await
+    }
+
+    /// Serve one request and report what the handler saw in
+    /// [`Request::peer`](crate::Request::peer).
+    ///
+    /// `with_peer` outer-`None` leaves the builder uncalled, which is what
+    /// `Connection::new` alone produces; `Some(p)` calls it with `p`. The
+    /// distinction is the point of the two tests below: the default and the
+    /// populated case reach the handler by different routes, and only the
+    /// accept loop exercises the second one otherwise — which under
+    /// `hyper-backend` never runs, leaving this public escape hatch with no
+    /// coverage at all in that feature row.
+    async fn peer_seen_by_handler(with_peer: Option<Option<SocketAddr>>) -> Option<SocketAddr> {
+        let seen: Rc<Cell<Option<SocketAddr>>> = Rc::new(Cell::new(None));
+        let recorder = seen.clone();
+
+        let (mut client, server) = tokio::io::duplex(64 * 1024);
+        let local = tokio::task::LocalSet::new();
+
+        let conn = Connection::new(
+            server,
+            move |req: Request| {
+                recorder.set(req.peer);
+                async move { Response::text("hi") }
+            },
+            cfg(Limits::default()),
+            Rc::new(RefCell::new(DateCache::new())),
+        );
+        let conn = match with_peer {
+            Some(peer) => conn.with_peer(peer),
+            None => conn,
+        };
+        let server_task = local.spawn_local(async move { conn.serve().await });
+
+        local
+            .run_until(async move {
+                client
+                    .write_all(b"GET / HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n")
+                    .await
+                    .unwrap();
+                let mut out = Vec::new();
+                let _ = tokio::time::timeout(Duration::from_secs(2), client.read_to_end(&mut out))
+                    .await;
+                let _ = server_task.await;
+                // Without this a handler that never ran would report `None` and
+                // pass the default case for the wrong reason.
+                assert!(
+                    String::from_utf8_lossy(&out).starts_with("HTTP/1.1 200 OK"),
+                    "the handler must have run"
+                );
+            })
+            .await;
+
+        seen.get()
+    }
+
+    #[tokio::test]
+    async fn with_peer_reaches_the_handler() {
+        let addr: SocketAddr = "203.0.113.7:54321".parse().expect("addr");
+        assert_eq!(peer_seen_by_handler(Some(Some(addr))).await, Some(addr));
+    }
+
+    #[tokio::test]
+    async fn peer_is_none_without_with_peer() {
+        // `None` here means unknown, not local: a `duplex` pair has no address
+        // to report, and nothing downstream may read the absence as trust.
+        assert_eq!(peer_seen_by_handler(None).await, None);
     }
 
     async fn ok_service(_req: Request) -> Response {
@@ -1136,6 +1409,62 @@ mod tests {
         );
     }
 
+    /// A handler that keeps the request body alive past its 101 still owns a
+    /// handle on the transport, so the handoff cannot happen. It must not panic
+    /// the connection task either: the retained body is ordinary safe code, and
+    /// a per-core worker that unwinds on it takes every other connection on that
+    /// core with it.
+    #[tokio::test]
+    async fn retained_body_across_an_upgrade_closes_instead_of_panicking() {
+        thread_local! {
+            static LEAKED: RefCell<Option<Body>> = const { RefCell::new(None) };
+        }
+
+        async fn switching(req: Request) -> Response {
+            // Stash the body in state that outlives the response — the shape a
+            // handler holding per-core state would produce.
+            LEAKED.with(|slot| *slot.borrow_mut() = Some(req.body));
+            Response::new(101)
+                .header(HeaderId::Upgrade, Bytes::from_static(b"raw"))
+                .header(HeaderId::Connection, Bytes::from_static(b"upgrade"))
+        }
+
+        let (mut client, server) = tokio::io::duplex(4096);
+        let local = tokio::task::LocalSet::new();
+        let conn = Connection::new(
+            server,
+            switching,
+            cfg(Limits::default()),
+            Rc::new(RefCell::new(DateCache::new())),
+        );
+        let task = local.spawn_local(async move { conn.serve().await });
+
+        let served = local
+            .run_until(async move {
+                client
+                    .write_all(
+                        b"GET / HTTP/1.1\r\nHost: a\r\nConnection: upgrade\r\nUpgrade: raw\r\n\r\n",
+                    )
+                    .await
+                    .unwrap();
+                let mut out = Vec::new();
+                let _ = tokio::time::timeout(Duration::from_secs(2), client.read_to_end(&mut out))
+                    .await;
+                task.await.expect("the worker task must not panic")
+            })
+            .await;
+
+        // The 101 head is already on the wire by the time the handoff is
+        // attempted — the response is written before the disposition is acted
+        // on. What matters is that no upgrade is handed back and no panic
+        // escapes.
+        assert!(
+            served.expect("serve").is_none(),
+            "a retained body forfeits the handoff"
+        );
+        LEAKED.with(|slot| slot.borrow_mut().take());
+    }
+
     /// 101 alone must not take the connection. Handing the transport to a
     /// protocol the client never negotiated loses every subsequent request on
     /// it.
@@ -1169,6 +1498,85 @@ mod tests {
             .await;
 
         assert!(upgraded.is_none(), "no upgrade was negotiated");
+    }
+
+    /// A stream that emits one small frame and then goes quiet must deliver
+    /// that frame promptly. Coalescing is allowed to span chunks that are ready
+    /// together, never to hold bytes across a park — otherwise an SSE body
+    /// trickling 50-byte events would stay invisible until 8 KiB had piled up.
+    #[tokio::test]
+    async fn a_streamed_frame_is_flushed_when_the_stream_goes_idle() {
+        struct OneThenIdle {
+            sent: bool,
+        }
+
+        impl crate::service::futures_stream::Stream for OneThenIdle {
+            fn poll_next(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+            ) -> Poll<Option<Result<Bytes, crate::BodyError>>> {
+                let me = self.get_mut();
+                if me.sent {
+                    // No waker is registered: this stream is idle forever, the
+                    // way a long-poll handler is between events.
+                    return Poll::Pending;
+                }
+                me.sent = true;
+                Poll::Ready(Some(Ok(Bytes::from_static(b"hello"))))
+            }
+        }
+
+        async fn trickle(_req: Request) -> Response {
+            Response::ok().with_body(ResponseBody::Stream(Box::pin(OneThenIdle { sent: false })))
+        }
+
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let local = tokio::task::LocalSet::new();
+        let conn = Connection::new(
+            server,
+            trickle,
+            cfg(Limits::default()),
+            Rc::new(RefCell::new(DateCache::new())),
+        );
+        let task = local.spawn_local(async move { conn.serve().await });
+
+        let out = local
+            .run_until(async move {
+                let mut client = client;
+                client
+                    .write_all(b"GET / HTTP/1.1\r\nHost: a\r\n\r\n")
+                    .await
+                    .unwrap();
+                let mut out = Vec::new();
+                // The stream never completes, so read until the frame shows up
+                // or the bound expires — never to EOF.
+                let _ = tokio::time::timeout(Duration::from_millis(500), async {
+                    let mut buf = [0u8; 1024];
+                    loop {
+                        let n = client.read(&mut buf).await.unwrap();
+                        if n == 0 {
+                            break;
+                        }
+                        out.extend_from_slice(&buf[..n]);
+                        if out.ends_with(b"5\r\nhello\r\n") {
+                            break;
+                        }
+                    }
+                })
+                .await;
+                task.abort();
+                String::from_utf8_lossy(&out).into_owned()
+            })
+            .await;
+
+        assert!(
+            out.contains("transfer-encoding: chunked"),
+            "the head must go out first: {out}"
+        );
+        assert!(
+            out.ends_with("5\r\nhello\r\n"),
+            "an idle stream must not hold its frame in the coalescing buffer: {out}"
+        );
     }
 
     /// `Connection` must never become `Send`. The per-core model rests on it:

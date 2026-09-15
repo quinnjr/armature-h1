@@ -24,8 +24,15 @@ pub struct Limits {
     /// Maximum bytes in the request line plus header section. Exceeding this
     /// yields 431 and closes.
     pub max_head_bytes: usize,
-    /// Maximum header field count. Exceeding this yields 431 and closes. Must
-    /// be `<= MAX_HEADERS_CEILING`.
+    /// Maximum header field count. Exceeding this yields 431 and closes.
+    ///
+    /// Values above [`MAX_HEADERS_CEILING`] are clamped to it, with a
+    /// `tracing::warn!`, by [`Limits::clamp_max_headers`] — called from both
+    /// [`Config::limits`](crate::server::Config::limits) and the worker setup
+    /// in `server::worker_loop`, since `Config`'s fields are public and so
+    /// `cfg.limits` can also be set directly, bypassing the former — the
+    /// parser's scratch array cannot serve more than that regardless of what
+    /// is configured here.
     pub max_headers: usize,
     /// Maximum request body bytes. Exceeding this yields 413 and closes.
     pub max_body_bytes: u64,
@@ -37,6 +44,26 @@ pub struct Limits {
     pub idle_timeout: Duration,
     /// Deadline for a response write to complete.
     pub write_timeout: Duration,
+}
+
+impl Limits {
+    /// Clamp `max_headers` to [`MAX_HEADERS_CEILING`], with a `tracing::warn!`
+    /// if clamping was necessary.
+    ///
+    /// The parser's fixed `httparse::Header` scratch array cannot serve more
+    /// than [`MAX_HEADERS_CEILING`] headers regardless of what is configured,
+    /// so every path that accepts a caller-supplied `Limits` must call this
+    /// before the value is used to size anything.
+    pub(crate) fn clamp_max_headers(&mut self) {
+        if self.max_headers > MAX_HEADERS_CEILING {
+            tracing::warn!(
+                configured = self.max_headers,
+                ceiling = MAX_HEADERS_CEILING,
+                "Limits::max_headers exceeds MAX_HEADERS_CEILING; clamping"
+            );
+            self.max_headers = MAX_HEADERS_CEILING;
+        }
+    }
 }
 
 impl Default for Limits {

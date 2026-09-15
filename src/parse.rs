@@ -117,6 +117,15 @@ pub fn prescan(head: &[u8]) -> Result<(), ParseError> {
 // validates against.
 const _: () = assert!(MAX_HEADERS_CEILING == 128);
 
+/// Header count served by the first parse attempt.
+///
+/// Most requests carry far fewer than [`MAX_HEADERS_CEILING`] header fields,
+/// so `parse_head` tries a small stack array first and only pays for the full
+/// ceiling-sized array (~2 KiB of zeroed `httparse::Header`s) on retry, when
+/// the first attempt reports `TooManyHeaders` and `limits.max_headers` is
+/// large enough that a genuinely-fitting head could still exist above tier 1.
+const HEADER_SCRATCH_TIER1: usize = 32;
+
 /// Parse a request head out of `buf`.
 ///
 /// Returns `Ok(None)` when the head is not yet complete, and `Ok(Some((head,
@@ -143,9 +152,38 @@ pub fn parse_head(buf: &Bytes, limits: &Limits) -> Result<Option<(Head, usize)>,
     let region = &buf[..head_len];
     prescan(region)?;
 
-    let mut scratch = [httparse::EMPTY_HEADER; MAX_HEADERS_CEILING];
-    let mut req = httparse::Request::new(&mut scratch);
-    let parsed = req.parse(region).map_err(map_httparse)?;
+    // Tier 1: a small scratch array covers the overwhelming majority of
+    // requests without paying for a full `MAX_HEADERS_CEILING`-sized init.
+    let mut scratch1 = [httparse::EMPTY_HEADER; HEADER_SCRATCH_TIER1];
+    let mut req1 = httparse::Request::new(&mut scratch1);
+    match req1.parse(region) {
+        Ok(parsed) => return finish_parse_head(buf, req1, parsed, head_len, limits),
+        Err(httparse::Error::TooManyHeaders) if limits.max_headers > HEADER_SCRATCH_TIER1 => {
+            // The head may still fit within `limits.max_headers`; tier 1's
+            // array was just too small to hold all the fields. Retry once
+            // with the full ceiling-sized array to get an accurate count.
+        }
+        Err(e) => return Err(map_httparse(e)),
+    }
+
+    let mut scratch2 = [httparse::EMPTY_HEADER; MAX_HEADERS_CEILING];
+    let mut req2 = httparse::Request::new(&mut scratch2);
+    let parsed = req2.parse(region).map_err(map_httparse)?;
+    finish_parse_head(buf, req2, parsed, head_len, limits)
+}
+
+/// Finish parsing a request head from an already-`parse`d `httparse::Request`.
+///
+/// Shared by both scratch-array tiers in [`parse_head`]: it validates
+/// completeness, the method, target, and header count/policy, and assembles
+/// the owned [`Head`].
+fn finish_parse_head(
+    buf: &Bytes,
+    req: httparse::Request<'_, '_>,
+    parsed: httparse::Status<usize>,
+    head_len: usize,
+    limits: &Limits,
+) -> Result<Option<(Head, usize)>, ParseError> {
     let httparse::Status::Complete(consumed) = parsed else {
         // `find_head_end` located a terminator, so httparse should have
         // completed. A Partial here means the head contained something httparse
@@ -208,12 +246,7 @@ pub fn parse_head(buf: &Bytes, limits: &Limits) -> Result<Option<(Head, usize)>,
     }
 
     Ok(Some((
-        Head {
-            method,
-            target,
-            version,
-            headers,
-        },
+        Head::new(method, target, version, headers),
         head_len,
     )))
 }
@@ -449,7 +482,7 @@ mod tests {
             .unwrap();
         assert_eq!(n, 35);
         assert_eq!(head.method, Method::Get);
-        assert_eq!(head.target.as_str(), "/");
+        assert_eq!(head.target().as_str(), "/");
         assert_eq!(head.version, Version::Http11);
         assert_eq!(head.headers.len(), 1);
         assert_eq!(head.get_str(&HeaderId::Host), Some("a.example"));
@@ -474,7 +507,7 @@ mod tests {
             addr >= base && addr < base + buf.len(),
             "header value must point into the read buffer, not a copy"
         );
-        let target = head.target.as_bytes().as_ptr() as usize;
+        let target = head.target().as_bytes().as_ptr() as usize;
         assert!(target >= base && target < base + buf.len());
     }
 
@@ -674,6 +707,44 @@ mod tests {
         };
         let raw = Bytes::from_static(b"GET / HTTP/1.1\r\nHost: a\r\nA: 1\r\nB: 2\r\n\r\n");
         assert_eq!(parse_head(&raw, &limits), Err(ParseError::TooManyHeaders));
+    }
+
+    /// A head with more fields than the tier-1 scratch array (32) but within
+    /// `limits.max_headers` must still parse: the tier-1 `TooManyHeaders`
+    /// failure has to trigger a retry with the full ceiling-sized array
+    /// rather than being reported as the final error.
+    #[test]
+    fn head_crossing_tier1_but_within_max_headers_still_parses() {
+        let mut raw = String::from("GET / HTTP/1.1\r\n");
+        for i in 0..33 {
+            raw.push_str(&format!("x-{i}: v\r\n"));
+        }
+        raw.push_str("\r\n");
+        let buf = Bytes::from(raw.into_bytes());
+        let limits = Limits::default();
+        assert!(limits.max_headers > HEADER_SCRATCH_TIER1);
+        let (head, _) = parse_head(&buf, &limits).unwrap().unwrap();
+        assert_eq!(head.headers.len(), 33);
+    }
+
+    /// A head whose field count exceeds both the tier-1 array and
+    /// `limits.max_headers` (with `limits.max_headers` above the tier-1 size,
+    /// so the retry path runs) must still yield the same rejection as a head
+    /// that never crossed tier 1.
+    #[test]
+    fn head_exceeding_max_headers_after_crossing_tier1_still_rejects() {
+        let limits = Limits {
+            max_headers: 40,
+            ..Default::default()
+        };
+        assert!(limits.max_headers > HEADER_SCRATCH_TIER1);
+        let mut raw = String::from("GET / HTTP/1.1\r\n");
+        for i in 0..41 {
+            raw.push_str(&format!("x-{i}: v\r\n"));
+        }
+        raw.push_str("\r\n");
+        let buf = Bytes::from(raw.into_bytes());
+        assert_eq!(parse_head(&buf, &limits), Err(ParseError::TooManyHeaders));
     }
 
     #[test]

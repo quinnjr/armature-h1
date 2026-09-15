@@ -37,6 +37,16 @@
 use armature_h1::{BodyKind, Limits, parse_head};
 use bytes::Bytes;
 use libfuzzer_sys::fuzz_target;
+use std::cell::RefCell;
+
+thread_local! {
+    static RUNTIME: RefCell<tokio::runtime::Runtime> = RefCell::new(
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime")
+    );
+}
 
 /// The verdict an implementation reaches about one request.
 #[derive(Debug, PartialEq, Eq)]
@@ -96,17 +106,13 @@ fn theirs(data: &[u8], limits: &Limits) -> Verdict {
     use hyper::service::service_fn;
     use std::sync::{Arc, Mutex};
 
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("runtime");
-
     // What hyper decided, recorded from inside its service.
     let seen: Arc<Mutex<Option<Verdict>>> = Arc::new(Mutex::new(None));
     let chunked = Arc::new(Mutex::new(false));
 
-    let outcome = rt.block_on(async {
-        let (mut client, server) = tokio::io::duplex(1 << 20);
+    let outcome = RUNTIME.with(|rt| {
+        rt.borrow_mut().block_on(async {
+            let (mut client, server) = tokio::io::duplex(64 << 10);
         let io = hyper_util::rt::TokioIo::new(server);
 
         let seen2 = seen.clone();
@@ -160,6 +166,7 @@ fn theirs(data: &[u8], limits: &Limits) -> Verdict {
             write
         );
         result
+        })
     });
 
     let recorded = seen.lock().expect("lock").take();

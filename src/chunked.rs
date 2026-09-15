@@ -673,6 +673,105 @@ mod tests {
         );
     }
 
+    /// The trailer bound must not depend on how the peer packetized its
+    /// writes, mirroring `over_long_chunk_extension_is_rejected_however_it_is_split`
+    /// for the size line. Feeding an over-long trailer line one byte at a
+    /// time trips the limit while the buffer grows; delivering the identical
+    /// bytes whole, or split at a couple of other points, must reach the
+    /// same verdict.
+    #[test]
+    fn over_long_trailer_is_rejected_however_it_is_split() {
+        let limits = Limits {
+            max_head_bytes: 8,
+            ..Default::default()
+        };
+
+        let mut raw = Vec::from(*b"0\r\nEtag: ");
+        raw.resize(raw.len() + limits.max_head_bytes + 256, b'a');
+        raw.extend_from_slice(b"\r\n\r\n");
+
+        let run_whole = |raw: &[u8]| -> Result<(), ChunkedError> {
+            let mut d = ChunkedDecoder::new(&limits);
+            let mut buf = Bytes::from(raw.to_vec());
+            loop {
+                match d.poll(&mut buf) {
+                    Err(e) => break Err(e),
+                    Ok(Some(ChunkEvent::End)) | Ok(None) => break Ok(()),
+                    Ok(Some(_)) => {}
+                }
+            }
+        };
+
+        let run_dribbled = |raw: &[u8]| -> Result<(), ChunkedError> {
+            let mut d = ChunkedDecoder::new(&limits);
+            let mut buf = Bytes::new();
+            let mut fed = 0;
+            loop {
+                match d.poll(&mut buf) {
+                    Err(e) => break Err(e),
+                    Ok(Some(ChunkEvent::End)) => break Ok(()),
+                    Ok(Some(_)) => continue,
+                    Ok(None) => {}
+                }
+                if fed == raw.len() {
+                    break Ok(());
+                }
+                let mut next = Vec::with_capacity(buf.len() + 1);
+                next.extend_from_slice(&buf);
+                next.push(raw[fed]);
+                buf = Bytes::from(next);
+                fed += 1;
+            }
+        };
+
+        let run_split_at = |raw: &[u8], at: usize| -> Result<(), ChunkedError> {
+            let mut d = ChunkedDecoder::new(&limits);
+            let mut buf = Bytes::from(raw[..at].to_vec());
+            loop {
+                match d.poll(&mut buf) {
+                    Err(e) => return Err(e),
+                    Ok(Some(ChunkEvent::End)) => return Ok(()),
+                    Ok(None) => break,
+                    Ok(Some(_)) => {}
+                }
+            }
+            let mut next = Vec::with_capacity(raw.len());
+            next.extend_from_slice(&buf);
+            next.extend_from_slice(&raw[at..]);
+            buf = Bytes::from(next);
+            loop {
+                match d.poll(&mut buf) {
+                    Err(e) => break Err(e),
+                    Ok(Some(ChunkEvent::End)) | Ok(None) => break Ok(()),
+                    Ok(Some(_)) => {}
+                }
+            }
+        };
+
+        let whole = run_whole(&raw);
+        let dribbled = run_dribbled(&raw);
+        let split_early = run_split_at(&raw, 4);
+        let split_mid = run_split_at(&raw, raw.len() / 2);
+
+        assert_eq!(
+            dribbled,
+            Err(ChunkedError::TrailerTooLarge),
+            "a trailer line longer than the bound must be rejected"
+        );
+        assert_eq!(
+            whole, dribbled,
+            "the same bytes in one segment must reach the same verdict"
+        );
+        assert_eq!(
+            split_early, dribbled,
+            "splitting before the bound is reached must reach the same verdict"
+        );
+        assert_eq!(
+            split_mid, dribbled,
+            "splitting after the bound is reached must reach the same verdict"
+        );
+    }
+
     #[test]
     fn end_is_terminal() {
         let mut d = dec();

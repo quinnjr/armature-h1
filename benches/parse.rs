@@ -3,7 +3,7 @@
 //! These three run on every request in that order, so they are the crate's hot
 //! path in the literal sense. The request shapes are chosen to separate fixed
 //! cost from per-header cost: a minimal GET, a browser-sized GET, and a
-//! 64-header request that sits at the `max_headers` default. If the browser case
+//! 96-header request that sits at the `max_headers` default. If the browser case
 //! costs proportionally more than the minimal one per header, header projection
 //! has regressed into copying — which the allocation test asserts and this
 //! measures the price of.
@@ -34,7 +34,7 @@ Cache-Control: max-age=0\r\n\
 fn many_headers() -> Bytes {
     let mut buf = Vec::with_capacity(4096);
     buf.extend_from_slice(b"GET / HTTP/1.1\r\nHost: a.example\r\n");
-    for i in 0..63 {
+    for i in 0..95 {
         buf.extend_from_slice(format!("x-custom-header-{i}: value-{i}\r\n").as_bytes());
     }
     buf.extend_from_slice(b"\r\n");
@@ -59,7 +59,7 @@ fn bench_parse_head(c: &mut Criterion) {
         b.iter(|| parse_head(black_box(&browser), black_box(&limits)).expect("parses"))
     });
     g.throughput(criterion::Throughput::Bytes(many.len() as u64));
-    g.bench_function("64_headers", |b| {
+    g.bench_function("96_headers", |b| {
         b.iter(|| parse_head(black_box(&many), black_box(&limits)).expect("parses"))
     });
     g.finish();

@@ -11,13 +11,26 @@ edition = "2024"
 [package.metadata]
 cargo-fuzz = true
 
+[features]
+# Passthrough, not a default: `backend_differential` is the only target that
+# needs a build where `serve_connection` resolves to hyper's stack while the
+# native `Connection` stays compiled and public. Turning `hyper-backend` on
+# for the whole fuzz crate would mean `parse_head`, `chunked` and
+# `framing_differential` never fuzz the default (non-hyper) build — the
+# `BodyState` cfg fields and the `poll_raw` branch it adds ahead of the main
+# loop in `src/service.rs` would go uncovered by every target. Only the
+# `backend_differential` CI job enables this.
+hyper-backend = ["armature-h1/hyper-backend"]
+
 [dependencies]
 libfuzzer-sys = "0.4"
 bytes = "1.12"
 armature-h1 = { path = ".." }
 
 # The differential target compares our framing decisions against hyper's. hyper is
-# a dependency of the FUZZ crate only — never of armature-h1 itself.
+# never in armature-h1's default dependency graph; the optional `hyper-backend`
+# feature is the only path that pulls it in, and the fuzz crate's copy stays
+# independent of it.
 hyper = { version = "1.10", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["server", "http1", "tokio"] }
 http-body-util = "0.1"
@@ -43,3 +56,14 @@ path = "fuzz_targets/framing_differential.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "backend_differential"
+path = "fuzz_targets/backend_differential.rs"
+test = false
+doc = false
+bench = false
+# Uses `armature_h1::serve_connection`, which only exists when `hyper-backend`
+# is on. `required-features` keeps `--all-targets` from trying (and failing)
+# to build this bin under the crate's default features.
+required-features = ["hyper-backend"]

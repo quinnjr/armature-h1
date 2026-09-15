@@ -11,6 +11,7 @@
 use armature_h1::{ConnConfig, Connection, DateCache, Limits, Request, Response};
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::{Cell, RefCell};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::rc::Rc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -86,6 +87,33 @@ async fn hello(_req: Request) -> Response {
     Response::text("hi")
 }
 
+/// The address the peer case populates, and the one its handler insists on.
+///
+/// `const` so the handler can stay a plain `fn` — the measurement harness wants
+/// a `Copy + 'static` service, and a bare function item is both without pulling
+/// anything into a closure.
+const MEASURED_PEER: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7)), 54321);
+
+/// As [`hello`], but reads `req.peer` inside the measured window.
+///
+/// The point is that the peer case must *depend* on the field. With `hello` the
+/// handler never touches it, so the case measures the peerless path under
+/// another name and would keep reporting zero if `with_peer` stopped
+/// propagating entirely.
+///
+/// The comparison is allocation-free — two `SocketAddr`s compared by value —
+/// and `assert_eq!` formats nothing unless it fails, so nothing here can move
+/// the count off zero on the success path.
+async fn hello_with_peer(req: Request) -> Response {
+    assert_eq!(
+        req.peer,
+        Some(MEASURED_PEER),
+        "the connection was built with a peer address and the handler must see \
+         it; a zero-allocation result means nothing if the field never arrived"
+    );
+    Response::text("hi")
+}
+
 async fn drain(mut req: Request) -> Response {
     let _ = req.body.collect(64 * 1024).await;
     Response::text("hi")
@@ -107,6 +135,25 @@ fn limits() -> Limits {
 /// excluded. What remains is per-request cost, which is the number that must not
 /// grow.
 fn steady_state_allocs<S, Fut>(request: &'static [u8], service: S, warm: usize, count: usize) -> u64
+where
+    S: Fn(Request) -> Fut + Copy + 'static,
+    Fut: std::future::Future<Output = Response> + 'static,
+{
+    steady_state_allocs_with_peer(request, service, warm, count, None)
+}
+
+/// As [`steady_state_allocs`], with the connection's peer address populated.
+///
+/// Split out rather than folded into every call site because `None` is the
+/// shape all the other cases measure; the point of the parameter is that one
+/// case measures the other shape.
+fn steady_state_allocs_with_peer<S, Fut>(
+    request: &'static [u8],
+    service: S,
+    warm: usize,
+    count: usize,
+    peer: Option<SocketAddr>,
+) -> u64
 where
     S: Fn(Request) -> Fut + Copy + 'static,
     Fut: std::future::Future<Output = Response> + 'static,
@@ -133,7 +180,8 @@ where
             server_name: None,
         }),
         Rc::new(RefCell::new(DateCache::new())),
-    );
+    )
+    .with_peer(peer);
     // Spawned on the LocalSet handle before `run_until`, matching the pattern the
     // connection tests use. Spawning from inside the `run_until` future instead
     // left the server task unscheduled and the whole harness wedged.
@@ -197,6 +245,29 @@ Connection: keep-alive\r\n\
 Cache-Control: max-age=0\r\n\
 \r\n";
 
+// Mirrors `BROWSER_GET` but with the mixed-case unknown headers a real browser
+// actually sends (Sec-Fetch-*, Sec-Ch-Ua*, Upgrade-Insecure-Requests, DNT).
+// `HeaderId::from_bytes` (src/parse.rs) only recognizes well-known names; an
+// unrecognized name takes the `HeaderId::Other` branch, which lowercases into
+// a fresh allocation whenever the name has an uppercase byte. `BROWSER_GET`'s
+// header set is entirely well-known names, so it never exercises that branch
+// and reports zero. This fixture is the honest one for "GET with N browser
+// headers."
+const BROWSER_GET_MIXED_CASE: &[u8] = b"GET /index.html HTTP/1.1\r\n\
+Host: a.example\r\n\
+User-Agent: Mozilla/5.0\r\n\
+Accept: text/html,application/xhtml+xml\r\n\
+Accept-Language: en-US,en;q=0.9\r\n\
+Accept-Encoding: gzip, deflate, br\r\n\
+Connection: keep-alive\r\n\
+Sec-Fetch-Mode: navigate\r\n\
+Sec-Fetch-Site: none\r\n\
+Sec-Fetch-Dest: document\r\n\
+Sec-Ch-Ua: \"Not.A/Brand\";v=\"8\"\r\n\
+Upgrade-Insecure-Requests: 1\r\n\
+DNT: 1\r\n\
+\r\n";
+
 const FIXED_BODY_POST: &[u8] =
     b"POST / HTTP/1.1\r\nHost: a.example\r\nContent-Length: 5\r\n\r\nhello";
 
@@ -223,6 +294,35 @@ fn steady_state_keepalive_get_stays_within_budget() {
     );
 }
 
+/// The same case, with the connection's peer address populated.
+///
+/// Every other case here builds its connection with `Connection::new` alone,
+/// which leaves `peer` as `None` — so the field is only ever measured empty,
+/// and an empty `Option` costs nothing however its payload is represented.
+/// `SocketAddr` is `Copy` and rides inline in the `Request`, so filling it in
+/// must not move the count off zero. The day someone reaches for an
+/// `Rc<String>` or a formatted address, this is the row that fails.
+///
+/// The service is [`hello_with_peer`], not `hello`: the field has to be read
+/// inside the measured window, or a `with_peer` that quietly stopped
+/// propagating would still report zero and this row would go on passing as a
+/// second copy of the peerless case.
+#[test]
+fn steady_state_keepalive_get_with_peer_stays_within_budget() {
+    let n = 100;
+    let allocs =
+        steady_state_allocs_with_peer(KEEPALIVE_GET, hello_with_peer, 50, n, Some(MEASURED_PEER));
+    let per_request = allocs as f64 / n as f64;
+    println!(
+        "keep-alive GET with peer: {allocs} allocations over {n} requests ({per_request:.2}/request)"
+    );
+    assert!(
+        allocs <= BUDGET_PER_GET * n as u64,
+        "a populated peer address must not cost an allocation: {per_request:.2} per request, \
+         budget is {BUDGET_PER_GET}"
+    );
+}
+
 #[test]
 fn browser_sized_get_stays_within_budget() {
     let n = 100;
@@ -235,6 +335,37 @@ fn browser_sized_get_stays_within_budget() {
     assert!(
         allocs <= BUDGET_PER_GET * n as u64,
         "header count must not drive allocations: {per_request:.2} per request"
+    );
+}
+
+/// Six mixed-case unknown header names (Sec-Fetch-Mode, Sec-Fetch-Site,
+/// Sec-Fetch-Dest, Sec-Ch-Ua, Upgrade-Insecure-Requests, DNT), each taking the
+/// lowercasing-copy branch in `finish_parse_head` (src/parse.rs, ~line 235)
+/// because `HeaderId::from_bytes` does not recognize them and each contains an
+/// uppercase byte. That is one allocation per unknown mixed-case header, per
+/// request: six here. `browser_sized_get_stays_within_budget` above stays at
+/// zero only because every one of its seven header names is well-known and
+/// never reaches that branch.
+///
+/// This budget is deliberately nonzero — see the module doc on
+/// `BUDGET_PER_GET` for why a nonzero number still gets pinned exactly rather
+/// than bounded by a threshold.
+const BUDGET_PER_MIXED_CASE_HEADER_GET: u64 = 6;
+
+#[test]
+fn browser_sized_get_with_mixed_case_unknown_headers_stays_within_budget() {
+    let n = 100;
+    let allocs = steady_state_allocs(BROWSER_GET_MIXED_CASE, hello, 50, n);
+    let per_request = allocs as f64 / n as f64;
+    println!(
+        "browser GET (7 well-known + 6 mixed-case unknown headers): {allocs} over {n} ({per_request:.2}/request)"
+    );
+    assert_eq!(
+        allocs,
+        BUDGET_PER_MIXED_CASE_HEADER_GET * n as u64,
+        "mixed-case unknown headers must cost exactly one allocation each per request \
+         (the lowercasing-copy branch in src/parse.rs): {per_request:.2} per request, \
+         budget is {BUDGET_PER_MIXED_CASE_HEADER_GET}"
     );
 }
 
