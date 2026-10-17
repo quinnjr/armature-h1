@@ -124,11 +124,17 @@ pub fn decide(head: &Head, limits: &Limits) -> Result<BodyKind, FramingError> {
             return Err(FramingError::TransferEncodingOnHttp10);
         }
 
-        let mut codings: smallvec::SmallVec<[&str; 4]> = smallvec::SmallVec::new();
+        // Work on bytes, never `str`: `str::trim` strips *Unicode* whitespace,
+        // so `chunked\xC2\xA0` (NBSP) would become `chunked` here while a front
+        // proxy that only strips SP/HTAB sees an unknown coding. Any non-ASCII
+        // byte in a framing field is rejected outright.
+        let mut codings: smallvec::SmallVec<[&[u8]; 4]> = smallvec::SmallVec::new();
         for value in head.all(&HeaderId::TransferEncoding) {
-            let s = std::str::from_utf8(value).map_err(|_| FramingError::ChunkedNotFinal)?;
-            for coding in s.split(',') {
-                let coding = coding.trim();
+            if !value.is_ascii() {
+                return Err(FramingError::ChunkedNotFinal);
+            }
+            for coding in value.split(|&b| b == b',') {
+                let coding = trim_ows(coding);
                 if !coding.is_empty() {
                     codings.push(coding);
                 }
@@ -137,14 +143,14 @@ pub fn decide(head: &Head, limits: &Limits) -> Result<BodyKind, FramingError> {
 
         let chunked_count = codings
             .iter()
-            .filter(|c| c.eq_ignore_ascii_case("chunked"))
+            .filter(|c| c.eq_ignore_ascii_case(b"chunked"))
             .count();
 
         return match chunked_count {
             // A single chunked coding, and it must be last.
             1 if codings
                 .last()
-                .is_some_and(|c| c.eq_ignore_ascii_case("chunked")) =>
+                .is_some_and(|c| c.eq_ignore_ascii_case(b"chunked")) =>
             {
                 if codings.len() == 1 {
                     Ok(BodyKind::Chunked)
@@ -168,9 +174,11 @@ pub fn decide(head: &Head, limits: &Limits) -> Result<BodyKind, FramingError> {
     if has_len {
         let mut agreed: Option<u64> = None;
         for value in head.all(&HeaderId::ContentLength) {
-            let s = std::str::from_utf8(value).map_err(|_| FramingError::InvalidContentLength)?;
-            for element in s.split(',') {
-                let n = parse_content_length(element.trim())?;
+            // Bytes, not `str`, for the same reason as Transfer-Encoding above:
+            // only SP/HTAB is optional whitespace, and `parse_content_length`
+            // rejects every non-digit byte, non-ASCII included.
+            for element in value.split(|&b| b == b',') {
+                let n = parse_content_length(trim_ows(element))?;
                 match agreed {
                     None => agreed = Some(n),
                     Some(prev) if prev == n => {}
@@ -197,13 +205,35 @@ pub fn decide(head: &Head, limits: &Limits) -> Result<BodyKind, FramingError> {
 /// `str::parse::<u64>` would accept a leading `+`, which RFC 9112 does not, so
 /// digits are checked explicitly.
 #[inline]
-fn parse_content_length(s: &str) -> Result<u64, FramingError> {
-    let bytes = s.as_bytes();
-    if bytes.is_empty() || !bytes.iter().all(|b| b.is_ascii_digit()) {
+fn parse_content_length(bytes: &[u8]) -> Result<u64, FramingError> {
+    if bytes.is_empty() {
         return Err(FramingError::InvalidContentLength);
     }
-    s.parse::<u64>()
-        .map_err(|_| FramingError::InvalidContentLength)
+    bytes.iter().try_fold(0u64, |acc, &b| {
+        if !b.is_ascii_digit() {
+            return Err(FramingError::InvalidContentLength);
+        }
+        acc.checked_mul(10)
+            .and_then(|n| n.checked_add(u64::from(b - b'0')))
+            .ok_or(FramingError::InvalidContentLength)
+    })
+}
+
+/// Strip RFC 9110 optional whitespace (`OWS = *( SP / HTAB )`) from both ends.
+///
+/// Deliberately *not* `str::trim` or `<[u8]>::trim_ascii`: the former strips
+/// Unicode whitespace (NBSP, NEL, ideographic space) and the latter also strips
+/// CR, LF and FF. Framing must agree byte-for-byte with every other hop, so only
+/// the two bytes the grammar allows are removed.
+#[inline]
+pub(crate) fn trim_ows(mut s: &[u8]) -> &[u8] {
+    while let [b' ' | b'\t', rest @ ..] = s {
+        s = rest;
+    }
+    while let [rest @ .., b' ' | b'\t'] = s {
+        s = rest;
+    }
+    s
 }
 
 #[cfg(test)]
@@ -472,6 +502,79 @@ mod tests {
                 b"POST / HTTP/1.1\r\nHost: a\r\nContent-Length: abc\r\nTransfer-Encoding: chunked\r\n\r\n"
             ),
             Err(FramingError::LengthAndTransferEncoding)
+        );
+    }
+
+    /// H16: `str::trim` strips Unicode whitespace, so NBSP (`C2 A0`), NEL
+    /// (`C2 85`) and IDEOGRAPHIC SPACE (`E3 80 80`) padding used to vanish and
+    /// `chunked<NBSP>` framed the body as chunked while a proxy that trims only
+    /// SP/HTAB saw an unknown coding. Every such value must now be rejected.
+    #[test]
+    fn rejects_unicode_whitespace_around_transfer_encoding() {
+        for raw in [
+            &b"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\xC2\xA0\r\n\r\n"[..],
+            b"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\xC2\x85\r\n\r\n",
+            b"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: \xE3\x80\x80chunked\r\n\r\n",
+            b"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: gzip,\xC2\xA0chunked\r\n\r\n",
+        ] {
+            let head = parse_head(&Bytes::copy_from_slice(raw), &Limits::default())
+                .expect("httparse admits obs-text")
+                .expect("complete")
+                .0;
+            let got = decide(&head, &Limits::default());
+            assert!(
+                got.is_err(),
+                "{:?} -> {got:?}",
+                String::from_utf8_lossy(raw)
+            );
+            assert_ne!(got, Ok(BodyKind::Chunked));
+        }
+    }
+
+    #[test]
+    fn rejects_unicode_whitespace_around_content_length() {
+        for raw in [
+            &b"POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 5\xC2\xA0\r\n\r\n"[..],
+            b"POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 5\xC2\x85\r\n\r\n",
+            b"POST / HTTP/1.1\r\nHost: a\r\nContent-Length: \xE3\x80\x805\r\n\r\n",
+            b"POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 5,\xC2\xA05\r\n\r\n",
+        ] {
+            let head = parse_head(&Bytes::copy_from_slice(raw), &Limits::default())
+                .expect("httparse admits obs-text")
+                .expect("complete")
+                .0;
+            assert_eq!(
+                decide(&head, &Limits::default()),
+                Err(FramingError::InvalidContentLength),
+                "{:?}",
+                String::from_utf8_lossy(raw)
+            );
+        }
+    }
+
+    /// Only SP and HTAB are optional whitespace around list elements.
+    #[test]
+    fn ows_around_list_elements_is_still_accepted() {
+        assert_eq!(
+            decide_raw(b"POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 5 ,\t5\r\n\r\n"),
+            Ok(BodyKind::Length(5))
+        );
+        assert_eq!(
+            decide_raw(b"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: ,\tchunked \r\n\r\n"),
+            Ok(BodyKind::Chunked)
+        );
+        assert_eq!(trim_ows(b" \t a \t"), b"a");
+        assert_eq!(trim_ows(b"\x0ca\x0c"), b"\x0ca\x0c", "FF is not OWS");
+        assert_eq!(trim_ows(b"   "), b"");
+    }
+
+    #[test]
+    fn content_length_overflow_is_rejected() {
+        assert_eq!(
+            decide_raw(
+                b"POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 18446744073709551616\r\n\r\n"
+            ),
+            Err(FramingError::InvalidContentLength)
         );
     }
 

@@ -131,6 +131,11 @@ pub struct Config {
     /// Pin each worker to a core.
     pub pin_cores: bool,
     /// Value for the `Server` field, or none to omit it.
+    ///
+    /// `None` by default: a `Server` field only fingerprints the implementation
+    /// (and its version, if you put one there) for an attacker. Set it with
+    /// [`Config::server_name`] when you want one. A value that is not a valid
+    /// field value (CR, LF, NUL) is dropped at write time.
     pub server_name: Option<Bytes>,
     /// How long to let in-flight connections finish after a shutdown signal.
     pub shutdown_grace: Duration,
@@ -194,7 +199,7 @@ impl Config {
         self
     }
 
-    /// Set the `Server` field value.
+    /// Set the `Server` field value. Omitted unless this is called.
     pub fn server_name(mut self, name: Bytes) -> Self {
         self.server_name = Some(name);
         self

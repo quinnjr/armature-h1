@@ -7,6 +7,26 @@ and this crate adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.h
 
 ## [Unreleased]
 
+### Security
+
+- `Transfer-Encoding` and `Content-Length` are now parsed as bytes and trimmed of
+  RFC 9110 optional whitespace (SP/HTAB) only. `str::trim` previously stripped
+  Unicode whitespace, so `chunked\xC2\xA0` framed a body as chunked and
+  `5\xC2\xA0` as five bytes while a proxy trimming only SP/HTAB disagreed — a
+  request-smuggling vector. Any non-ASCII byte in either field is now rejected
+  with 400. `Connection` tokens and the response-side `Transfer-Encoding` check
+  use the same byte-level reading.
+
+### Changed
+
+- Documented that no `Server` field is emitted unless `Config::server_name` is
+  set (this was already the default; it is now pinned by a test).
+
+### Fixed
+
+- The `backend_differential` fuzz target compiles again against the
+  six-argument `serve_connection`.
+
 ## [0.3.1] - 2026-09-15
 
 ### Security
