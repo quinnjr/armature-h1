@@ -7,6 +7,40 @@ and this crate adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.h
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-10-17
+
+### Security
+
+- `BACKENDS.md` now documents that the `hyper-backend` serves a request carrying both `Content-Length` and `Transfer-Encoding: chunked` as chunked and then closes the connection, where the native backend refuses it with `400`; new conformance tests pin both behaviours (the existing test's body was also an invalid chunk, so it passed on hyper by accident).
+- `Transfer-Encoding` and `Content-Length` are now parsed as bytes and trimmed of
+  RFC 9110 optional whitespace (SP/HTAB) only. `str::trim` previously stripped
+  Unicode whitespace, so `chunked\xC2\xA0` framed a body as chunked and
+  `5\xC2\xA0` as five bytes while a proxy trimming only SP/HTAB disagreed — a
+  request-smuggling vector. Any non-ASCII byte in either field is now rejected
+  with 400. `Connection` tokens and the response-side `Transfer-Encoding` check
+  use the same byte-level reading.
+- Per-worker connection cap (see Added): a flood of idle connections can no
+  longer exhaust a worker's memory and file descriptors.
+
+### Added
+
+- `HYPER_BACKEND`: whether the build uses the `hyper-backend` feature, so dependents can tell which backend's documented behaviour applies.
+- `Limits::max_connections` (default `limits::DEFAULT_MAX_CONNECTIONS_PER_WORKER`,
+  10 000): a per-worker cap on open connections. At the cap a worker stops
+  accepting until one closes, leaving new connections in the listen backlog.
+  **Breaking** for exhaustive `Limits { .. }` literals — add
+  `..Limits::default()`.
+
+### Changed
+
+- Documented that no `Server` field is emitted unless `Config::server_name` is
+  set (this was already the default; it is now pinned by a test).
+
+### Fixed
+
+- The `backend_differential` fuzz target compiles again against the
+  six-argument `serve_connection`.
+
 ## [0.3.1] - 2026-09-15
 
 ### Security

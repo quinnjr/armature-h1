@@ -135,10 +135,12 @@ impl Head {
     /// Whether `Connection` carries `token`, compared case-insensitively
     /// against each comma-separated element.
     pub fn connection_has_token(&self, token: &str) -> bool {
+        // Byte-level, OWS-only trimming: `str::trim` would also strip Unicode
+        // whitespace and read `close\xC2\xA0` as `close`, disagreeing with
+        // every other hop on the connection's fate.
         self.all(&HeaderId::Connection).any(|v| {
-            std::str::from_utf8(v)
-                .map(|s| s.split(',').any(|t| t.trim().eq_ignore_ascii_case(token)))
-                .unwrap_or(false)
+            v.split(|&b| b == b',')
+                .any(|t| crate::framing::trim_ows(t).eq_ignore_ascii_case(token.as_bytes()))
         })
     }
 
@@ -169,6 +171,25 @@ mod tests {
             Version::Http11,
             HeaderVec::new(),
         )
+    }
+
+    fn with_connection(value: &'static [u8]) -> Head {
+        let mut v = HeaderVec::new();
+        v.push((
+            crate::header::HeaderId::Connection,
+            bytes::Bytes::from_static(value),
+        ));
+        Head::new(Method::Get, ByteStr::from_static("/"), Version::Http11, v)
+    }
+
+    /// Only SP/HTAB is trimmed around `Connection` tokens; Unicode whitespace
+    /// (NBSP `C2 A0`, NEL `C2 85`) makes the token not match.
+    #[test]
+    fn connection_tokens_trim_only_ascii_ows() {
+        assert!(with_connection(b" keep-alive ,\tClose ").connection_has_token("close"));
+        assert!(!with_connection(b"close\xC2\xA0").connection_has_token("close"));
+        assert!(!with_connection(b"\xC2\x85close").connection_has_token("close"));
+        assert!(!with_connection(b"close\xE3\x80\x80").connection_has_token("close"));
     }
 
     #[test]

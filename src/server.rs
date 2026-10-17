@@ -131,6 +131,11 @@ pub struct Config {
     /// Pin each worker to a core.
     pub pin_cores: bool,
     /// Value for the `Server` field, or none to omit it.
+    ///
+    /// `None` by default: a `Server` field only fingerprints the implementation
+    /// (and its version, if you put one there) for an attacker. Set it with
+    /// [`Config::server_name`] when you want one. A value that is not a valid
+    /// field value (CR, LF, NUL) is dropped at write time.
     pub server_name: Option<Bytes>,
     /// How long to let in-flight connections finish after a shutdown signal.
     pub shutdown_grace: Duration,
@@ -194,7 +199,7 @@ impl Config {
         self
     }
 
-    /// Set the `Server` field value.
+    /// Set the `Server` field value. Omitted unless this is called.
     pub fn server_name(mut self, name: Bytes) -> Self {
         self.server_name = Some(name);
         self
@@ -683,6 +688,13 @@ async fn worker_loop<F, S, G, H, U, C>(
 
     let local = tokio::task::LocalSet::new();
 
+    // Per-worker connection cap. Thread-local state, so a `Cell` and a
+    // `Notify` suffice: each connection task decrements on exit and wakes the
+    // accept loop if it was parked at the cap.
+    let max_connections = cfg.limits.max_connections.max(1);
+    let open = Rc::new(std::cell::Cell::new(0usize));
+    let slot_freed = Rc::new(tokio::sync::Notify::new());
+
     local
         .run_until(async {
             loop {
@@ -695,6 +707,19 @@ async fn worker_loop<F, S, G, H, U, C>(
                 // this worker is parked in `select!`.
                 if *rx.borrow() {
                     break;
+                }
+                if open.get() >= max_connections {
+                    // At the cap: do not accept until a connection closes (or
+                    // shutdown). New connections wait in the listen backlog.
+                    tokio::select! {
+                        changed = rx.changed() => {
+                            if changed.is_err() || *rx.borrow() {
+                                break;
+                            }
+                        }
+                        _ = slot_freed.notified() => {}
+                    }
+                    continue;
                 }
                 tokio::select! {
                     changed = rx.changed() => {
@@ -753,7 +778,15 @@ async fn worker_loop<F, S, G, H, U, C>(
                             let _ = stream.set_nodelay(true);
                         }
                         let ctx = ctx.clone();
+                        open.set(open.get() + 1);
+                        let slot = ConnSlot {
+                            open: open.clone(),
+                            freed: slot_freed.clone(),
+                        };
                         tokio::task::spawn_local(async move {
+                            // Held for the task's life; released on drop,
+                            // including when the drain timeout cancels it.
+                            let _slot = slot;
                             dispatch(stream, ctx, peer).await;
                         });
                     }
@@ -764,6 +797,19 @@ async fn worker_loop<F, S, G, H, U, C>(
 
     // Drain: give in-flight connections a bounded window to finish.
     let _ = tokio::time::timeout(cfg.shutdown_grace, local).await;
+}
+
+/// One open connection's claim on its worker's [`Limits::max_connections`].
+struct ConnSlot {
+    open: Rc<std::cell::Cell<usize>>,
+    freed: Rc<tokio::sync::Notify>,
+}
+
+impl Drop for ConnSlot {
+    fn drop(&mut self) {
+        self.open.set(self.open.get().saturating_sub(1));
+        self.freed.notify_one();
+    }
 }
 
 /// Everything one worker holds for the lifetime of the thread.
@@ -1174,6 +1220,61 @@ mod tests {
             client.join().unwrap(),
             "no request may be served after shutdown"
         );
+    }
+
+    /// A worker at `Limits::max_connections` leaves the next connection in
+    /// the backlog until one of its open connections closes.
+    #[test]
+    fn connection_cap_defers_accepts_until_a_slot_frees() {
+        let limits = Limits {
+            idle_timeout: Duration::from_secs(5),
+            header_timeout: Duration::from_secs(5),
+            max_connections: 1,
+            ..Default::default()
+        };
+        let cfg = Config::new(loopback())
+            .workers(1)
+            .limits(limits)
+            .pin_cores(false);
+        let server = Server::bind(cfg).expect("bind");
+        let addr = server.local_addr();
+        let handle = server.handle();
+
+        let client = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let out = rt.block_on(async move {
+                // Hold the only slot with an unfinished head.
+                let mut holder = tokio::net::TcpStream::connect(addr).await.unwrap();
+                holder.write_all(b"GET / HTTP/1.1\r\n").await.unwrap();
+                tokio::time::sleep(Duration::from_millis(100)).await;
+
+                let mut second = tokio::net::TcpStream::connect(addr).await.unwrap();
+                second.write_all(GET).await.unwrap();
+                let mut buf = [0u8; 64];
+                let blocked =
+                    tokio::time::timeout(Duration::from_millis(300), second.read(&mut buf))
+                        .await
+                        .is_err();
+
+                drop(holder);
+                let mut out = Vec::new();
+                tokio::time::timeout(Duration::from_secs(3), second.read_to_end(&mut out))
+                    .await
+                    .expect("served once the slot frees")
+                    .unwrap();
+                (blocked, String::from_utf8_lossy(&out).into_owned())
+            });
+            handle.shutdown();
+            out
+        });
+
+        server.serve(|| hello).expect("serve");
+        let (blocked, out) = client.join().unwrap();
+        assert!(blocked, "the second connection must wait while at the cap");
+        assert!(out.starts_with("HTTP/1.1 200 OK"), "{out}");
     }
 
     /// A shutdown signalled before `serve` runs must still be honoured.

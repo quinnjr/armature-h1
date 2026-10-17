@@ -44,6 +44,12 @@ pub struct Limits {
     pub idle_timeout: Duration,
     /// Deadline for a response write to complete.
     pub write_timeout: Duration,
+    /// Maximum open connections per worker. Once a worker holds this many it
+    /// stops accepting until one closes, leaving new connections in the
+    /// kernel's listen backlog instead of spending memory and file
+    /// descriptors on sockets it cannot serve. With `n` workers the server as
+    /// a whole holds at most `n * max_connections`. `0` is treated as `1`.
+    pub max_connections: usize,
 }
 
 impl Limits {
@@ -76,9 +82,13 @@ impl Default for Limits {
             body_timeout: Duration::from_secs(30),
             idle_timeout: Duration::from_secs(75),
             write_timeout: Duration::from_secs(30),
+            max_connections: DEFAULT_MAX_CONNECTIONS_PER_WORKER,
         }
     }
 }
+
+/// Default for [`Limits::max_connections`].
+pub const DEFAULT_MAX_CONNECTIONS_PER_WORKER: usize = 10_000;
 
 #[cfg(test)]
 mod tests {
@@ -94,6 +104,7 @@ mod tests {
         assert_eq!(l.body_timeout, Duration::from_secs(30));
         assert_eq!(l.idle_timeout, Duration::from_secs(75));
         assert_eq!(l.write_timeout, Duration::from_secs(30));
+        assert_eq!(l.max_connections, DEFAULT_MAX_CONNECTIONS_PER_WORKER);
     }
 
     /// `max_headers` must not exceed the fixed httparse scratch array in

@@ -301,10 +301,7 @@ where
     // Both halves run in one task: neither future is `Send`, and the connection
     // is driven only while the client is also being polled, which is exactly the
     // interleaving a real peer produces.
-    let (result, out) = tokio::join!(
-        tokio::time::timeout(Duration::from_secs(2), conn),
-        exchange
-    );
+    let (result, out) = tokio::join!(tokio::time::timeout(Duration::from_secs(2), conn), exchange);
     let _ = result;
     out
 }
@@ -335,6 +332,7 @@ fn hyper(data: &[u8]) -> Vec<u8> {
                 cfg(),
                 Rc::new(RefCell::new(DateCache::new())),
                 Bytes::new(),
+                None,
             )
         }))
     })
@@ -430,12 +428,8 @@ fuzz_target!(|data: &[u8]| {
     // stops meaning anything. What survives the guard is the case worth having:
     // native walked the stream cleanly and stopped, and hyper found another
     // request in the same bytes.
-    let finals = |v: &[Resp]| -> Vec<u16> {
-        v.iter()
-            .map(|r| r.status)
-            .filter(|s| *s >= 200)
-            .collect()
-    };
+    let finals =
+        |v: &[Resp]| -> Vec<u16> { v.iter().map(|r| r.status).filter(|s| *s >= 200).collect() };
     let (nf, hf) = (finals(&n), finals(&h));
     if nf.iter().all(|s| *s == 200) && hf.iter().all(|s| *s == 200) && hf.len() > nf.len() {
         panic!(
