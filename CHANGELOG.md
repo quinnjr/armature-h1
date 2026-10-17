@@ -9,6 +9,7 @@ and this crate adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.h
 
 ### Security
 
+- `BACKENDS.md` now documents that the `hyper-backend` serves a request carrying both `Content-Length` and `Transfer-Encoding: chunked` as chunked and then closes the connection, where the native backend refuses it with `400`; new conformance tests pin both behaviours (the existing test's body was also an invalid chunk, so it passed on hyper by accident).
 - `Transfer-Encoding` and `Content-Length` are now parsed as bytes and trimmed of
   RFC 9110 optional whitespace (SP/HTAB) only. `str::trim` previously stripped
   Unicode whitespace, so `chunked\xC2\xA0` framed a body as chunked and
@@ -21,6 +22,7 @@ and this crate adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.h
 
 ### Added
 
+- `HYPER_BACKEND`: whether the build uses the `hyper-backend` feature, so dependents can tell which backend's documented behaviour applies.
 - `Limits::max_connections` (default `limits::DEFAULT_MAX_CONNECTIONS_PER_WORKER`,
   10 000): a per-worker cap on open connections. At the cap a worker stops
   accepting until one closes, leaving new connections in the listen backlog.
