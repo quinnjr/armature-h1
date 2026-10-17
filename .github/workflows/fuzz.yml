@@ -5,6 +5,9 @@ on:
     branches: [main, develop]
   pull_request:
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -17,14 +20,17 @@ jobs:
       matrix:
         target: [parse_head, chunked, framing_differential]
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
       # cargo-fuzz needs nightly: the sanitizer and coverage instrumentation
       # libFuzzer relies on are nightly-only. `clippy` is requested explicitly
       # because this action installs the minimal profile, which omits it.
-      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           components: clippy
-      - uses: Swatinem/rust-cache@v2
+          toolchain: nightly
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: fuzz
       - run: cargo install cargo-fuzz --locked
@@ -38,7 +44,7 @@ jobs:
       # input is all that survives the runner, and re-finding it costs a run.
       - name: Upload crash artifacts
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: fuzz-artifacts-${{ matrix.target }}
           path: fuzz/artifacts/
@@ -54,11 +60,14 @@ jobs:
     name: fuzz backend_differential
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           components: clippy
-      - uses: Swatinem/rust-cache@v2
+          toolchain: nightly
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: fuzz
       - run: cargo install cargo-fuzz --locked
@@ -72,7 +81,7 @@ jobs:
         run: cargo fuzz run backend_differential --features hyper-backend -- -max_total_time=300 -print_final_stats=1
       - name: Upload crash artifacts
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: fuzz-artifacts-backend_differential
           path: fuzz/artifacts/

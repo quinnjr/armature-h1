@@ -113,59 +113,59 @@ fn theirs(data: &[u8], limits: &Limits) -> Verdict {
     let outcome = RUNTIME.with(|rt| {
         rt.borrow_mut().block_on(async {
             let (mut client, server) = tokio::io::duplex(64 << 10);
-        let io = hyper_util::rt::TokioIo::new(server);
+            let io = hyper_util::rt::TokioIo::new(server);
 
-        let seen2 = seen.clone();
-        let chunked2 = chunked.clone();
-        let svc = service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
-            let seen = seen2.clone();
-            let chunked = chunked2.clone();
-            async move {
-                let te_chunked = req
-                    .headers()
-                    .get(hyper::header::TRANSFER_ENCODING)
-                    .is_some();
-                *chunked.lock().expect("lock") = te_chunked;
-                let verdict = match req.into_body().collect().await {
-                    Ok(collected) => {
-                        let n = collected.to_bytes().len() as u64;
-                        if te_chunked {
-                            Verdict::AcceptedChunked(n)
-                        } else {
-                            Verdict::Accepted(n)
+            let seen2 = seen.clone();
+            let chunked2 = chunked.clone();
+            let svc = service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
+                let seen = seen2.clone();
+                let chunked = chunked2.clone();
+                async move {
+                    let te_chunked = req
+                        .headers()
+                        .get(hyper::header::TRANSFER_ENCODING)
+                        .is_some();
+                    *chunked.lock().expect("lock") = te_chunked;
+                    let verdict = match req.into_body().collect().await {
+                        Ok(collected) => {
+                            let n = collected.to_bytes().len() as u64;
+                            if te_chunked {
+                                Verdict::AcceptedChunked(n)
+                            } else {
+                                Verdict::Accepted(n)
+                            }
                         }
-                    }
-                    // A body that fails mid-read is a rejection: hyper decided the
-                    // framing was not what the head claimed.
-                    Err(_) => Verdict::Rejected,
-                };
-                *seen.lock().expect("lock") = Some(verdict);
-                Ok::<_, std::convert::Infallible>(hyper::Response::new(http_body_util::Full::new(
-                    bytes::Bytes::new(),
-                )))
-            }
-        });
+                        // A body that fails mid-read is a rejection: hyper decided the
+                        // framing was not what the head claimed.
+                        Err(_) => Verdict::Rejected,
+                    };
+                    *seen.lock().expect("lock") = Some(verdict);
+                    Ok::<_, std::convert::Infallible>(hyper::Response::new(
+                        http_body_util::Full::new(bytes::Bytes::new()),
+                    ))
+                }
+            });
 
-        let mut builder = hyper::server::conn::http1::Builder::new();
-        builder
-            .max_headers(limits.max_headers)
-            .header_read_timeout(None);
+            let mut builder = hyper::server::conn::http1::Builder::new();
+            builder
+                .max_headers(limits.max_headers)
+                .header_read_timeout(None);
 
-        let conn = builder.serve_connection(io, svc);
+            let conn = builder.serve_connection(io, svc);
 
-        let write = async {
-            use tokio::io::AsyncWriteExt;
-            let _ = client.write_all(data).await;
-            let _ = client.flush().await;
-            // Half-close so hyper sees the end of input rather than waiting.
-            let _ = client.shutdown().await;
-        };
+            let write = async {
+                use tokio::io::AsyncWriteExt;
+                let _ = client.write_all(data).await;
+                let _ = client.flush().await;
+                // Half-close so hyper sees the end of input rather than waiting.
+                let _ = client.shutdown().await;
+            };
 
-        let (result, _) = tokio::join!(
-            tokio::time::timeout(std::time::Duration::from_secs(2), conn),
-            write
-        );
-        result
+            let (result, _) = tokio::join!(
+                tokio::time::timeout(std::time::Duration::from_secs(2), conn),
+                write
+            );
+            result
         })
     });
 

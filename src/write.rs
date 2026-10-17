@@ -277,13 +277,15 @@ pub(crate) fn parse_len(v: &Bytes) -> Option<u64> {
 /// not disagree about what "chunked" means.
 #[inline]
 fn te_frames_chunked(v: &Bytes) -> bool {
-    let Ok(s) = std::str::from_utf8(v) else {
+    // Bytes and OWS-only trimming, exactly as `framing::decide` reads it: a
+    // Unicode-aware `str::trim` would read `chunked\xC2\xA0` as chunked.
+    if !v.is_ascii() {
         return false;
-    };
-    s.split(',')
-        .map(str::trim)
+    }
+    v.split(|&b| b == b',')
+        .map(crate::framing::trim_ows)
         .rfind(|c| !c.is_empty())
-        .is_some_and(|c| c.eq_ignore_ascii_case("chunked"))
+        .is_some_and(|c| c.eq_ignore_ascii_case(b"chunked"))
 }
 
 /// Serialize a status line and header section into `out`.
@@ -724,6 +726,18 @@ mod tests {
             "{got}"
         );
         assert!(!got.contains("content-length"), "{got}");
+    }
+
+    /// The response side reads `Transfer-Encoding` exactly as the request side
+    /// does: OWS is SP/HTAB only, and non-ASCII never means chunked.
+    #[test]
+    fn te_frames_chunked_trims_only_ascii_ows() {
+        assert!(te_frames_chunked(&Bytes::from_static(b"gzip ,\tchunked ")));
+        assert!(!te_frames_chunked(&Bytes::from_static(b"chunked\xC2\xA0")));
+        assert!(!te_frames_chunked(&Bytes::from_static(b"\xC2\x85chunked")));
+        assert!(!te_frames_chunked(&Bytes::from_static(
+            b"chunked\xE3\x80\x80"
+        )));
     }
 
     /// RFC 9110 section 15.4.5: a 304 may carry the `Content-Length` the full

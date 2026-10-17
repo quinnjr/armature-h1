@@ -1210,6 +1210,20 @@ mod tests {
         assert!(out.starts_with("HTTP/1.1 431"), "{out}");
     }
 
+    /// No `Server` field unless one is configured: it only fingerprints the
+    /// implementation for an attacker.
+    #[tokio::test]
+    async fn server_field_is_omitted_by_default() {
+        let out = exchange(
+            b"GET / HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n",
+            ok_service,
+            Limits::default(),
+        )
+        .await;
+        assert!(out.starts_with("HTTP/1.1 200"), "{out}");
+        assert!(!out.to_ascii_lowercase().contains("\r\nserver:"), "{out}");
+    }
+
     #[tokio::test]
     async fn server_name_is_emitted_when_configured() {
         let (mut client, server) = tokio::io::duplex(4096);

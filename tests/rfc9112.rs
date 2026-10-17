@@ -169,6 +169,53 @@ fn content_length_and_transfer_encoding_400_close() {
     .assert_rejected_and_closed(400);
 }
 
+/// The same ambiguity with a *well-formed* chunked body. The test above only
+/// sends `hello`, which is also an invalid chunk, so it cannot tell "refused
+/// the ambiguous framing" apart from "framed as chunked, then failed to
+/// decode"; this one can.
+#[test]
+#[cfg_attr(
+    feature = "hyper-backend",
+    ignore = "see BACKENDS.md: Content-Length together with Transfer-Encoding \
+              (hyper drops Content-Length and frames the body as chunked)"
+)]
+fn content_length_and_valid_chunked_body_400_close() {
+    raw_exchange(
+        b"POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+    )
+    .assert_rejected_and_closed(400);
+}
+
+/// Positive twin for the hyper backend: BACKENDS.md documents hyper serving
+/// the request as chunked (RFC 9112 section 6.3 permits this) and then
+/// closing the connection, so no bytes after the chunked body can be read as
+/// a second request on this hop. A hyper version that stops closing, or
+/// starts rejecting, should fail the build rather than pass silently.
+#[test]
+#[cfg(feature = "hyper-backend")]
+fn hyper_content_length_and_transfer_encoding_served_chunked_then_closed() {
+    let exchange = raw_exchange(
+        b"POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\nGET /smuggled HTTP/1.1\r\nHost: a\r\n\r\n",
+    );
+    assert_eq!(exchange.status(), Some(200), "{:?}", exchange.body);
+    assert!(
+        exchange.closed,
+        "the connection must close: {:?}",
+        exchange.body
+    );
+    assert!(
+        exchange.body.contains("connection: close"),
+        "the close must be advertised: {:?}",
+        exchange.body
+    );
+    assert_eq!(
+        exchange.body.matches("HTTP/1.1 ").count(),
+        1,
+        "the bytes after the chunked body must not be served as a request: {:?}",
+        exchange.body
+    );
+}
+
 #[test]
 fn conflicting_content_length_400_close() {
     raw_exchange(

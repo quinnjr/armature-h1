@@ -47,6 +47,14 @@ pub mod service;
 pub mod tls;
 pub mod write;
 
+/// Whether this build serves connections with the `hyper-backend` feature.
+///
+/// Because the feature is non-additive and unified across the whole build,
+/// a dependent crate cannot see it through its own `cfg`; this constant lets
+/// it (and its tests) tell which backend's documented behaviour in
+/// `BACKENDS.md` applies.
+pub const HYPER_BACKEND: bool = cfg!(feature = "hyper-backend");
+
 pub use backend::serve_connection;
 pub use bytestr::ByteStr;
 pub use chunked::{ChunkEvent, ChunkedDecoder, ChunkedError};
