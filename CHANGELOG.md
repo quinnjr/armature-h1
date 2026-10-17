@@ -7,6 +7,8 @@ and this crate adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.h
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-10-17
+
 ### Security
 
 - `BACKENDS.md` now documents that the `hyper-backend` serves a request carrying both `Content-Length` and `Transfer-Encoding: chunked` as chunked and then closes the connection, where the native backend refuses it with `400`; new conformance tests pin both behaviours (the existing test's body was also an invalid chunk, so it passed on hyper by accident).
