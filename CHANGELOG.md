@@ -16,6 +16,16 @@ and this crate adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.h
   request-smuggling vector. Any non-ASCII byte in either field is now rejected
   with 400. `Connection` tokens and the response-side `Transfer-Encoding` check
   use the same byte-level reading.
+- Per-worker connection cap (see Added): a flood of idle connections can no
+  longer exhaust a worker's memory and file descriptors.
+
+### Added
+
+- `Limits::max_connections` (default `limits::DEFAULT_MAX_CONNECTIONS_PER_WORKER`,
+  10 000): a per-worker cap on open connections. At the cap a worker stops
+  accepting until one closes, leaving new connections in the listen backlog.
+  **Breaking** for exhaustive `Limits { .. }` literals — add
+  `..Limits::default()`.
 
 ### Changed
 
