@@ -922,13 +922,17 @@ async fn peek_preface(
     cfg: &Config,
 ) -> Option<(tokio::net::TcpStream, Bytes, Preface)> {
     let mut buf = BytesMut::with_capacity(crate::tls::H2C_PREFACE.len());
+    // One deadline for the whole preface, not one per read: re-arming per read
+    // let a peer dribble a matching byte every `header_timeout` and hold the
+    // connection slot for 24 of them.
+    let deadline = tokio::time::Instant::now() + cfg.limits.header_timeout;
     loop {
         match is_h2c_preface(&buf) {
             Preface::NeedMore => {}
             decided => return Some((stream, buf.freeze(), decided)),
         }
-        let deadline = tokio::time::timeout(cfg.limits.header_timeout, stream.read_buf(&mut buf));
-        match deadline.await {
+        let read = tokio::time::timeout_at(deadline, stream.read_buf(&mut buf));
+        match read.await {
             Ok(Ok(0)) => {
                 // EOF mid-prefix: let the HTTP/1 path deal with it.
                 return Some((stream, buf.freeze(), Preface::Http1));
@@ -1555,5 +1559,40 @@ mod tests {
                 assert_eq!(l.local_addr().unwrap().port(), addr.port());
             }
         }
+    }
+
+    /// The preface sniff has one deadline for all of it. A peer that keeps
+    /// sending matching bytes just inside a per-read timeout must still be cut
+    /// off once `header_timeout` has passed in total.
+    #[tokio::test]
+    async fn a_dribbled_preface_is_bounded_by_one_header_timeout() {
+        let listener = tokio::net::TcpListener::bind(loopback()).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let dribble = tokio::spawn(async move {
+            let mut c = tokio::net::TcpStream::connect(addr).await.unwrap();
+            for b in crate::tls::H2C_PREFACE {
+                if c.write_all(&[*b]).await.is_err() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(60)).await;
+            }
+        });
+        let (stream, _) = listener.accept().await.unwrap();
+        let cfg = Config::new(loopback()).limits(Limits {
+            header_timeout: Duration::from_millis(200),
+            ..Default::default()
+        });
+        let started = std::time::Instant::now();
+        let got = peek_preface(stream, &cfg).await;
+        assert!(
+            got.is_none(),
+            "an undecided preface past the deadline is dropped"
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(600),
+            "took {:?}: the deadline was re-armed per read",
+            started.elapsed()
+        );
+        dribble.abort();
     }
 }
