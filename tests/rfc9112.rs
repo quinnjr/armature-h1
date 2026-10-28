@@ -920,3 +920,65 @@ fn a_handler_sitting_on_an_unread_body_still_gets_408() {
     );
     ex.assert_rejected_and_closed(408);
 }
+
+/// Echo what the handler saw as the path and authority.
+fn route_echo()
+-> impl Fn() -> fn(Request) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response>>>
++ Send
++ Clone
++ 'static {
+    || {
+        fn handle(req: Request) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response>>> {
+            let seen = format!(
+                "{} {}",
+                req.head.path(),
+                req.head.authority().unwrap_or("-")
+            );
+            Box::pin(async move {
+                let mut r = Response::new(200);
+                r.body = armature_h1::ResponseBody::Full(seen.into());
+                r
+            })
+        }
+        handle
+    }
+}
+
+/// RFC 9112 section 3.2.2: an absolute-form target routes on its path, and
+/// its authority is the request's.
+#[test]
+fn absolute_form_routes_on_its_path_component() {
+    let ex = raw_exchange_with_service(
+        quick_limits(),
+        route_echo(),
+        vec![b"GET http://a.example/admin?x=1 HTTP/1.1\r\nHost: a.example\r\nConnection: close\r\n\r\n".to_vec()],
+        Duration::ZERO,
+    );
+    assert_eq!(ex.status(), Some(200), "{:?}", ex.body);
+    assert!(ex.body.ends_with("/admin a.example"), "{:?}", ex.body);
+}
+
+/// A `Host` that names another authority than the target is refused, not
+/// resolved silently in favor of either.
+#[test]
+fn absolute_form_with_a_disagreeing_host_400_close() {
+    raw_exchange(b"GET http://a.example/ HTTP/1.1\r\nHost: b.example\r\n\r\n")
+        .assert_rejected_and_closed(400);
+}
+
+#[test]
+fn absolute_form_with_userinfo_400_close() {
+    raw_exchange(b"GET http://trusted@evil.example/ HTTP/1.1\r\nHost: evil.example\r\n\r\n")
+        .assert_rejected_and_closed(400);
+}
+
+#[test]
+fn absolute_form_with_a_non_http_scheme_400_close() {
+    raw_exchange(b"GET ftp://a.example/ HTTP/1.1\r\nHost: a.example\r\n\r\n")
+        .assert_rejected_and_closed(400);
+}
+
+#[test]
+fn malformed_host_400_close() {
+    raw_exchange(b"GET / HTTP/1.1\r\nHost: user@a.example\r\n\r\n").assert_rejected_and_closed(400);
+}
