@@ -785,6 +785,12 @@ impl Balance {
     /// connections than it; otherwise `me`.
     fn pick(&self, me: usize, rng: &std::cell::Cell<u64>) -> usize {
         let mine = self.count(me);
+        // No worker can be `HANDOFF_MARGIN` below this one: the answer is
+        // known without touching anyone else's cache line — which on a lightly
+        // loaded server is most accepts.
+        if mine < HANDOFF_MARGIN {
+            return me;
+        }
         let mut best = me;
         let mut best_open = mine;
         let mut consider = |i: usize| {

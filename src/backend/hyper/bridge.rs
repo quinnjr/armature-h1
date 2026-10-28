@@ -192,9 +192,7 @@ impl<S: H1Service + 'static>
             // the same case (`write::write_head`, Http10 + keep_alive).
             let keep_alive = head.is_keep_alive();
 
-            // The clock's flag rather than a fresh one: the watchdog reads it to
-            // tell a stalled body from a slow handler.
-            let fully_read = phase.request_body_read();
+            let fully_read = Rc::new(Cell::new(false));
             let trailers_slot = Rc::new(RefCell::new(None));
             let body_io: Rc<RefCell<dyn crate::service::BodyIo>> = Rc::new(RefCell::new(
                 HyperBodyIo::new(incoming, trailers_slot.clone())
@@ -397,11 +395,16 @@ fn convert_response(
     // intermediary that honours the field then waits for a body that never
     // comes: a keep-alive desync reached through a backend divergence.
     //
-    // A `HEAD` response is exempt on the same grounds, as natively: its length
-    // describes the body a `GET` would have had (RFC 9110 section 9.3.2), and
-    // hyper never writes a body for it.
-    let check_content_length =
-        !(crate::write::content_length_is_descriptive(status.as_u16()) || head_request);
+    // The rule itself is `write::handler_length_is_stale`, shared with the
+    // native writer so the two cannot drift. The bridge always drops a
+    // handler `Transfer-Encoding` (below), so no length here ever competes
+    // with one.
+    let length_instances = headers
+        .iter()
+        .filter(|(id, v)| {
+            *id == HeaderId::ContentLength && ::hyper::http::HeaderValue::from_bytes(v).is_ok()
+        })
+        .count();
 
     // hyper writes the status line — and picks its framing — from the
     // response's version, so it has to carry the request's.
@@ -422,9 +425,15 @@ fn convert_response(
         // `content-length: abc` through on a stream body — the one combination
         // where hyper has neither a length of its own to fall back on nor a
         // reason to trust the field.
-        if check_content_length
-            && id == HeaderId::ContentLength
-            && (expected_len.is_none() || crate::write::parse_len(&value) != expected_len)
+        if id == HeaderId::ContentLength
+            && crate::write::handler_length_is_stale(
+                &value,
+                length_instances,
+                status.as_u16(),
+                head_request,
+                expected_len,
+                false,
+            )
         {
             tracing::warn!("dropping response content-length that disagrees with the body length");
             continue;

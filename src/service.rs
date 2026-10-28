@@ -275,7 +275,7 @@ impl Body {
             BodyKind::Chunked => (0, Some(ChunkedDecoder::new(limits)), false),
         };
         fully_read.set(done);
-        Self {
+        let mut body = Self {
             state: BodyState {
                 kind,
                 buffered: Bytes::new(),
@@ -296,7 +296,14 @@ impl Body {
                 #[cfg(feature = "hyper-backend")]
                 trailers_slot: None,
             },
+        };
+        // A body that is finished before it is read — none, or an explicit
+        // zero length — says so through the same signal a read one does, so
+        // the connection has one flag to time it by.
+        if done {
+            body.state.notify_finished();
         }
+        body
     }
 
     /// A body whose transport already de-framed it (the hyper backend).
@@ -320,7 +327,7 @@ impl Body {
         // the native loop reuses the connection.
         let done = matches!(kind, BodyKind::None | BodyKind::Length(0));
         fully_read.set(done);
-        Self {
+        let mut body = Self {
             state: BodyState {
                 kind,
                 buffered: Bytes::new(),
@@ -337,7 +344,14 @@ impl Body {
                 cap: max_body_bytes,
                 trailers_slot: Some(trailers_slot),
             },
+        };
+        // A body that is finished before it is read — none, or an explicit
+        // zero length — says so through the same signal a read one does, so
+        // the connection has one flag to time it by.
+        if done {
+            body.state.notify_finished();
         }
+        body
     }
 
     /// A body over a fixed byte string, for tests and synthetic requests.
@@ -637,6 +651,9 @@ impl Body {
             let chunk = chunk?;
             total += chunk.len() as u64;
             if total > cap {
+                // Finished, if not read: the handler stops here, and the body
+                // deadline has nothing left to bound while it answers 413.
+                self.state.fail();
                 return Err(BodyError::TooLarge);
             }
             match (&mut acc, &first) {

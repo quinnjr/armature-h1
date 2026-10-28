@@ -193,6 +193,44 @@ fn write_connection_without_persistence(out: &mut BytesMut, value: &[u8]) {
     }
 }
 
+/// Whether a handler's `Content-Length` must be dropped rather than written.
+///
+/// The one rule both backends apply, so a handler's length reaches the wire
+/// under exactly the same conditions under either:
+///
+/// - more than one (`instances`) is never written: the response-side twin of
+///   the request ambiguity this crate refuses;
+/// - on a 304, and on a `HEAD` answered with a status that may carry one, the
+///   field describes the representation a `GET` would have had (RFC 9110
+///   sections 15.4.5 and 9.3.2), so only well-formedness matters — and never
+///   beside a `Transfer-Encoding` that will also be written
+///   (`competing_te`), since two framing fields on one message is what RFC
+///   9112 section 6.1 forbids, descriptive or not;
+/// - otherwise it must equal the length of the body actually written
+///   (`body_len`, `None` for a stream, which no length can agree with);
+/// - on a 1xx or a 204 it is never written at all, whatever its value: RFC
+///   9110 section 8.6 forbids the field there outright.
+pub(crate) fn handler_length_is_stale(
+    value: &Bytes,
+    instances: usize,
+    status: u16,
+    head_request: bool,
+    body_len: Option<u64>,
+    competing_te: bool,
+) -> bool {
+    // RFC 9110 section 8.6: never on a 1xx or a 204, whatever its value.
+    if instances > 1 || (forbids_body_framing(status) && !content_length_is_descriptive(status)) {
+        return true;
+    }
+    let descriptive =
+        content_length_is_descriptive(status) || (head_request && !forbids_body_framing(status));
+    if descriptive {
+        parse_len(value).is_none() || competing_te
+    } else {
+        body_len.is_none() || parse_len(value) != body_len
+    }
+}
+
 /// Whether `status` can stand as the final response to a request.
 ///
 /// Anything outside 200..=599 cannot: `1000` is not a status line a peer can
@@ -464,23 +502,18 @@ pub(crate) fn write_head_for(
     // malformed one. Shipping `content-length: abc` because the status is 304
     // hands the peer a field it must then guess about.
     let stale_content_length = handler_len.is_some_and(|v| {
-        len_count > 1
-            || if content_length_is_descriptive(resp.status) {
-                parse_len(v).is_none()
-            } else if head_request {
-                // Descriptive on a HEAD too, but never beside a handler
-                // `Transfer-Encoding` that will also be written: two framing
-                // fields on one message is what RFC 9112 section 6.1 forbids,
-                // descriptive or not. With one, the length goes, as on a GET.
-                parse_len(v).is_none() || (handler_te.is_some() && !stale_transfer_encoding)
-            } else {
-                match body {
-                    OutBody::Fixed(b) => parse_len(v) != Some(b.len() as u64),
-                    OutBody::None => parse_len(v) != Some(0),
-                    // A chunked body carries its own framing; a length cannot agree.
-                    OutBody::Chunked => true,
-                }
-            }
+        handler_length_is_stale(
+            v,
+            len_count,
+            resp.status,
+            head_request,
+            match body {
+                OutBody::Fixed(b) => Some(b.len() as u64),
+                OutBody::None => Some(0),
+                OutBody::Chunked => None,
+            },
+            handler_te.is_some() && !stale_transfer_encoding,
+        )
     });
 
     // Handler-supplied headers first, so the checks below can see them.
@@ -1035,8 +1068,31 @@ mod tests {
         assert!(got.starts_with("HTTP/1.0 200 OK\r\n"));
     }
 
-    /// Only the persistence tokens are the server's: `upgrade` beside them
-    /// survives, or a 101 would go out without `Connection: upgrade`.
+    /// RFC 9110 section 8.6: no `Content-Length` on a 204 or a 1xx, not even
+    /// a truthful `0`, and not on a HEAD either.
+    #[test]
+    fn a_204_never_carries_a_handler_content_length() {
+        for head_request in [false, true] {
+            let mut out = BytesMut::new();
+            write_head_for(
+                &mut out,
+                Version::Http11,
+                &head_of(204, &[(HeaderId::ContentLength, "0")]),
+                &OutBody::None,
+                EPOCH_DATE,
+                true,
+                head_request,
+            );
+            let got = String::from_utf8(out.to_vec())
+                .unwrap()
+                .to_ascii_lowercase();
+            assert!(
+                !got.contains("content-length"),
+                "head={head_request}: {got}"
+            );
+        }
+    }
+
     /// A HEAD response may keep a descriptive length, but never beside a
     /// handler `Transfer-Encoding` that frames it too.
     #[test]
@@ -1064,6 +1120,8 @@ mod tests {
         assert!(!got.contains("content-length"), "{got}");
     }
 
+    /// Only the persistence tokens are the server's: `upgrade` beside them
+    /// survives, or a 101 would go out without `Connection: upgrade`.
     #[test]
     fn keeps_other_connection_tokens_beside_a_persistence_token() {
         let got = render(

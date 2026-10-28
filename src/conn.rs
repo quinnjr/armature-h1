@@ -531,7 +531,7 @@ where
                     // to its end: either way no bytes are awaited, so a
                     // handler composing its answer to a bad body is not cut
                     // off with a 408 it did nothing to earn.
-                    let body_finished = || body_read.get() || self.shared.borrow().body_finished;
+                    let body_finished = || self.shared.borrow().body_finished;
                     let body_armed = !body_finished();
                     if body_armed {
                         self.deadline.arm(self.cfg.limits.body_timeout);

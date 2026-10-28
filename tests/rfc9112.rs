@@ -1249,3 +1249,22 @@ fn a_failed_body_does_not_put_the_handler_under_body_timeout() {
     );
     assert_eq!(ex.status(), Some(400), "{:?}", ex.body);
 }
+
+/// The same when the handler's own `collect` cap is what stopped the body:
+/// it is finished, and the 413 the handler takes its time over goes out.
+#[test]
+fn a_body_over_the_handlers_collect_cap_does_not_put_it_under_body_timeout() {
+    let ex = raw_exchange_with_service(
+        quick_limits(),
+        || {
+            |mut req: Request| async move {
+                let err = req.body.collect(4).await.expect_err("over the cap");
+                tokio::time::sleep(Duration::from_millis(900)).await;
+                Response::status_only(err.status())
+            }
+        },
+        vec![b"POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 64\r\n\r\n0123456789abcdef".to_vec()],
+        Duration::ZERO,
+    );
+    assert_eq!(ex.status(), Some(413), "{:?}", ex.body);
+}
