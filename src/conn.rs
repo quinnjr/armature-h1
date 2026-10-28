@@ -32,6 +32,15 @@ const READ_CHUNK: usize = 8 * 1024;
 /// Matches [`READ_CHUNK`] so a stream and a read move data in comparable units.
 const STREAM_FLUSH_BYTES: usize = 8 * 1024;
 
+/// How many bytes of finished responses may wait in the write buffer for the
+/// next pipelined one.
+///
+/// A response whose successor is already buffered is not flushed on its own:
+/// pipelined requests are answered with one write instead of one per request.
+/// The cap bounds how much a client can make the server hold back by
+/// pipelining.
+const PIPELINE_FLUSH_BYTES: usize = 32 * 1024;
+
 /// The interim response for `Expect: 100-continue`.
 const CONTINUE: &[u8] = b"HTTP/1.1 100 Continue\r\n\r\n";
 
@@ -416,23 +425,44 @@ where
                 body,
                 peer: self.peer,
             }));
-            self.deadline.arm(self.cfg.limits.body_timeout);
+
+            // Earlier responses may still be waiting in `out` for this one (see
+            // `PIPELINE_FLUSH_BYTES`). They go out before anything else can be
+            // written — a `100 Continue` is written straight to the transport —
+            // and before a handler that does not finish at once can hold them
+            // back for as long as it takes.
+            let mut early = None;
+            if !self.out.is_empty() {
+                if !expects_continue
+                    && let Poll::Ready(resp) =
+                        std::future::poll_fn(|cx| Poll::Ready(call.as_mut().poll(cx))).await
+                {
+                    early = Some(resp);
+                }
+                if early.is_none() {
+                    self.flush().await?;
+                }
+            }
             // `poll_fn` over the pinned call rather than `select!`, which takes
             // its futures by value: with the request's inline header array
             // inside, the handler's future is large enough that moving it into
             // and out of the `select!` state cost more than parsing the head.
             // Deadline first, as `biased` had it.
-            let resp = {
+            let resp = if let Some(resp) = early {
+                Some(resp)
+            } else {
+                self.deadline.arm(self.cfg.limits.body_timeout);
                 let deadline = &mut self.deadline;
-                std::future::poll_fn(|cx| {
+                let resp = std::future::poll_fn(|cx| {
                     if deadline.poll_expired(cx).is_ready() {
                         return Poll::Ready(None);
                     }
                     call.as_mut().poll(cx).map(Some)
                 })
-                .await
+                .await;
+                self.deadline.disarm();
+                resp
             };
-            self.deadline.disarm();
             let Some(resp) = resp else {
                 self.write_error(version, 408).await?;
                 return Ok(None);
@@ -502,6 +532,12 @@ where
         // A complete head may already be buffered from a pipelined write.
         if self.has_complete_head() {
             return Ok(HeadOutcome::Ready);
+        }
+        // Responses are only held back while a successor head is buffered, so
+        // this cannot find any; it is what guarantees none ever waits on a
+        // read.
+        if !self.out.is_empty() {
+            self.flush().await?;
         }
 
         let had_bytes = !self.shared.borrow().buf.is_empty();
@@ -629,7 +665,8 @@ where
             ResponseBody::Stream(_) => OutBody::Chunked,
         };
 
-        self.out.clear();
+        // Not cleared: it may hold earlier pipelined responses still owed to
+        // the peer, and this one goes out after them.
         {
             let mut date = self.date.borrow_mut();
             let now = SystemTime::now();
@@ -728,7 +765,17 @@ where
             }
         }
 
-        self.flush().await?;
+        // Hold a keep-alive response back while the next request is already
+        // here, so a pipelined batch goes out in one write. Whichever response
+        // finds no successor buffered flushes the batch; nothing waits on a
+        // read, since the successor needs none.
+        let coalesce = keep_alive
+            && !upgrading
+            && self.out.len() < PIPELINE_FLUSH_BYTES
+            && self.has_complete_head();
+        if !coalesce {
+            self.flush().await?;
+        }
 
         if upgrading {
             return Ok(Disposition::Upgrade);
@@ -798,7 +845,8 @@ where
     /// Always `Connection: close`: a connection whose framing we do not fully
     /// agree on is never reused.
     async fn write_error(&mut self, version: Version, status: u16) -> io::Result<()> {
-        self.out.clear();
+        // Appended rather than written alone: earlier pipelined responses may
+        // still be waiting in `out`, and they are owed first.
         {
             let mut date = self.date.borrow_mut();
             let now = SystemTime::now();
@@ -816,9 +864,10 @@ where
             );
         }
         // Best effort: the peer may already be gone, and there is nothing
-        // further to do about it either way.
-        let _ = Self::write_all_from(&self.shared, &self.out).await;
-        self.out.clear();
+        // further to do about it either way. Deadline-guarded like every other
+        // write, so a peer that stops reading cannot hold the connection open
+        // on an error response.
+        let _ = self.flush().await;
         Ok(())
     }
 }
@@ -1031,6 +1080,174 @@ mod tests {
             p1 < p2 && p2 < p3,
             "responses must be in request order: {out}"
         );
+    }
+
+    /// A transport that counts the writes made to it.
+    struct CountingIo {
+        inner: tokio::io::DuplexStream,
+        writes: Rc<Cell<usize>>,
+    }
+
+    impl AsyncRead for CountingIo {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
+        }
+    }
+
+    impl AsyncWrite for CountingIo {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            self.writes.set(self.writes.get() + 1);
+            std::pin::Pin::new(&mut self.inner).poll_write(cx, buf)
+        }
+
+        fn poll_flush(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<io::Result<()>> {
+            std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+        }
+
+        fn poll_shutdown(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<io::Result<()>> {
+            std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
+    }
+
+    /// A pipelined batch is answered with one write, not one per request.
+    #[tokio::test]
+    async fn pipelined_responses_go_out_in_one_write() {
+        let (mut client, server) = tokio::io::duplex(64 * 1024);
+        let writes = Rc::new(Cell::new(0));
+        let io = CountingIo {
+            inner: server,
+            writes: writes.clone(),
+        };
+        let local = tokio::task::LocalSet::new();
+        let conn = Connection::new(
+            io,
+            ok_service,
+            cfg(Limits::default()),
+            Rc::new(RefCell::new(DateCache::new())),
+        );
+        let server_task = local.spawn_local(async move { conn.serve().await });
+        let out = local
+            .run_until(async move {
+                client
+                    .write_all(
+                        b"GET / HTTP/1.1\r\nHost: a\r\n\r\nGET / HTTP/1.1\r\nHost: a\r\n\r\n\
+                          GET / HTTP/1.1\r\nHost: a\r\n\r\nGET / HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n",
+                    )
+                    .await
+                    .unwrap();
+                let mut out = Vec::new();
+                tokio::time::timeout(Duration::from_secs(2), client.read_to_end(&mut out))
+                    .await
+                    .expect("server closes after the last request")
+                    .unwrap();
+                let _ = server_task.await;
+                String::from_utf8_lossy(&out).into_owned()
+            })
+            .await;
+        assert_eq!(out.matches("HTTP/1.1 200 OK").count(), 4, "{out}");
+        assert_eq!(writes.get(), 1, "four pipelined responses, one write");
+    }
+
+    /// Held-back responses must not wait on a handler that does not finish at
+    /// once: the client gets them while the next handler is still running.
+    #[tokio::test]
+    async fn a_slow_handler_does_not_hold_back_earlier_pipelined_responses() {
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let release_rx = Rc::new(RefCell::new(Some(release_rx)));
+        let service = move |req: Request| {
+            let wait = (req.head.path() == "/slow")
+                .then(|| release_rx.borrow_mut().take())
+                .flatten();
+            async move {
+                if let Some(rx) = wait {
+                    let _ = rx.await;
+                }
+                let mut r = Response::new(200);
+                r.body = ResponseBody::Full(Bytes::from(req.head.path().to_owned()));
+                r
+            }
+        };
+        let (mut client, server) = tokio::io::duplex(64 * 1024);
+        let local = tokio::task::LocalSet::new();
+        let conn = Connection::new(
+            server,
+            service,
+            cfg(Limits::default()),
+            Rc::new(RefCell::new(DateCache::new())),
+        );
+        let server_task = local.spawn_local(async move { conn.serve().await });
+        local
+            .run_until(async move {
+                client
+                    .write_all(
+                        b"GET /fast HTTP/1.1\r\nHost: a\r\n\r\n\
+                          GET /slow HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n",
+                    )
+                    .await
+                    .unwrap();
+                let mut first = vec![0u8; 4096];
+                let n = tokio::time::timeout(Duration::from_secs(2), client.read(&mut first))
+                    .await
+                    .expect("the first response must not wait for the slow handler")
+                    .unwrap();
+                let first = String::from_utf8_lossy(&first[..n]).into_owned();
+                assert!(first.ends_with("/fast"), "{first}");
+                release_tx.send(()).unwrap();
+                let mut rest = Vec::new();
+                tokio::time::timeout(Duration::from_secs(2), client.read_to_end(&mut rest))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(String::from_utf8_lossy(&rest).ends_with("/slow"));
+                let _ = server_task.await;
+            })
+            .await;
+    }
+
+    /// A `100 Continue` is written straight to the transport, so a response
+    /// held back for the batch must go out ahead of it.
+    #[tokio::test]
+    async fn a_held_back_response_precedes_the_next_requests_100_continue() {
+        let out = exchange(
+            b"GET / HTTP/1.1\r\nHost: a\r\n\r\n\
+              POST / HTTP/1.1\r\nHost: a\r\nExpect: 100-continue\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello",
+            echo_service,
+            Limits::default(),
+        )
+        .await;
+        let ok = out.find("HTTP/1.1 200 OK").expect("first response");
+        let cont = out.find("HTTP/1.1 100 Continue").expect("interim response");
+        let echoed = out.rfind("hello").expect("echoed body");
+        assert!(ok < cont && cont < echoed, "{out}");
+    }
+
+    /// An error response for a later pipelined request is appended to the
+    /// held-back batch, not written over it.
+    #[tokio::test]
+    async fn an_error_after_a_held_back_response_keeps_both() {
+        let out = exchange(
+            b"GET / HTTP/1.1\r\nHost: a\r\n\r\nGET / HTTP/1.1\r\n\r\n",
+            ok_service,
+            Limits::default(),
+        )
+        .await;
+        let ok = out.find("HTTP/1.1 200 OK").expect("first response");
+        let bad = out.find("HTTP/1.1 400").expect("missing-Host rejection");
+        assert!(ok < bad, "{out}");
     }
 
     #[tokio::test]
