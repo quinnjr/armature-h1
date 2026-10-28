@@ -25,8 +25,29 @@ match it (4 → 2), and a pipelined batch is served at roughly 4.5× the rate.
 - A keep-alive response whose successor is already buffered is held back, up
   to 32 KiB, so a pipelined batch goes out in one write. Nothing held back can
   wait on the peer or on a slow handler.
+- Connections are balanced across workers by load. `SO_REUSEPORT` spreads
+  them by address hash, which left one core as low as 45% busy with 16
+  keep-alive connections on 4; a worker that accepts while another holds
+  fewer connections now hands the socket over before serving it.
+
+### Changed
+
+- **Breaking:** `FramingError` is `#[non_exhaustive]` and gains `InvalidHost`,
+  `InvalidAuthority`, `UnsupportedScheme` and `HostMismatch`.
+- `Head::path()` returns only the path component of an absolute-form target
+  (`/` when empty). New `Head::authority()` and `Head::absolute_scheme()`.
+- `Limits::body_timeout` bounds the body's arrival, not the handler: a handler
+  runs unbounded once its body is read, or when there is none.
+- The `tls` feature requires `rustls-webpki` 0.103.16 (RUSTSEC-2026-0382).
 
 ### Fixed
+
+- A `Host` that is malformed, or that disagrees with an absolute-form target's
+  authority, is refused with `400`, as is a target with userinfo or a scheme
+  other than `http`/`https`.
+- Empty lines before a request line are ignored (RFC 9112 section 2.2), chunk
+  sizes may carry any number of leading zeros, and chunk extensions are held to
+  their grammar (bytes at or above `0x80` only inside a quoted value).
 
 - `100 Continue` is no longer written inside a streamed response whose handler
   reads the body after its head goes out, no longer sent to HTTP/1.0 clients,
