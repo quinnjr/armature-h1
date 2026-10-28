@@ -858,3 +858,65 @@ fn impossible_final_status_becomes_500_and_closes() {
         assert!(ex.closed, "{status}");
     }
 }
+
+/// `body_timeout` bounds the body's arrival, not the handler: a request with
+/// no body is served however long its handler takes.
+#[test]
+fn a_slow_handler_without_a_body_is_not_cut_off_by_body_timeout() {
+    let ex = raw_exchange_with_service(
+        quick_limits(),
+        || {
+            |_req: Request| async {
+                tokio::time::sleep(Duration::from_millis(1000)).await;
+                Response::text("slow")
+            }
+        },
+        vec![b"GET / HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n".to_vec()],
+        Duration::ZERO,
+    );
+    assert_eq!(ex.status(), Some(200), "{:?}", ex.body);
+    assert!(ex.body.ends_with("slow"), "{:?}", ex.body);
+}
+
+/// Nor once the body has been read: the deadline stops mattering the moment
+/// the body is complete.
+#[test]
+fn a_slow_handler_after_reading_its_body_is_not_cut_off() {
+    let ex = raw_exchange_with_service(
+        quick_limits(),
+        || {
+            |mut req: Request| async move {
+                let body = req.body.collect(1024).await.expect("body");
+                tokio::time::sleep(Duration::from_millis(1000)).await;
+                let mut r = Response::new(200);
+                r.body = armature_h1::ResponseBody::Full(body);
+                r
+            }
+        },
+        vec![
+            b"POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello"
+                .to_vec(),
+        ],
+        Duration::ZERO,
+    );
+    assert_eq!(ex.status(), Some(200), "{:?}", ex.body);
+    assert!(ex.body.ends_with("hello"), "{:?}", ex.body);
+}
+
+/// A handler that never reads its body still answers to the deadline: the
+/// body has not arrived, from the server's point of view.
+#[test]
+fn a_handler_sitting_on_an_unread_body_still_gets_408() {
+    let ex = raw_exchange_with_service(
+        quick_limits(),
+        || {
+            |_req: Request| async {
+                tokio::time::sleep(Duration::from_millis(1500)).await;
+                Response::text("late")
+            }
+        },
+        vec![b"POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\n\r\nhello".to_vec()],
+        Duration::ZERO,
+    );
+    ex.assert_rejected_and_closed(408);
+}

@@ -39,6 +39,11 @@ pub struct Limits {
     /// Deadline for the complete head to arrive once the first byte does.
     pub header_timeout: Duration,
     /// Deadline for the complete body to arrive once the head is parsed.
+    ///
+    /// It bounds the body, not the handler: once the body has been read to
+    /// its end, or when the request has none, the handler may run as long as
+    /// it needs. A body still incomplete at the deadline — the peer stalled,
+    /// or the handler is not reading it — gets a `408` and a close.
     pub body_timeout: Duration,
     /// Deadline for the next request to begin on an idle keep-alive connection.
     pub idle_timeout: Duration,

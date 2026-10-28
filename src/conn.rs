@@ -458,13 +458,21 @@ where
             // inside, the handler's future is large enough that moving it into
             // and out of the `select!` state cost more than parsing the head.
             // Deadline first, as `biased` had it.
+            //
+            // `body_timeout` bounds the body's arrival, not the handler: once the
+            // body has been read to its end — or when there never was one — an
+            // expiry means nothing, and a handler may take as long as it needs.
+            // A body still incomplete at the deadline is a stalled peer (or a
+            // handler sitting on bytes it never reads), and gets the 408.
             let resp = if let Some(resp) = early {
                 Some(resp)
+            } else if body_read.get() {
+                Some(call.as_mut().await)
             } else {
                 self.deadline.arm(self.cfg.limits.body_timeout);
                 let deadline = &mut self.deadline;
                 let resp = std::future::poll_fn(|cx| {
-                    if deadline.poll_expired(cx).is_ready() {
+                    if !body_read.get() && deadline.poll_expired(cx).is_ready() {
                         return Poll::Ready(None);
                     }
                     call.as_mut().poll(cx).map(Some)

@@ -106,6 +106,12 @@ pub(crate) struct PhaseClock {
     /// `note_flush`. Detaching makes both no-ops rather than pointless
     /// `notify_waiters()` calls and phase flips on a dead clock.
     detached: Cell<bool>,
+    /// Whether the current request's body has been read to its end; the
+    /// bridge hands this to the request's [`crate::Body`] as its `fully_read`.
+    ///
+    /// `body_timeout` bounds the body's arrival, not the handler, so an expiry
+    /// in [`Phase::Handler`] only counts while this is still `false`.
+    request_body_read: Rc<Cell<bool>>,
     notify: tokio::sync::Notify,
 }
 
@@ -117,6 +123,7 @@ impl PhaseClock {
             wrote_bytes: Cell::new(false),
             body_done: Cell::new(false),
             detached: Cell::new(false),
+            request_body_read: Rc::new(Cell::new(false)),
             notify: tokio::sync::Notify::new(),
         }
     }
@@ -152,6 +159,9 @@ impl PhaseClock {
         if matches!(p, Phase::Idle | Phase::Handler) {
             self.wrote_bytes.set(false);
             self.body_done.set(false);
+        }
+        if p == Phase::Handler {
+            self.request_body_read.set(false);
         }
         self.phase.set(p);
         self.bump();
@@ -189,6 +199,12 @@ impl PhaseClock {
     }
 
     /// Record that the response body has no more frames to give.
+    /// The flag the current request's body reports its end through. The
+    /// body itself resets it when it is created.
+    pub(crate) fn request_body_read(&self) -> Rc<Cell<bool>> {
+        self.request_body_read.clone()
+    }
+
     pub(crate) fn note_body_end(&self) {
         self.body_done.set(true);
     }
@@ -239,6 +255,13 @@ async fn watchdog(clock: &PhaseClock, limits: &Limits, deadline: &mut ConnDeadli
                 // A change that landed between the snapshot and the expiry
                 // means this deadline was armed for a phase already over.
                 if clock.generation.get() != generation {
+                    continue;
+                }
+                // The body arrived in time; the handler's own runtime is not
+                // bounded, as natively. Nothing to time until the phase moves.
+                if phase == Phase::Handler && clock.request_body_read.get() {
+                    deadline.disarm();
+                    clock.notify.notified().await;
                     continue;
                 }
                 return phase;

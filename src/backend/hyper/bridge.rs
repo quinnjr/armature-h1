@@ -190,7 +190,9 @@ impl<S: H1Service + 'static>
             // the same case (`write::write_head`, Http10 + keep_alive).
             let keep_alive = head.is_keep_alive();
 
-            let fully_read = Rc::new(Cell::new(false));
+            // The clock's flag rather than a fresh one: the watchdog reads it to
+            // tell a stalled body from a slow handler.
+            let fully_read = phase.request_body_read();
             let trailers_slot = Rc::new(RefCell::new(None));
             let body_io: Rc<RefCell<dyn crate::service::BodyIo>> = Rc::new(RefCell::new(
                 HyperBodyIo::new(incoming, trailers_slot.clone()),
