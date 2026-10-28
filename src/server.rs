@@ -684,6 +684,18 @@ struct Peers {
     inbox: tokio::sync::mpsc::UnboundedReceiver<Handoff>,
 }
 
+/// How many more connections the accepting worker must hold than the least
+/// loaded one before it hands a connection over.
+///
+/// A handoff is not free — the socket leaves this reactor and joins another,
+/// with a channel send and a cross-thread wake between, and leaves the core
+/// that took its interrupt. Under churn, counts jitter by one constantly, and
+/// a margin of one would pay that on most accepts for a balance
+/// `SO_REUSEPORT` already roughly gives. Two keeps every worker within two of
+/// the least loaded, which is what the skew this exists for (5/5/3/3, or
+/// worse) needs, and leaves the fast path local.
+const HANDOFF_MARGIN: usize = 2;
+
 /// A count no live worker reaches, so a retired worker is never the least
 /// loaded. Not `usize::MAX`: in-flight decrements must not wrap it.
 const RETIRED: usize = usize::MAX / 2;
@@ -751,11 +763,13 @@ impl Balance {
         (0..self.open.len()).find(|&i| self.reserve(i))
     }
 
-    /// The worker that should serve a connection `me` just accepted: `me`,
-    /// unless another holds strictly fewer connections.
+    /// The worker that should serve a connection `me` just accepted: the
+    /// least-loaded one, if `me` holds at least [`HANDOFF_MARGIN`] more
+    /// connections than it; otherwise `me`.
     fn pick(&self, me: usize) -> usize {
+        let mine = self.count(me);
         let mut best = me;
-        let mut best_open = self.count(me);
+        let mut best_open = mine;
         for i in 0..self.open.len() {
             let n = self.count(i);
             if n < best_open {
@@ -763,7 +777,11 @@ impl Balance {
                 best_open = n;
             }
         }
-        best
+        if mine.saturating_sub(best_open) >= HANDOFF_MARGIN {
+            best
+        } else {
+            me
+        }
     }
 
     /// Take `worker` out of the running for handoffs, for good.
@@ -1810,7 +1828,8 @@ mod tests {
     }
 
     /// Connections spread by load, not by `SO_REUSEPORT`'s address hash:
-    /// sixteen long-lived connections on four workers land four apiece.
+    /// sixteen long-lived connections on four workers land within
+    /// `HANDOFF_MARGIN` of four apiece.
     #[test]
     fn long_lived_connections_spread_evenly_across_workers() {
         let cfg = test_config(4).limits(Limits {
@@ -1866,19 +1885,24 @@ mod tests {
         for w in &workers {
             *per_worker.entry(w.as_str()).or_insert(0) += 1;
         }
+        // Within `HANDOFF_MARGIN` of perfectly even, and every worker used.
         assert_eq!(per_worker.len(), 4, "{per_worker:?}");
-        assert!(per_worker.values().all(|&n| n == 4), "{per_worker:?}");
+        let (min, max) = (
+            per_worker.values().min().copied().unwrap_or(0),
+            per_worker.values().max().copied().unwrap_or(0),
+        );
+        assert!(max - min <= HANDOFF_MARGIN, "{per_worker:?}");
     }
 
     #[test]
-    fn pick_prefers_self_on_a_tie_and_the_least_loaded_otherwise() {
+    fn pick_stays_local_within_the_margin_and_hands_off_beyond_it() {
         let (b, _inboxes) = Balance::new(3, 100);
         assert_eq!(b.pick(1), 1, "all equal: stay");
+        b.open[1].0.store(1, Ordering::Relaxed);
+        assert_eq!(b.pick(1), 1, "one more than the least: stay");
         b.open[1].0.store(2, Ordering::Relaxed);
         b.open[2].0.store(1, Ordering::Relaxed);
-        assert_eq!(b.pick(1), 0);
-        b.open[0].0.store(1, Ordering::Relaxed);
-        assert_eq!(b.pick(2), 2, "tied with the least: stay");
+        assert_eq!(b.pick(1), 0, "two more than the least: hand off to it");
         b.retire(0);
         b.open[2].0.store(5, Ordering::Relaxed);
         assert_eq!(b.pick(2), 1, "a retired worker is never picked");

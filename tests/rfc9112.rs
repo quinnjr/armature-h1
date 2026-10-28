@@ -1186,3 +1186,46 @@ fn the_handler_timeout_503_is_a_bare_rejection() {
     assert!(out.starts_with("HTTP/1.1 503"), "{out:?}");
     assert!(!out.to_ascii_lowercase().contains("server:"), "{out:?}");
 }
+
+/// The same with the stray CRLF split across two reads: a lone CR is not the
+/// start of a request either.
+#[test]
+fn a_stray_crlf_split_across_reads_is_not_a_request() {
+    let ex = raw_exchange_slow(
+        Limits {
+            header_timeout: Duration::from_millis(200),
+            idle_timeout: Duration::from_millis(900),
+            ..quick_limits()
+        },
+        vec![
+            b"GET / HTTP/1.1\r\nHost: a\r\n\r\n".to_vec(),
+            b"\r".to_vec(),
+            b"\n".to_vec(),
+        ],
+        Duration::from_millis(50),
+    );
+    assert_eq!(ex.responses(), 1, "{:?}", ex.body);
+    assert!(!ex.body.contains("408"), "{:?}", ex.body);
+    assert!(ex.closed);
+}
+
+/// And when the stray CR arrives in the same read as the request before it,
+/// so it is already buffered when the connection goes back to waiting.
+#[test]
+fn a_stray_cr_behind_a_request_is_not_a_request() {
+    let ex = raw_exchange_slow(
+        Limits {
+            header_timeout: Duration::from_millis(200),
+            idle_timeout: Duration::from_millis(900),
+            ..quick_limits()
+        },
+        vec![
+            b"GET / HTTP/1.1\r\nHost: a\r\n\r\n\r".to_vec(),
+            b"\n".to_vec(),
+        ],
+        Duration::from_millis(400),
+    );
+    assert_eq!(ex.responses(), 1, "{:?}", ex.body);
+    assert!(!ex.body.contains("408"), "{:?}", ex.body);
+    assert!(ex.closed);
+}

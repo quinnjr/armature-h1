@@ -435,100 +435,117 @@ where
                 body_read.clone(),
             );
 
-            // The body deadline covers the handler's read of it. Nothing else
-            // polls this deadline, so the handler call itself has to race it:
-            // arming a timer nobody awaits would leave a handler blocked on body
-            // bytes the peer never sends holding the connection forever.
-            //
-            // Cancelling the handler mid-await drops its `Body`, and with it the
-            // last borrow of the transport, so the 408 can be written here.
-            let mut call = std::pin::pin!(self.service.call(Request {
-                head,
-                body,
-                peer: self.peer,
-            }));
-
             // Earlier responses may still be waiting in `out` for this one (see
             // `PIPELINE_FLUSH_BYTES`). They go out before anything else can be
             // written — a `100 Continue` is written straight to the transport —
             // and before a handler that does not finish at once can hold them
-            // back for as long as it takes.
-            let mut early = None;
+            // back for as long as it takes. Until then they sit in a guard that
+            // exists before the handler is even called, so a handler that
+            // panics — in `call` itself or in its first poll — does not take
+            // finished responses down with it.
+            let mut held = None;
             if !self.out.is_empty() {
-                if !expects_continue {
-                    // Held by a guard across the one poll, so a handler that
-                    // panics in it does not take finished responses with it.
-                    let mut held = HeldOutput {
+                if expects_continue {
+                    self.flush().await?;
+                } else {
+                    held = Some(HeldOutput {
                         shared: self.shared.clone(),
                         bytes: Some(self.out.split()),
-                    };
+                    });
+                }
+            }
+
+            // Scoped so the handler's future — and whatever it holds: its
+            // `Body`, which is the last borrow of the transport, a pool
+            // connection, a lock — is dropped before an error response is
+            // written, not kept alive for as long as that write takes.
+            let resp = {
+                let mut call = std::pin::pin!(self.service.call(Request {
+                    head,
+                    body,
+                    peer: self.peer,
+                }));
+
+                let mut early = None;
+                if let Some(mut held) = held.take() {
                     let polled =
                         std::future::poll_fn(|cx| Poll::Ready(call.as_mut().poll(cx))).await;
                     let mut bytes = held.bytes.take().unwrap_or_default();
                     bytes.unsplit(std::mem::take(&mut self.out));
                     self.out = bytes;
-                    if let Poll::Ready(resp) = polled {
-                        early = Some(resp);
+                    match polled {
+                        Poll::Ready(resp) => early = Some(resp),
+                        Poll::Pending => self.flush().await?,
                     }
                 }
-                if early.is_none() {
-                    self.flush().await?;
-                }
-            }
-            // Armed only now: writing the earlier responses above is the write
-            // deadline's business, and a slow reader must not spend this
-            // handler's budget. hyper starts the same clock at the call.
-            if early.is_none()
-                && let (Some(after), Some(d)) = (
-                    self.cfg.limits.handler_timeout,
-                    self.handler_deadline.as_mut(),
-                )
-            {
-                d.arm(after);
-            }
-            // `poll_fn` over the pinned call rather than `select!`, which takes
-            // its futures by value: with the request's inline header array
-            // inside, the handler's future is large enough that moving it into
-            // and out of the `select!` state cost more than parsing the head.
-            // Deadline first, as `biased` had it.
-            //
-            // `body_timeout` bounds the body's arrival, not the handler: once the
-            // body has been read to its end — or when there never was one — an
-            // expiry means nothing, and a handler may take as long as it needs.
-            // A body still incomplete at the deadline is a stalled peer (or a
-            // handler sitting on bytes it never reads), and gets the 408.
-            //
-            // `handler_timeout`, when set, bounds the handler itself and is the
-            // server's failure, not the peer's: 503 rather than 408.
-            let resp = if let Some(resp) = early {
-                Ok(resp)
-            } else {
-                let body_armed = !body_read.get();
-                if body_armed {
-                    self.deadline.arm(self.cfg.limits.body_timeout);
-                }
-                let deadline = &mut self.deadline;
-                let mut handler_deadline = self.handler_deadline.as_mut();
-                let resp = std::future::poll_fn(|cx| {
-                    if body_armed && !body_read.get() && deadline.poll_expired(cx).is_ready() {
-                        return Poll::Ready(Err(408));
+
+                // The body deadline covers the handler's read of it. Nothing
+                // else polls this deadline, so the handler call itself has to
+                // race it: arming a timer nobody awaits would leave a handler
+                // blocked on body bytes the peer never sends holding the
+                // connection forever.
+                //
+                // `poll_fn` over the pinned call rather than `select!`, which
+                // takes its futures by value: with the request's inline header
+                // array inside, the handler's future is large enough that
+                // moving it into and out of the `select!` state cost more than
+                // parsing the head.
+                //
+                // `body_timeout` bounds the body's arrival, not the handler:
+                // once the body has been read to its end — or when there never
+                // was one — an expiry means nothing, and a handler may take as
+                // long as it needs. A body still incomplete at the deadline is
+                // a stalled peer (or a handler sitting on bytes it never
+                // reads), and gets the 408, checked before the handler as
+                // `biased` had it.
+                //
+                // `handler_timeout`, when set, bounds the handler itself and is
+                // the server's failure, not the peer's: 503 rather than 408. It
+                // is checked after the handler, as `tokio::time::timeout` (the
+                // hyper backend's) checks after its inner future, so a handler
+                // ready on the same wakeup wins under both. Armed only here:
+                // writing the earlier responses above is the write deadline's
+                // business, and a slow reader must not spend this handler's
+                // budget.
+                if let Some(resp) = early {
+                    Ok(resp)
+                } else {
+                    if let (Some(after), Some(d)) = (
+                        self.cfg.limits.handler_timeout,
+                        self.handler_deadline.as_mut(),
+                    ) {
+                        d.arm(after);
                     }
-                    if let Some(d) = handler_deadline.as_mut()
-                        && d.poll_expired(cx).is_ready()
-                    {
-                        return Poll::Ready(Err(503));
+                    let body_armed = !body_read.get();
+                    if body_armed {
+                        self.deadline.arm(self.cfg.limits.body_timeout);
                     }
-                    call.as_mut().poll(cx).map(Ok)
-                })
-                .await;
-                if body_armed {
-                    self.deadline.disarm();
+                    let deadline = &mut self.deadline;
+                    let mut handler_deadline = self.handler_deadline.as_mut();
+                    let resp = std::future::poll_fn(|cx| {
+                        if body_armed && !body_read.get() && deadline.poll_expired(cx).is_ready() {
+                            return Poll::Ready(Err(408));
+                        }
+                        if let Poll::Ready(resp) = call.as_mut().poll(cx) {
+                            return Poll::Ready(Ok(resp));
+                        }
+                        if let Some(d) = handler_deadline.as_mut()
+                            && d.poll_expired(cx).is_ready()
+                        {
+                            return Poll::Ready(Err(503));
+                        }
+                        Poll::Pending
+                    })
+                    .await;
+                    if body_armed {
+                        self.deadline.disarm();
+                    }
+                    if let Some(d) = self.handler_deadline.as_mut() {
+                        d.disarm();
+                    }
+                    resp
                 }
-                resp
             };
-            if let Some(d) = self.handler_deadline.as_mut() {
-                d.disarm();
-            }
             let resp = match resp {
                 Ok(resp) => resp,
                 Err(status) => {
@@ -609,7 +626,7 @@ where
             self.flush().await?;
         }
 
-        let had_bytes = !self.shared.borrow().buf.is_empty();
+        let had_bytes = self.request_started();
         // Idle applies before the first byte; the header deadline applies once
         // the request has begun. Conflating them would let a client hold a
         // connection open indefinitely mid-head.
@@ -656,7 +673,12 @@ where
                     // legacy one some clients send after a body) leaves it
                     // idle, under `idle_timeout` and a silent close, not
                     // facing a 408 for a request it never began.
-                    if !started && !self.shared.borrow().buf.is_empty() {
+                    //
+                    // A CR or LF on its own is not one either: a stray CRLF
+                    // split across reads leaves a lone `\r` until its `\n`
+                    // arrives. Only a byte that can begin a request line starts
+                    // one — the same rule the hyper adapter applies.
+                    if !started && self.request_started() {
                         started = true;
                         self.deadline.arm(self.cfg.limits.header_timeout);
                     }
@@ -667,6 +689,22 @@ where
                 }
             }
         }
+    }
+
+    /// Whether the buffered bytes have begun a request: whether any of them is
+    /// something other than CR or LF.
+    ///
+    /// Blank lines before a request line are not one (RFC 9112 section 2.2),
+    /// and neither is a lone CR waiting for its LF — a stray CRLF can arrive
+    /// split, or behind the previous request in the same read. Only a byte
+    /// that can begin a request line moves the connection from the idle
+    /// deadline to the header deadline; the hyper adapter draws the same line.
+    fn request_started(&self) -> bool {
+        self.shared
+            .borrow()
+            .buf
+            .iter()
+            .any(|&b| b != b'\r' && b != b'\n')
     }
 
     /// Whether a complete head is buffered, resuming the search where the last
@@ -1465,6 +1503,100 @@ mod tests {
             .await;
         assert!(out.starts_with("HTTP/1.1 200 OK"), "{out:?}");
         assert!(out.ends_with("first"), "{out:?}");
+    }
+
+    /// The same when the panic is in the synchronous part of `call`, before
+    /// any future exists to poll.
+    #[tokio::test]
+    async fn a_handler_panicking_in_call_does_not_lose_held_back_responses() {
+        let service = |req: Request| {
+            assert!(
+                req.head.path() != "/boom",
+                "synchronous handler panic, on purpose"
+            );
+            async move { Response::text("first") }
+        };
+        let (mut client, server) = tokio::io::duplex(64 * 1024);
+        let local = tokio::task::LocalSet::new();
+        let conn = Connection::new(
+            server,
+            service,
+            cfg(Limits::default()),
+            Rc::new(RefCell::new(DateCache::new())),
+        );
+        let server_task = local.spawn_local(async move { conn.serve().await });
+        let out = local
+            .run_until(async move {
+                client
+                    .write_all(
+                        b"GET /a HTTP/1.1\r\nHost: a\r\n\r\nGET /boom HTTP/1.1\r\nHost: a\r\n\r\n",
+                    )
+                    .await
+                    .unwrap();
+                assert!(server_task.await.is_err(), "the handler panicked");
+                let mut out = Vec::new();
+                let _ = tokio::time::timeout(Duration::from_secs(2), client.read_to_end(&mut out))
+                    .await;
+                String::from_utf8_lossy(&out).into_owned()
+            })
+            .await;
+        assert!(out.starts_with("HTTP/1.1 200 OK"), "{out:?}");
+        assert!(out.ends_with("first"), "{out:?}");
+    }
+
+    /// A timed-out handler is dropped before its error response is written,
+    /// not kept alive — with whatever it holds — for as long as that write
+    /// takes against a slow reader.
+    #[tokio::test]
+    async fn a_timed_out_handler_is_dropped_before_the_error_is_written() {
+        struct OnDrop(Rc<Cell<bool>>);
+        impl Drop for OnDrop {
+            fn drop(&mut self) {
+                self.0.set(true);
+            }
+        }
+        let dropped = Rc::new(Cell::new(false));
+        let flag = dropped.clone();
+        let service = move |_req: Request| {
+            let guard = OnDrop(flag.clone());
+            async move {
+                let _guard = guard;
+                std::future::pending::<()>().await;
+                Response::text("never")
+            }
+        };
+        // Eight bytes of buffer: the 503 cannot be written until the client
+        // reads, so the write is in progress when the flag is checked.
+        let (mut client, server) = tokio::io::duplex(8);
+        let local = tokio::task::LocalSet::new();
+        let conn = Connection::new(
+            server,
+            service,
+            cfg(Limits {
+                handler_timeout: Some(Duration::from_millis(50)),
+                ..Default::default()
+            }),
+            Rc::new(RefCell::new(DateCache::new())),
+        );
+        let server_task = local.spawn_local(async move { conn.serve().await });
+        local
+            .run_until(async move {
+                client
+                    .write_all(b"GET / HTTP/1.1\r\nHost: a\r\n\r\n")
+                    .await
+                    .unwrap();
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                assert!(
+                    dropped.get(),
+                    "handler still alive while its 503 is written"
+                );
+                let mut out = Vec::new();
+                let _ = tokio::time::timeout(Duration::from_secs(2), client.read_to_end(&mut out))
+                    .await;
+                assert!(String::from_utf8_lossy(&out).starts_with("HTTP/1.1 503"));
+                let _ = server_task.await;
+            })
+            .await;
     }
 
     /// A `100 Continue` is written straight to the transport, so a response

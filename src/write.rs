@@ -337,6 +337,12 @@ pub fn write_head(
     date: &[u8],
     keep_alive: bool,
 ) {
+    // A caller here cannot say whether a body follows, so a stream on 1.0 is
+    // taken to have one: close-delimited, which the connection must close.
+    let keep_alive = keep_alive
+        && !(version == Version::Http10
+            && *body == OutBody::Chunked
+            && !forbids_body_framing(resp.status));
     write_head_for(out, version, resp, body, date, keep_alive, false);
 }
 
@@ -346,6 +352,11 @@ pub fn write_head(
 /// had (RFC 9110 section 9.3.2), not the empty body actually sent, so a
 /// handler's well-formed value passes through as on a 304 instead of being
 /// rewritten to the length of nothing.
+///
+/// `keep_alive` is taken as decided: whether a close-delimited HTTP/1.0 body
+/// costs the connection is the caller's call, made once, where it also knows
+/// whether that body is written at all. The writer only frames: a 1.0 stream
+/// never gets a chunked field, whatever follows it.
 pub(crate) fn write_head_for(
     out: &mut BytesMut,
     version: Version,
@@ -355,12 +366,8 @@ pub(crate) fn write_head_for(
     keep_alive: bool,
     head_request: bool,
 ) {
-    // HTTP/1.0 has no chunked coding: a stream there carries no framing field
-    // and ends with the connection. It only costs the connection when a body
-    // is actually written — not for HEAD, nor a status that forbids one.
+    // HTTP/1.0 has no chunked coding: a stream there carries no framing field.
     let close_delimited = version == Version::Http10 && *body == OutBody::Chunked;
-    let keep_alive =
-        keep_alive && !(close_delimited && !head_request && !forbids_body_framing(resp.status));
 
     out.put_slice(version.as_bytes());
     out.put_u8(b' ');
