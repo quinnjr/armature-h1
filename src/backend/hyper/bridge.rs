@@ -197,7 +197,8 @@ impl<S: H1Service + 'static>
             let fully_read = phase.request_body_read();
             let trailers_slot = Rc::new(RefCell::new(None));
             let body_io: Rc<RefCell<dyn crate::service::BodyIo>> = Rc::new(RefCell::new(
-                HyperBodyIo::new(incoming, trailers_slot.clone()),
+                HyperBodyIo::new(incoming, trailers_slot.clone())
+                    .with_finished(phase.request_body_finished()),
             ));
             let body = Body::from_backend(
                 kind,

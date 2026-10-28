@@ -430,6 +430,21 @@ pub(crate) fn write_head_for(
         }
     }
 
+    // A handler `Transfer-Encoding` only counts as handler framing when it
+    // actually frames *this* body as chunked. Anything else is a field the
+    // writer must not defer to: `chunked` over a `Fixed` body would put raw
+    // unframed bytes behind a chunked advertisement (an undelimited response —
+    // the desync this crate exists to make impossible), `chunked` over no body
+    // leaves the peer waiting for chunks that never come, and a non-chunked
+    // coding over a chunked body advertises the wrong one. Dropping it takes the
+    // same path as a stale length: the writer emits true framing below. More
+    // than one writable instance is stale for the same reason as a duplicated
+    // length — the emit loop writes them all, and it is their *combined* final
+    // coding that delimits the message, not the first one checked.
+    let stale_transfer_encoding = handler_te.is_some_and(|v| {
+        te_count > 1 || *body != OutBody::Chunked || close_delimited || !te_frames_chunked(v)
+    });
+
     // A handler `Content-Length` that disagrees with the body it framed is
     // dropped, so the writer below reclaims framing and emits the true length.
     // Trusting it would put more (or fewer) bytes on the wire than the field
@@ -450,8 +465,14 @@ pub(crate) fn write_head_for(
     // hands the peer a field it must then guess about.
     let stale_content_length = handler_len.is_some_and(|v| {
         len_count > 1
-            || if content_length_is_descriptive(resp.status) || head_request {
+            || if content_length_is_descriptive(resp.status) {
                 parse_len(v).is_none()
+            } else if head_request {
+                // Descriptive on a HEAD too, but never beside a handler
+                // `Transfer-Encoding` that will also be written: two framing
+                // fields on one message is what RFC 9112 section 6.1 forbids,
+                // descriptive or not. With one, the length goes, as on a GET.
+                parse_len(v).is_none() || (handler_te.is_some() && !stale_transfer_encoding)
             } else {
                 match body {
                     OutBody::Fixed(b) => parse_len(v) != Some(b.len() as u64),
@@ -460,21 +481,6 @@ pub(crate) fn write_head_for(
                     OutBody::Chunked => true,
                 }
             }
-    });
-
-    // A handler `Transfer-Encoding` only counts as handler framing when it
-    // actually frames *this* body as chunked. Anything else is a field the
-    // writer must not defer to: `chunked` over a `Fixed` body would put raw
-    // unframed bytes behind a chunked advertisement (an undelimited response —
-    // the desync this crate exists to make impossible), `chunked` over no body
-    // leaves the peer waiting for chunks that never come, and a non-chunked
-    // coding over a chunked body advertises the wrong one. Dropping it takes the
-    // same path as a stale length: the writer emits true framing below. More
-    // than one writable instance is stale for the same reason as a duplicated
-    // length — the emit loop writes them all, and it is their *combined* final
-    // coding that delimits the message, not the first one checked.
-    let stale_transfer_encoding = handler_te.is_some_and(|v| {
-        te_count > 1 || *body != OutBody::Chunked || close_delimited || !te_frames_chunked(v)
     });
 
     // Handler-supplied headers first, so the checks below can see them.
@@ -1031,6 +1037,33 @@ mod tests {
 
     /// Only the persistence tokens are the server's: `upgrade` beside them
     /// survives, or a 101 would go out without `Connection: upgrade`.
+    /// A HEAD response may keep a descriptive length, but never beside a
+    /// handler `Transfer-Encoding` that frames it too.
+    #[test]
+    fn a_head_response_never_carries_both_framing_fields() {
+        let mut out = BytesMut::new();
+        write_head_for(
+            &mut out,
+            Version::Http11,
+            &head_of(
+                200,
+                &[
+                    (HeaderId::ContentLength, "42"),
+                    (HeaderId::TransferEncoding, "chunked"),
+                ],
+            ),
+            &OutBody::Chunked,
+            EPOCH_DATE,
+            true,
+            true,
+        );
+        let got = String::from_utf8(out.to_vec())
+            .unwrap()
+            .to_ascii_lowercase();
+        assert!(got.contains("transfer-encoding: chunked\r\n"), "{got}");
+        assert!(!got.contains("content-length"), "{got}");
+    }
+
     #[test]
     fn keeps_other_connection_tokens_beside_a_persistence_token() {
         let got = render(

@@ -74,8 +74,9 @@ N pinned OS threads, each running a `current_thread` runtime. On Unix each threa
 owns its own `SO_REUSEPORT` listener. The kernel spreads accepts by a hash of
 the connection's addresses rather than by load, which with a few long-lived
 keep-alive connections can leave one core with twice another's share; so a
-worker that accepts while another holds fewer open connections hands the socket
-to it before serving anything. Once a connection is being served it never
+worker that accepts while holding at least two more open connections than the
+least loaded one it finds hands the socket to that one before serving
+anything. Once a connection is being served it never
 migrates cores. Windows, Solaris, and illumos fall back to duplicated handles on
 one shared listener, balanced the same way.
 

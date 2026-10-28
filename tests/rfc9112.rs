@@ -1229,3 +1229,23 @@ fn a_stray_cr_behind_a_request_is_not_a_request() {
     assert!(!ex.body.contains("408"), "{:?}", ex.body);
     assert!(ex.closed);
 }
+
+/// A body that failed awaits no more bytes, so `body_timeout` has nothing to
+/// bound: a handler taking its time over the error response is not cut off
+/// with a 408.
+#[test]
+fn a_failed_body_does_not_put_the_handler_under_body_timeout() {
+    let ex = raw_exchange_with_service(
+        quick_limits(),
+        || {
+            |mut req: Request| async move {
+                let err = req.body.collect(1024).await.expect_err("malformed chunk");
+                tokio::time::sleep(Duration::from_millis(900)).await;
+                Response::status_only(err.status())
+            }
+        },
+        vec![b"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\n".to_vec()],
+        Duration::ZERO,
+    );
+    assert_eq!(ex.status(), Some(400), "{:?}", ex.body);
+}

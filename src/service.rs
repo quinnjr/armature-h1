@@ -129,6 +129,14 @@ pub trait BodyIo {
     /// Used after a chunked body's terminating chunk, where the decoder may have
     /// been handed bytes belonging to the next request.
     fn push_back(&mut self, bytes: Bytes);
+
+    /// The body is finished: read to its end, or failed.
+    ///
+    /// Either way no more body bytes are awaited, so the body's deadline has
+    /// nothing left to bound. The default does nothing; the connection uses it
+    /// to stop racing `Limits::body_timeout` against a handler that is now
+    /// only working on its response.
+    fn body_finished(&mut self) {}
 }
 
 /// Shared body-reading state.
@@ -172,6 +180,7 @@ impl BodyState {
     fn finish(&mut self) {
         self.done = true;
         self.fully_read.set(true);
+        self.notify_finished();
     }
 
     /// Mark the body finished *without* claiming it was fully read.
@@ -185,6 +194,21 @@ impl BodyState {
     fn fail(&mut self) {
         self.done = true;
         self.fully_read.set(false);
+        self.notify_finished();
+    }
+
+    /// Tell the transport the body needs nothing more from it.
+    ///
+    /// `try_borrow_mut`, though nothing holds the transport when `finish` and
+    /// `fail` run: a missed call only leaves the body deadline armed, as it
+    /// was before this signal existed, where a panic would take the
+    /// connection down.
+    fn notify_finished(&mut self) {
+        if let Some(io) = &self.io
+            && let Ok(mut io) = io.try_borrow_mut()
+        {
+            io.body_finished();
+        }
     }
 }
 

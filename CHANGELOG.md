@@ -27,8 +27,9 @@ match it (4 → 2), and a pipelined batch is served at roughly 4.5× the rate.
   wait on the peer or on a slow handler.
 - Connections are balanced across workers by load. `SO_REUSEPORT` spreads
   them by address hash, which left one core as low as 45% busy with 16
-  keep-alive connections on 4; a worker that accepts while another holds
-  fewer connections now hands the socket over before serving it.
+  keep-alive connections on 4; a worker that accepts while holding at least
+  two more connections than the least loaded one it finds now hands the
+  socket over before serving it.
 
 ### Changed
 

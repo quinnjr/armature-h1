@@ -18,14 +18,23 @@ pub(crate) struct HyperBodyIo<B> {
     /// Bytes the `Body` took but did not consume, or pushed back.
     stash: Bytes,
     trailers_slot: Rc<RefCell<Option<HeaderVec>>>,
+    /// Set when the request's `Body` finishes, read to its end or failed.
+    finished: Option<Rc<std::cell::Cell<bool>>>,
 }
 
 impl<B> HyperBodyIo<B> {
+    /// Report the body's end — success or failure — through `flag`.
+    pub(crate) fn with_finished(mut self, flag: Rc<std::cell::Cell<bool>>) -> Self {
+        self.finished = Some(flag);
+        self
+    }
+
     pub(crate) fn new(body: B, trailers_slot: Rc<RefCell<Option<HeaderVec>>>) -> Self {
         Self {
             body,
             stash: Bytes::new(),
             trailers_slot,
+            finished: None,
         }
     }
 }
@@ -92,6 +101,12 @@ where
     fn take_buffered(&mut self, max: usize) -> Bytes {
         let n = self.stash.len().min(max);
         self.stash.split_to(n)
+    }
+
+    fn body_finished(&mut self) {
+        if let Some(flag) = &self.finished {
+            flag.set(true);
+        }
     }
 
     fn push_back(&mut self, bytes: Bytes) {

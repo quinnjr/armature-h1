@@ -2,8 +2,9 @@
 //!
 //! N pinned OS threads, each running a `current_thread` runtime. On Unix each
 //! thread owns its own `SO_REUSEPORT` listener. The kernel spreads accepts by
-//! address hash, not load, so a worker that accepts while another holds fewer
-//! open connections hands the socket over before serving anything on it. Once
+//! address hash, not load, so a worker that accepts while holding at least two
+//! more open connections than the least loaded one it finds hands the socket
+//! over before serving anything on it. Once
 //! a connection is being served it never migrates cores — which is what makes
 //! per-core date caches and service state safe to keep non-atomic.
 
@@ -650,8 +651,9 @@ type Handoff = (std::net::TcpStream, SocketAddr);
 /// on four workers and leave two cores a third idle — measurably behind a
 /// work-stealing server at low connection counts. Every worker still accepts
 /// from its own socket, so the accept path takes no shared lock; a worker
-/// that accepts while another holds fewer connections passes the socket to
-/// that one instead of serving it. Counts are open connections, handoffs in
+/// that accepts while holding at least [`HANDOFF_MARGIN`] more connections
+/// than the least loaded one it finds (see [`Balance::pick`]) passes the
+/// socket to that one instead of serving it. Counts are open connections, handoffs in
 /// flight included, which is what keeps two workers from both handing to the
 /// same idle one in a burst.
 ///
@@ -695,6 +697,21 @@ struct Peers {
 /// the least loaded, which is what the skew this exists for (5/5/3/3, or
 /// worse) needs, and leaves the fast path local.
 const HANDOFF_MARGIN: usize = 2;
+
+/// How many other workers `pick` looks at on a machine with more than
+/// `PICK_SAMPLES + 1` of them; with that many or fewer it looks at all.
+const PICK_SAMPLES: usize = 3;
+
+/// xorshift64: the per-worker sampler for `pick`. Not for anything that needs
+/// unpredictability — only for spreading probes across workers.
+fn next_random(state: &std::cell::Cell<u64>) -> u64 {
+    let mut x = state.get();
+    x ^= x << 13;
+    x ^= x >> 7;
+    x ^= x << 17;
+    state.set(x);
+    x
+}
 
 /// A count no live worker reaches, so a retired worker is never the least
 /// loaded. Not `usize::MAX`: in-flight decrements must not wrap it.
@@ -749,11 +766,11 @@ impl Balance {
         self.freed[worker].notify_one();
     }
 
-    /// Find a slot for a connection `me` just accepted: the least-loaded
-    /// worker if it is strictly less loaded than `me`, else `me`, else anyone
-    /// with room. `None` when every worker is at its cap.
-    fn place(&self, me: usize) -> Option<usize> {
-        let target = self.pick(me);
+    /// Find a slot for a connection `me` just accepted: the worker
+    /// [`pick`](Self::pick) chooses, else `me`, else anyone with room. `None`
+    /// when every worker is at its cap.
+    fn place(&self, me: usize, rng: &std::cell::Cell<u64>) -> Option<usize> {
+        let target = self.pick(me, rng);
         if target != me && self.reserve(target) {
             return Some(target);
         }
@@ -766,15 +783,27 @@ impl Balance {
     /// The worker that should serve a connection `me` just accepted: the
     /// least-loaded one, if `me` holds at least [`HANDOFF_MARGIN`] more
     /// connections than it; otherwise `me`.
-    fn pick(&self, me: usize) -> usize {
+    fn pick(&self, me: usize, rng: &std::cell::Cell<u64>) -> usize {
         let mine = self.count(me);
         let mut best = me;
         let mut best_open = mine;
-        for i in 0..self.open.len() {
+        let mut consider = |i: usize| {
             let n = self.count(i);
             if n < best_open {
                 best = i;
                 best_open = n;
+            }
+        };
+        let workers = self.open.len();
+        if workers <= PICK_SAMPLES + 1 {
+            (0..workers).for_each(&mut consider);
+        } else {
+            // Each count sits on a line its owner dirties on every open and
+            // close; reading all of them would cost an accept one cache miss
+            // per core. A few random others find a much less loaded worker
+            // about as reliably (the power of d choices) at a fixed cost.
+            for _ in 0..PICK_SAMPLES {
+                consider((next_random(rng) % workers as u64) as usize);
             }
         }
         if mine.saturating_sub(best_open) >= HANDOFF_MARGIN {
@@ -783,7 +812,6 @@ impl Balance {
             me
         }
     }
-
     /// Take `worker` out of the running for handoffs, for good.
     fn retire(&self, worker: usize) {
         self.open[worker].0.store(RETIRED, Ordering::Relaxed);
@@ -859,6 +887,9 @@ async fn worker_loop<F, S, G, H, U, C>(
     // is released when its task ends, which wakes this loop through
     // `balance.freed` if it was parked at the cap.
     let max_connections = cfg.limits.max_connections.max(1);
+    // Seeded per worker so their samples differ; never zero, which xorshift
+    // would never leave.
+    let rng = std::cell::Cell::new(0x9E37_79B9_7F4A_7C15 ^ (worker as u64 + 1));
     // Serve one connection on this worker. Its slot was already counted —
     // by this worker on accept, or by the one that handed it over.
     let serve = |stream: tokio::net::TcpStream, peer: SocketAddr| {
@@ -971,7 +1002,7 @@ async fn worker_loop<F, S, G, H, U, C>(
                         if cfg.tcp.nodelay {
                             let _ = stream.set_nodelay(true);
                         }
-                        let Some(target) = balance.place(worker) else {
+                        let Some(target) = balance.place(worker, &rng) else {
                             // Every worker filled up between this one's cap check
                             // and the accept — handoffs racing it. Shed this one
                             // rather than exceed the cap.
@@ -1897,15 +1928,20 @@ mod tests {
     #[test]
     fn pick_stays_local_within_the_margin_and_hands_off_beyond_it() {
         let (b, _inboxes) = Balance::new(3, 100);
-        assert_eq!(b.pick(1), 1, "all equal: stay");
+        let rng = std::cell::Cell::new(1);
+        assert_eq!(b.pick(1, &rng), 1, "all equal: stay");
         b.open[1].0.store(1, Ordering::Relaxed);
-        assert_eq!(b.pick(1), 1, "one more than the least: stay");
+        assert_eq!(b.pick(1, &rng), 1, "one more than the least: stay");
         b.open[1].0.store(2, Ordering::Relaxed);
         b.open[2].0.store(1, Ordering::Relaxed);
-        assert_eq!(b.pick(1), 0, "two more than the least: hand off to it");
+        assert_eq!(
+            b.pick(1, &rng),
+            0,
+            "two more than the least: hand off to it"
+        );
         b.retire(0);
         b.open[2].0.store(5, Ordering::Relaxed);
-        assert_eq!(b.pick(2), 1, "a retired worker is never picked");
+        assert_eq!(b.pick(2, &rng), 1, "a retired worker is never picked");
     }
 
     /// The cap holds under the pick: a worker at `cap` is never reserved,
@@ -1913,14 +1949,15 @@ mod tests {
     #[test]
     fn place_never_exceeds_the_cap() {
         let (b, _inboxes) = Balance::new(3, 2);
+        let rng = std::cell::Cell::new(1);
         let mut placed = Vec::new();
         for i in 0..6 {
-            placed.push(b.place(i % 3).expect("room left"));
+            placed.push(b.place(i % 3, &rng).expect("room left"));
         }
-        assert!(b.place(0).is_none(), "every worker is full");
+        assert!(b.place(0, &rng).is_none(), "every worker is full");
         assert!((0..3).all(|w| b.count(w) == 2), "{placed:?}");
         b.release(1);
-        assert_eq!(b.place(0), Some(1));
+        assert_eq!(b.place(0, &rng), Some(1));
     }
 
     /// A handoff still queued when a worker shuts down is served within the
@@ -1991,5 +2028,22 @@ mod tests {
             .await
             .expect("woken")
             .unwrap();
+    }
+
+    /// Past `PICK_SAMPLES + 1` workers, `pick` samples instead of scanning,
+    /// and still finds a far less loaded worker.
+    #[test]
+    fn pick_samples_on_a_large_machine_and_still_finds_room() {
+        let (b, _inboxes) = Balance::new(64, 1000);
+        let rng = std::cell::Cell::new(7);
+        for w in 0..64 {
+            b.open[w].0.store(50, Ordering::Relaxed);
+        }
+        // Half the workers idle: three samples miss them all one time in 8.
+        for w in (0..64).step_by(2) {
+            b.open[w].0.store(0, Ordering::Relaxed);
+        }
+        let handed = (0..1000).filter(|_| b.pick(1, &rng) != 1).count();
+        assert!(handed > 800, "{handed} of 1000");
     }
 }

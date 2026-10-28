@@ -88,7 +88,7 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> IoShared<IO> {
     /// rather than starting a `header_timeout` that ends in a 408 for a
     /// request never sent. Native's scanner draws the same line.
     fn note_read(&self, bytes: &[u8]) {
-        if self.clock.phase() == Phase::Idle && bytes.iter().any(|&b| b != b'\r' && b != b'\n') {
+        if self.clock.phase() == Phase::Idle && crate::parse::begins_request(bytes) {
             self.clock.set(Phase::Head);
         }
     }

@@ -112,6 +112,10 @@ pub(crate) struct PhaseClock {
     /// `body_timeout` bounds the body's arrival, not the handler, so an expiry
     /// in [`Phase::Handler`] only counts while this is still `false`.
     request_body_read: Rc<Cell<bool>>,
+    /// Whether the current request's body is finished at all — read to its
+    /// end *or failed*. A failed body awaits no more bytes either, so its
+    /// deadline has nothing left to bound.
+    request_body_finished: Rc<Cell<bool>>,
     notify: tokio::sync::Notify,
 }
 
@@ -124,6 +128,7 @@ impl PhaseClock {
             body_done: Cell::new(false),
             detached: Cell::new(false),
             request_body_read: Rc::new(Cell::new(false)),
+            request_body_finished: Rc::new(Cell::new(false)),
             notify: tokio::sync::Notify::new(),
         }
     }
@@ -162,6 +167,7 @@ impl PhaseClock {
         }
         if p == Phase::Handler {
             self.request_body_read.set(false);
+            self.request_body_finished.set(false);
         }
         self.phase.set(p);
         self.bump();
@@ -202,6 +208,12 @@ impl PhaseClock {
     /// body itself resets it when it is created.
     pub(crate) fn request_body_read(&self) -> Rc<Cell<bool>> {
         self.request_body_read.clone()
+    }
+
+    /// The flag the current request's body reports finishing through,
+    /// whether it was read to its end or failed.
+    pub(crate) fn request_body_finished(&self) -> Rc<Cell<bool>> {
+        self.request_body_finished.clone()
     }
 
     /// Record that the response body has no more frames to give.
@@ -257,9 +269,13 @@ async fn watchdog(clock: &PhaseClock, limits: &Limits, deadline: &mut ConnDeadli
                 if clock.generation.get() != generation {
                     continue;
                 }
-                // The body arrived in time; the handler's own runtime is not
-                // bounded, as natively. Nothing to time until the phase moves.
-                if phase == Phase::Handler && clock.request_body_read.get() {
+                // The body is finished — arrived in time, or failed, which
+                // awaits no more bytes either — and the handler's own runtime
+                // is not bounded, as natively. Nothing to time until the phase
+                // moves.
+                if phase == Phase::Handler
+                    && (clock.request_body_read.get() || clock.request_body_finished.get())
+                {
                     deadline.disarm();
                     clock.notify.notified().await;
                     continue;

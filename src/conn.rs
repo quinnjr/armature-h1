@@ -99,6 +99,9 @@ struct IoState<IO> {
     /// Kept so the head is not searched again to split it off and again to
     /// parse it. Cleared alongside `scanned`, for the same reason.
     head_end: Option<usize>,
+    /// Whether the current request's body is finished — read to its end or
+    /// failed — so its deadline has nothing left to bound.
+    body_finished: bool,
     /// How many bytes of a `100 Continue` are owed to the peer and not yet
     /// written; zero when none is.
     ///
@@ -193,6 +196,10 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> BodyIo for IoState<IO> {
         self.buf = joined;
     }
 
+    fn body_finished(&mut self) {
+        self.body_finished = true;
+    }
+
     fn poll_send_continue(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         while self.pending_continue > 0 {
             let rest = &CONTINUE[CONTINUE.len() - self.pending_continue..];
@@ -269,6 +276,7 @@ where
                 scanned: 0,
                 head_end: None,
                 pending_continue: 0,
+                body_finished: false,
             })),
             service,
             cfg,
@@ -419,8 +427,11 @@ where
                     .is_some_and(|v| v.eq_ignore_ascii_case("100-continue"));
             let is_head_request = head.method == Method::Head;
 
-            self.shared.borrow_mut().pending_continue =
-                if expects_continue { CONTINUE.len() } else { 0 };
+            {
+                let mut st = self.shared.borrow_mut();
+                st.pending_continue = if expects_continue { CONTINUE.len() } else { 0 };
+                st.body_finished = false;
+            }
 
             let dyn_io: Rc<RefCell<dyn BodyIo>> = self.shared.clone();
             // Shared with the body so the loop can tell, after the handler
@@ -516,14 +527,19 @@ where
                     ) {
                         d.arm(after);
                     }
-                    let body_armed = !body_read.get();
+                    // Finished covers a body that failed as well as one read
+                    // to its end: either way no bytes are awaited, so a
+                    // handler composing its answer to a bad body is not cut
+                    // off with a 408 it did nothing to earn.
+                    let body_finished = || body_read.get() || self.shared.borrow().body_finished;
+                    let body_armed = !body_finished();
                     if body_armed {
                         self.deadline.arm(self.cfg.limits.body_timeout);
                     }
                     let deadline = &mut self.deadline;
                     let mut handler_deadline = self.handler_deadline.as_mut();
                     let resp = std::future::poll_fn(|cx| {
-                        if body_armed && !body_read.get() && deadline.poll_expired(cx).is_ready() {
+                        if body_armed && !body_finished() && deadline.poll_expired(cx).is_ready() {
                             return Poll::Ready(Err(408));
                         }
                         if let Poll::Ready(resp) = call.as_mut().poll(cx) {
@@ -661,7 +677,16 @@ where
                 }
                 Some(Err(e)) => return Err(e),
                 Some(Ok(0)) => return Ok(HeadOutcome::Eof),
-                Some(Ok(_)) => {
+                Some(Ok(n)) => {
+                    // Judged on this read's bytes alone, before the scanner
+                    // below strips blank lines: rescanning the whole buffer on
+                    // every read would let a peer trickling CR/LF noise make
+                    // each read cost the buffer's length.
+                    let fresh_begins = {
+                        let st = self.shared.borrow();
+                        let len = st.buf.len();
+                        parse::begins_request(&st.buf[len - n.min(len)..])
+                    };
                     // Checked before arming the header deadline: a head that
                     // arrives whole in one read — nearly every one — has no
                     // use for it, and arming is not free.
@@ -678,7 +703,7 @@ where
                     // split across reads leaves a lone `\r` until its `\n`
                     // arrives. Only a byte that can begin a request line starts
                     // one — the same rule the hyper adapter applies.
-                    if !started && self.request_started() {
+                    if !started && fresh_begins {
                         started = true;
                         self.deadline.arm(self.cfg.limits.header_timeout);
                     }
@@ -691,20 +716,10 @@ where
         }
     }
 
-    /// Whether the buffered bytes have begun a request: whether any of them is
-    /// something other than CR or LF.
-    ///
-    /// Blank lines before a request line are not one (RFC 9112 section 2.2),
-    /// and neither is a lone CR waiting for its LF — a stray CRLF can arrive
-    /// split, or behind the previous request in the same read. Only a byte
-    /// that can begin a request line moves the connection from the idle
-    /// deadline to the header deadline; the hyper adapter draws the same line.
+    /// Whether what is already buffered has begun a request; see
+    /// [`parse::begins_request`]. Scanned once per request, on entry.
     fn request_started(&self) -> bool {
-        self.shared
-            .borrow()
-            .buf
-            .iter()
-            .any(|&b| b != b'\r' && b != b'\n')
+        parse::begins_request(&self.shared.borrow().buf)
     }
 
     /// Whether a complete head is buffered, resuming the search where the last

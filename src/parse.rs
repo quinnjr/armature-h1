@@ -70,6 +70,18 @@ impl ParseError {
     }
 }
 
+/// Whether `bytes` include one that can begin a request — anything but CR
+/// or LF.
+///
+/// Blank lines before a request line are not a request (RFC 9112 section
+/// 2.2), nor is a lone CR waiting for its LF: a stray CRLF can arrive split,
+/// or behind the previous request in the same read. Both backends decide with
+/// this whether a connection has moved from waiting under `idle_timeout` to
+/// reading a head under `header_timeout`, each over the bytes it just read.
+pub(crate) fn begins_request(bytes: &[u8]) -> bool {
+    bytes.iter().any(|&b| b != b'\r' && b != b'\n')
+}
+
 /// The index just past the `\r\n\r\n` terminating the head, or `None` if the
 /// head is not yet complete.
 ///
