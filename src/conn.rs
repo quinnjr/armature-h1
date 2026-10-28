@@ -624,6 +624,24 @@ where
     /// and it always sees the whole head region.
     fn has_complete_head(&self) -> bool {
         let mut st = self.shared.borrow_mut();
+        // RFC 9112 section 2.2: a server SHOULD ignore empty lines received
+        // before a request line. Only whole CRLFs, matching the strict line
+        // endings everywhere else, and only at the front, where a request line
+        // can never begin with CR — so this can never eat part of a head. A
+        // peer streaming nothing but CRLFs is bounded by the header deadline,
+        // and the discarded bytes never accumulate toward `max_head_bytes`.
+        let blank = st
+            .buf
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .take_while(|pair| *pair == b"\r\n")
+            .count()
+            * 2;
+        if blank > 0 {
+            bytes::Buf::advance(&mut st.buf, blank);
+            st.scanned = st.scanned.saturating_sub(blank);
+        }
         // A miss leaves `scanned == buf.len()`, so this also covers "called
         // twice without an intervening read".
         if st.buf.len() <= st.scanned {
@@ -1515,6 +1533,32 @@ mod tests {
             out.starts_with("HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\n"),
             "{out}"
         );
+    }
+
+    /// RFC 9112 section 2.2: empty lines before a request line are ignored,
+    /// including between pipelined requests.
+    #[tokio::test]
+    async fn empty_lines_before_a_request_line_are_ignored() {
+        let out = exchange(
+            b"\r\n\r\nGET / HTTP/1.1\r\nHost: a\r\n\r\n\r\nGET / HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n",
+            ok_service,
+            Limits::default(),
+        )
+        .await;
+        assert_eq!(out.matches("HTTP/1.1 200 OK").count(), 2, "{out}");
+    }
+
+    /// Only whole CRLFs: a bare LF before the request line is still refused,
+    /// as a bare LF anywhere in the head is.
+    #[tokio::test]
+    async fn a_bare_lf_before_a_request_line_is_still_refused() {
+        let out = exchange(
+            b"\nGET / HTTP/1.1\r\nHost: a\r\n\r\n",
+            ok_service,
+            Limits::default(),
+        )
+        .await;
+        assert!(out.starts_with("HTTP/1.1 400"), "{out}");
     }
 
     /// An error response for a later pipelined request is appended to the

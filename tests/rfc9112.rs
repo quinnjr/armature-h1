@@ -982,3 +982,35 @@ fn absolute_form_with_a_non_http_scheme_400_close() {
 fn malformed_host_400_close() {
     raw_exchange(b"GET / HTTP/1.1\r\nHost: user@a.example\r\n\r\n").assert_rejected_and_closed(400);
 }
+
+/// RFC 9112 section 2.2: empty lines before the request line are ignored.
+#[test]
+fn empty_lines_before_the_request_line_are_ignored() {
+    let ex = raw_exchange(b"\r\n\r\nGET / HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n");
+    assert_eq!(ex.status(), Some(200), "{:?}", ex.body);
+}
+
+/// RFC 9112 section 7.1.1: a chunk extension outside its grammar is refused.
+#[test]
+#[cfg_attr(
+    feature = "hyper-backend",
+    ignore = "see BACKENDS.md: chunk extensions outside their grammar \
+              (hyper skips an extension's bytes up to the CRLF unread)"
+)]
+fn chunk_extension_outside_its_grammar_400_close() {
+    raw_exchange(
+        b"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n5;\xe9\r\nhello\r\n0\r\n\r\n",
+    )
+    .assert_rejected_and_closed(400);
+}
+
+/// Positive twin: hyper serves it. Fails the build, rather than passing an
+/// ignored test silently, if hyper starts refusing it.
+#[test]
+#[cfg(feature = "hyper-backend")]
+fn hyper_chunk_extension_outside_its_grammar_is_served() {
+    let ex = raw_exchange(
+        b"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n5;\xe9\r\nhello\r\n0\r\n\r\n",
+    );
+    assert_eq!(ex.status(), Some(200), "{:?}", ex.body);
+}

@@ -363,32 +363,39 @@ fn find_line(
     }
 }
 
-/// Parse a chunk-size line: hex digits, optionally followed by `;extensions`.
+/// Parse a chunk-size line: hex digits, optionally followed by extensions.
+///
+/// `chunk-size [ chunk-ext ]` (RFC 9112 section 7.1.1). Extensions are not
+/// interpreted, but they are held to their grammar — a byte that fits no part
+/// of it means the framing is not what we think it is.
 fn parse_chunk_size(line: &[u8]) -> Result<u64, ChunkedError> {
-    let digits = match memchr::memchr(b';', line) {
-        Some(i) => {
-            // Extensions are not interpreted, but they must be printable ASCII;
-            // control bytes here mean the framing is not what we think it is.
-            if line[i + 1..]
-                .iter()
-                .any(|&b| b < 0x20 && b != b'\t' || b == 0x7f)
-            {
-                return Err(ChunkedError::BadExtension);
-            }
-            &line[..i]
-        }
-        None => line,
-    };
-
-    if digits.is_empty() {
+    let digits_end = line
+        .iter()
+        .position(|b| !b.is_ascii_hexdigit())
+        .unwrap_or(line.len());
+    let (digits, ext) = line.split_at(digits_end);
+    // Anything but an extension's start right after the digits is a bad size,
+    // not a bad extension: `5x` is a size that is not hex.
+    if digits.is_empty()
+        || ext
+            .first()
+            .is_some_and(|b| !matches!(b, b';' | b' ' | b'\t'))
+    {
         return Err(ChunkedError::BadSize);
     }
-    if digits.len() > MAX_SIZE_DIGITS {
+    if !ext.is_empty() {
+        check_chunk_ext(ext)?;
+    }
+    // Leading zeros carry no value, so they do not count against the digit
+    // limit: `00000000000000000005` is five, not an overflow. The size line as
+    // a whole is still bounded, so this cannot be stretched indefinitely.
+    let significant = &digits[digits.iter().take_while(|&&b| b == b'0').count()..];
+    if significant.len() > MAX_SIZE_DIGITS {
         return Err(ChunkedError::SizeOverflow);
     }
 
     let mut size: u64 = 0;
-    for &b in digits {
+    for &b in significant {
         let d = match b {
             b'0'..=b'9' => b - b'0',
             b'a'..=b'f' => b - b'a' + 10,
@@ -401,6 +408,90 @@ fn parse_chunk_size(line: &[u8]) -> Result<u64, ChunkedError> {
             .ok_or(ChunkedError::SizeOverflow)?;
     }
     Ok(size)
+}
+
+/// Validate `chunk-ext`:
+///
+/// ```text
+/// chunk-ext      = *( BWS ";" BWS chunk-ext-name [ BWS "=" BWS chunk-ext-val ] )
+/// chunk-ext-name = token
+/// chunk-ext-val  = token / quoted-string
+/// ```
+///
+/// Anything after the size digits must parse as this, so whitespace not
+/// followed by `;` is refused, and a byte at or above `0x80` is accepted only
+/// inside a quoted string, where `obs-text` allows it.
+fn check_chunk_ext(mut ext: &[u8]) -> Result<(), ChunkedError> {
+    fn bws(s: &[u8]) -> &[u8] {
+        let n = s.iter().take_while(|&&b| b == b' ' || b == b'\t').count();
+        &s[n..]
+    }
+    fn token(s: &[u8]) -> Result<&[u8], ChunkedError> {
+        let n = s.iter().take_while(|&&b| is_tchar(b)).count();
+        if n == 0 {
+            return Err(ChunkedError::BadExtension);
+        }
+        Ok(&s[n..])
+    }
+    fn quoted(s: &[u8]) -> Result<&[u8], ChunkedError> {
+        let mut i = 1; // past the opening DQUOTE
+        loop {
+            match s.get(i) {
+                None => return Err(ChunkedError::BadExtension),
+                Some(b'"') => return Ok(&s[i + 1..]),
+                Some(b'\\') => match s.get(i + 1) {
+                    Some(&b)
+                        if b == b'\t' || b == b' ' || (0x21..=0x7e).contains(&b) || b >= 0x80 =>
+                    {
+                        i += 2
+                    }
+                    _ => return Err(ChunkedError::BadExtension),
+                },
+                Some(&b) if b == b'\t' || b == b' ' || (0x21..=0x7e).contains(&b) || b >= 0x80 => {
+                    i += 1
+                }
+                Some(_) => return Err(ChunkedError::BadExtension),
+            }
+        }
+    }
+
+    while !ext.is_empty() {
+        ext = bws(ext);
+        ext = ext.strip_prefix(b";").ok_or(ChunkedError::BadExtension)?;
+        ext = token(bws(ext))?;
+        let rest = bws(ext);
+        if let Some(after_eq) = rest.strip_prefix(b"=") {
+            let v = bws(after_eq);
+            ext = if v.first() == Some(&b'"') {
+                quoted(v)?
+            } else {
+                token(v)?
+            };
+        }
+    }
+    Ok(())
+}
+
+/// `tchar` (RFC 9110 section 5.6.2).
+fn is_tchar(b: u8) -> bool {
+    b.is_ascii_alphanumeric()
+        || matches!(
+            b,
+            b'!' | b'#'
+                | b'$'
+                | b'%'
+                | b'&'
+                | b'\''
+                | b'*'
+                | b'+'
+                | b'-'
+                | b'.'
+                | b'^'
+                | b'_'
+                | b'`'
+                | b'|'
+                | b'~'
+        )
 }
 
 #[cfg(test)]
@@ -498,6 +589,51 @@ mod tests {
             b"1f\r\n0123456789012345678901234567890\r\n0\r\n\r\n",
         );
         assert_eq!(upper.unwrap(), lower.unwrap());
+    }
+
+    #[test]
+    fn leading_zeros_do_not_count_against_the_size_digit_limit() {
+        let events = drain(&mut dec(), b"00000000000000000005\r\nhello\r\n0\r\n\r\n").unwrap();
+        assert_eq!(events[0], data("hello"));
+        assert_eq!(
+            drain(&mut dec(), b"00011111111111111111\r\n"),
+            Err(ChunkedError::SizeOverflow)
+        );
+    }
+
+    /// RFC 9112 section 7.1.1: extensions follow their grammar, with BWS
+    /// around the separators and obs-text only inside a quoted value.
+    #[test]
+    fn accepts_extensions_that_follow_the_grammar() {
+        for raw in [
+            &b"5;a\r\nhello\r\n0\r\n\r\n"[..],
+            b"5 ; a = b ;c\r\nhello\r\n0\r\n\r\n",
+            b"5;a=\"q \\\" \xe9\"\r\nhello\r\n0\r\n\r\n",
+            b"5\t;a=b\r\nhello\r\n0\r\n\r\n",
+        ] {
+            let events = drain(&mut dec(), raw).unwrap_or_else(|e| panic!("{raw:?}: {e:?}"));
+            assert_eq!(events[0], data("hello"), "{raw:?}");
+        }
+    }
+
+    #[test]
+    fn rejects_extensions_outside_the_grammar() {
+        for raw in [
+            &b"5;\xe9\r\nhello\r\n0\r\n\r\n"[..],
+            b"5;a=\xe9\r\nhello\r\n0\r\n\r\n",
+            b"5;\r\nhello\r\n0\r\n\r\n",
+            b"5;a=\r\nhello\r\n0\r\n\r\n",
+            b"5;a=\"open\r\nhello\r\n0\r\n\r\n",
+            b"5;a b\r\nhello\r\n0\r\n\r\n",
+            b"5 \r\nhello\r\n0\r\n\r\n",
+            b"5;a=\"\x01\"\r\nhello\r\n0\r\n\r\n",
+        ] {
+            assert_eq!(
+                drain(&mut dec(), raw),
+                Err(ChunkedError::BadExtension),
+                "{raw:?}"
+            );
+        }
     }
 
     #[test]
