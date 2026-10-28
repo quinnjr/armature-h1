@@ -663,6 +663,10 @@ type Handoff = (std::net::TcpStream, SocketAddr);
 struct Balance {
     open: Box<[PaddedCount]>,
     inbox: Box<[tokio::sync::mpsc::UnboundedSender<Handoff>]>,
+    /// Per worker, woken whenever a slot of that worker's is released — by
+    /// any thread, since another worker gives back a slot it reserved on this
+    /// one when a handoff fails. A worker parked at its cap waits on it.
+    freed: Box<[tokio::sync::Notify]>,
     cap: usize,
 }
 
@@ -702,6 +706,7 @@ impl Balance {
             Self {
                 open,
                 inbox: senders.into_boxed_slice(),
+                freed: (0..workers).map(|_| tokio::sync::Notify::new()).collect(),
                 cap: cap.max(1),
             },
             receivers,
@@ -729,6 +734,7 @@ impl Balance {
     /// Give back a slot taken with [`reserve`](Self::reserve).
     fn release(&self, worker: usize) {
         self.open[worker].0.fetch_sub(1, Ordering::Relaxed);
+        self.freed[worker].notify_one();
     }
 
     /// Find a slot for a connection `me` just accepted: the least-loaded
@@ -831,11 +837,10 @@ async fn worker_loop<F, S, G, H, U, C>(
 
     let local = tokio::task::LocalSet::new();
 
-    // Per-worker connection cap. Thread-local state, so a `Cell` and a
-    // `Notify` suffice: each connection task decrements on exit and wakes the
-    // accept loop if it was parked at the cap.
+    // Per-worker connection cap, counted in `balance`: each connection's slot
+    // is released when its task ends, which wakes this loop through
+    // `balance.freed` if it was parked at the cap.
     let max_connections = cfg.limits.max_connections.max(1);
-    let slot_freed = Rc::new(tokio::sync::Notify::new());
     // Serve one connection on this worker. Its slot was already counted —
     // by this worker on accept, or by the one that handed it over.
     let serve = |stream: tokio::net::TcpStream, peer: SocketAddr| {
@@ -843,7 +848,6 @@ async fn worker_loop<F, S, G, H, U, C>(
         let slot = ConnSlot {
             balance: balance.clone(),
             worker,
-            freed: slot_freed.clone(),
         };
         tokio::task::spawn_local(async move {
             // Held for the task's life; released on drop,
@@ -885,7 +889,7 @@ async fn worker_loop<F, S, G, H, U, C>(
                                 break;
                             }
                         }
-                        _ = slot_freed.notified() => {}
+                        _ = balance.freed[worker].notified() => {}
                         // A handoff reserved its slot before it was sent, so
                         // serving it never takes this worker past the cap.
                         Some(handoff) = inbox.recv() => adopt(handoff),
@@ -988,14 +992,22 @@ async fn worker_loop<F, S, G, H, U, C>(
     // connection back and serves it itself. Connections already queued were
     // accepted before shutdown like any other, so they are served within the
     // grace window rather than reset.
+    //
+    // Inside the `LocalSet`: serving one spawns its task there, and outside of
+    // `run_until` there is no `LocalSet` to spawn on.
     balance.retire(worker);
     inbox.close();
-    while let Ok(handoff) = inbox.try_recv() {
-        // Retiring overwrote the count; recount so the slot's release on close
-        // has something to release. RETIRED is far enough from overflow.
-        balance.open[worker].0.fetch_add(1, Ordering::Relaxed);
-        adopt(handoff);
-    }
+    local
+        .run_until(async {
+            while let Ok(handoff) = inbox.try_recv() {
+                // Retiring overwrote the count; recount so the slot's release
+                // on close has something to release. RETIRED is far enough
+                // from overflow.
+                balance.open[worker].0.fetch_add(1, Ordering::Relaxed);
+                adopt(handoff);
+            }
+        })
+        .await;
     // Drain: give in-flight connections a bounded window to finish.
     let _ = tokio::time::timeout(cfg.shutdown_grace, local).await;
 }
@@ -1004,13 +1016,12 @@ async fn worker_loop<F, S, G, H, U, C>(
 struct ConnSlot {
     balance: Arc<Balance>,
     worker: usize,
-    freed: Rc<tokio::sync::Notify>,
 }
 
 impl Drop for ConnSlot {
     fn drop(&mut self) {
+        // Wakes this worker if it is parked at its cap.
         self.balance.release(self.worker);
-        self.freed.notify_one();
     }
 }
 
@@ -1886,5 +1897,75 @@ mod tests {
         assert!((0..3).all(|w| b.count(w) == 2), "{placed:?}");
         b.release(1);
         assert_eq!(b.place(0), Some(1));
+    }
+
+    /// A handoff still queued when a worker shuts down is served within the
+    /// grace window — from inside the worker's `LocalSet`, where its task can
+    /// be spawned. A worker that has already been told to stop when it starts
+    /// reaches that drain straight away.
+    #[test]
+    fn a_handoff_queued_at_shutdown_is_served() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let listener = std::net::TcpListener::bind(loopback()).unwrap();
+        let (balance, mut inboxes) = Balance::new(1, 10);
+        let balance = Arc::new(balance);
+        let inbox = inboxes[0].take().unwrap();
+
+        // A connected socket pair, the server side queued as a handoff.
+        let side = std::net::TcpListener::bind(loopback()).unwrap();
+        let mut client = std::net::TcpStream::connect(side.local_addr().unwrap()).unwrap();
+        let (server_side, peer) = side.accept().unwrap();
+        server_side.set_nonblocking(true).unwrap();
+        assert!(balance.reserve(0));
+        balance.inbox[0].send((server_side, peer)).unwrap();
+        use std::io::{Read, Write};
+        client
+            .write_all(b"GET / HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n")
+            .unwrap();
+
+        let (_tx, rx) = watch::channel(true);
+        let started = AtomicUsize::new(0);
+        let cfg = test_config(1).limits(Limits {
+            ..Default::default()
+        });
+        rt.block_on(worker_loop(
+            listener,
+            || hello,
+            || CloseH2,
+            || CloseUpgrade,
+            cfg,
+            rx,
+            Startup {
+                worker: 0,
+                started: &started,
+                peers: Peers { balance, inbox },
+            },
+        ));
+
+        let mut out = String::new();
+        client.read_to_string(&mut out).unwrap();
+        assert!(out.starts_with("HTTP/1.1 200 OK"), "{out:?}");
+    }
+
+    /// A slot released from another thread wakes the worker it belongs to,
+    /// which may be parked at its cap waiting for exactly that.
+    #[tokio::test]
+    async fn a_release_from_another_thread_wakes_the_owning_worker() {
+        let (b, _inboxes) = Balance::new(2, 1);
+        let b = Arc::new(b);
+        assert!(b.reserve(0));
+        let waiting = b.clone();
+        let parked = tokio::spawn(async move { waiting.freed[0].notified().await });
+        let releaser = b.clone();
+        std::thread::spawn(move || releaser.release(0))
+            .join()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), parked)
+            .await
+            .expect("woken")
+            .unwrap();
     }
 }

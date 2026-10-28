@@ -319,6 +319,31 @@ pub fn intern(name: &str) -> HeaderId {
     HeaderId::Other(ByteStr::from(name))
 }
 
+/// `tchar` (RFC 9110 section 5.6.2): the bytes a token is made of.
+///
+/// The one definition behind field names, trailer names and chunk-extension
+/// names alike.
+pub(crate) fn is_tchar(b: u8) -> bool {
+    b.is_ascii_alphanumeric()
+        || matches!(
+            b,
+            b'!' | b'#'
+                | b'$'
+                | b'%'
+                | b'&'
+                | b'\''
+                | b'*'
+                | b'+'
+                | b'-'
+                | b'.'
+                | b'^'
+                | b'_'
+                | b'`'
+                | b'|'
+                | b'~'
+        )
+}
+
 /// Whether a comma-separated field value lists `token`, compared
 /// case-insensitively with OWS trimmed from each element.
 pub(crate) fn value_has_token(value: &[u8], token: &str) -> bool {

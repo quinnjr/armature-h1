@@ -9,7 +9,7 @@
 //! unit-tested and differentially fuzzed against another implementation.
 
 use crate::header::HeaderId;
-use crate::{Head, Limits, Version};
+use crate::{Head, Limits, Method, Version};
 
 /// How to read the request body.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -51,17 +51,20 @@ pub enum FramingError {
     /// More than one `Host` is ambiguous at any version.
     #[error("multiple Host fields")]
     MultipleHost,
-    /// `Host` was empty or not a `uri-host [ ":" port ]` (RFC 9112 section 3.2).
+    /// `Host` was not a `uri-host [ ":" port ]` (RFC 9112 section 3.2). An empty
+    /// `Host` is valid: it is how a client says the target has no authority.
     #[error("invalid Host")]
     InvalidHost,
     /// An absolute-form target's authority was empty, carried userinfo, or was
-    /// not a `uri-host [ ":" port ]`.
+    /// not a `uri-host [ ":" port ]`; or a CONNECT target was not exactly
+    /// `uri-host ":" port`.
     #[error("invalid authority in the request target")]
     InvalidAuthority,
     /// An absolute-form target named a scheme other than `http` or `https`.
     #[error("unsupported scheme in the request target")]
     UnsupportedScheme,
-    /// `Host` named a different authority than an absolute-form target.
+    /// `Host` named a different authority than an absolute-form or CONNECT
+    /// target.
     #[error("Host disagrees with the request target's authority")]
     HostMismatch,
     /// The declared body exceeded `Limits::max_body_bytes`.
@@ -97,6 +100,23 @@ fn check_authority(head: &Head) -> Result<(), FramingError> {
         Some(v) if !v.is_empty() => Some(parse_authority(v).ok_or(FramingError::InvalidHost)?),
         _ => None,
     };
+    // CONNECT's authority-form target (RFC 9112 section 3.2.3) is the
+    // request's authority just as an absolute-form one is, and is held to the
+    // same rules: a real `uri-host ":" port`, no userinfo, and no `Host`
+    // naming somewhere else.
+    if head.method == Method::Connect {
+        let (target_host, target_port) = parse_authority(head.target().as_bytes())
+            .filter(|(_, port)| port.is_some())
+            .ok_or(FramingError::InvalidAuthority)?;
+        if let Some((host, port)) = host {
+            let same = host.eq_ignore_ascii_case(target_host)
+                && port.is_none_or(|p| Some(p) == target_port);
+            if !same {
+                return Err(FramingError::HostMismatch);
+            }
+        }
+        return Ok(());
+    }
     let Some(scheme) = head.absolute_scheme() else {
         return Ok(());
     };
@@ -440,6 +460,32 @@ mod tests {
                 "{raw:?}"
             );
         }
+    }
+
+    /// CONNECT's target is its authority, held to the same rules.
+    #[test]
+    fn connect_targets_are_validated_and_reconciled_with_host() {
+        let ok = |raw: &'static [u8]| decide(&head(raw), &Limits::default());
+        assert_eq!(
+            ok(b"CONNECT a.example:443 HTTP/1.1\r\nHost: a.example:443\r\n\r\n"),
+            Ok(BodyKind::None)
+        );
+        assert_eq!(
+            ok(b"CONNECT a.example:443 HTTP/1.1\r\nHost: A.example\r\n\r\n"),
+            Ok(BodyKind::None)
+        );
+        assert_eq!(
+            ok(b"CONNECT trusted@evil.example:443 HTTP/1.1\r\nHost: good.example\r\n\r\n"),
+            Err(FramingError::InvalidAuthority)
+        );
+        assert_eq!(
+            ok(b"CONNECT a.example:443 HTTP/1.1\r\nHost: good.example\r\n\r\n"),
+            Err(FramingError::HostMismatch)
+        );
+        assert_eq!(
+            ok(b"CONNECT a.example:443 HTTP/1.1\r\nHost: a.example:8443\r\n\r\n"),
+            Err(FramingError::HostMismatch)
+        );
     }
 
     #[test]

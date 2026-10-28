@@ -359,12 +359,7 @@ fn validate_target_form(target: &[u8], method: &Method) -> Result<(), ParseError
 
     // absolute-form: a valid scheme, then `://`.
     if let Some(i) = target.windows(3).position(|w| w == b"://") {
-        let scheme = &target[..i];
-        let valid_scheme = scheme.first().is_some_and(|b| b.is_ascii_alphabetic())
-            && scheme
-                .iter()
-                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.'));
-        return if valid_scheme {
+        return if crate::head::valid_scheme(&target[..i]) {
             Ok(())
         } else {
             Err(ParseError::InvalidTarget)

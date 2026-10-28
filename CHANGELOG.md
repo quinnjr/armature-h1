@@ -34,13 +34,16 @@ match it (4 → 2), and a pipelined batch is served at roughly 4.5× the rate.
 
 - **Breaking:** `FramingError` is `#[non_exhaustive]` and gains `InvalidHost`,
   `InvalidAuthority`, `UnsupportedScheme` and `HostMismatch`.
+- **Breaking:** `Limits` gains the public field `handler_timeout`, so a
+  `Limits { .. }` literal that names every field without `..Default::default()`
+  no longer compiles.
 - `Head::path()` returns only the path component of an absolute-form target
   (`/` when empty). New `Head::authority()` and `Head::absolute_scheme()`.
 - `Limits::body_timeout` bounds the body's arrival, not the handler: a handler
   runs unbounded once its body is read, or when there is none.
 - The `tls` feature requires `rustls-webpki` 0.103.16 (RUSTSEC-2026-0382).
-- New `Limits::handler_timeout` (default `None`): bounds a handler's own
-  runtime, answering `503` and closing.
+- `Limits::handler_timeout` (default `None`) bounds a handler's own runtime,
+  answering `503` and closing.
 
 ### Fixed
 

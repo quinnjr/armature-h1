@@ -159,11 +159,17 @@ pub(crate) fn forbids_body_framing(status: u16) -> bool {
     matches!(status, 204 | 304) || (100..200).contains(&status)
 }
 
-/// Write a handler `Connection` field minus its `close` and `keep-alive`
-/// tokens, or nothing if no other token is left.
-fn write_connection_without_persistence(out: &mut BytesMut, value: &[u8]) {
-    let mut first = true;
-    for token in value
+/// Whether a handler `Connection` field carries a token the server owns.
+pub(crate) fn has_persistence_token(value: &[u8]) -> bool {
+    header::value_has_token(value, "close") || header::value_has_token(value, "keep-alive")
+}
+
+/// The tokens of a `Connection` field other than `close` and `keep-alive`.
+///
+/// The one definition both backends filter a handler's field through, so
+/// which tokens count as the server's cannot drift between them.
+pub(crate) fn non_persistence_tokens(value: &[u8]) -> impl Iterator<Item = &[u8]> {
+    value
         .split(|&b| b == b',')
         .map(crate::framing::trim_ows)
         .filter(|t| {
@@ -171,7 +177,13 @@ fn write_connection_without_persistence(out: &mut BytesMut, value: &[u8]) {
                 && !t.eq_ignore_ascii_case(b"close")
                 && !t.eq_ignore_ascii_case(b"keep-alive")
         })
-    {
+}
+
+/// Write a handler `Connection` field minus its `close` and `keep-alive`
+/// tokens, or nothing if no other token is left.
+fn write_connection_without_persistence(out: &mut BytesMut, value: &[u8]) {
+    let mut first = true;
+    for token in non_persistence_tokens(value) {
         out.put_slice(if first { b"connection: " } else { b", " });
         out.put_slice(token);
         first = false;
@@ -255,27 +267,7 @@ fn valid_field_value(value: &[u8]) -> bool {
 /// value does.
 #[inline]
 pub(crate) fn valid_field_name(name: &str) -> bool {
-    !name.is_empty()
-        && name.bytes().all(|b| {
-            b.is_ascii_alphanumeric()
-                || matches!(
-                    b,
-                    b'!' | b'#'
-                        | b'$'
-                        | b'%'
-                        | b'&'
-                        | b'\''
-                        | b'*'
-                        | b'+'
-                        | b'-'
-                        | b'.'
-                        | b'^'
-                        | b'_'
-                        | b'`'
-                        | b'|'
-                        | b'~'
-                )
-        })
+    !name.is_empty() && name.bytes().all(header::is_tchar)
 }
 
 /// Whether this field may be emitted as-is.
@@ -498,10 +490,7 @@ pub(crate) fn write_head_for(
             );
             continue;
         }
-        if id == &HeaderId::Connection
-            && (header::value_has_token(value, "close")
-                || header::value_has_token(value, "keep-alive"))
-        {
+        if id == &HeaderId::Connection && has_persistence_token(value) {
             // Persistence is the server's to state, so those two tokens go;
             // the rest of the list stays. Dropping the whole field would take
             // `upgrade` with it, and a 101 without `Connection: upgrade` is a

@@ -443,16 +443,10 @@ fn convert_response(
         // As natively, only the persistence tokens are dropped: `upgrade` and
         // any other token beside them stays, or a 101 loses the
         // `Connection: upgrade` its handshake needs.
-        let value = if id == HeaderId::Connection {
-            let rest: Vec<&[u8]> = value
-                .split(|&b| b == b',')
-                .map(crate::framing::trim_ows)
-                .filter(|t| {
-                    !t.is_empty()
-                        && !t.eq_ignore_ascii_case(b"close")
-                        && !t.eq_ignore_ascii_case(b"keep-alive")
-                })
-                .collect();
+        // The filter is `write`'s, so the backends cannot disagree on which
+        // tokens are the server's; a field with none of them passes as is.
+        let value = if id == HeaderId::Connection && crate::write::has_persistence_token(&value) {
+            let rest: Vec<&[u8]> = crate::write::non_persistence_tokens(&value).collect();
             if rest.is_empty() {
                 continue;
             }

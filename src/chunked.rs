@@ -425,16 +425,19 @@ fn parse_chunk_size(line: &[u8]) -> Result<u64, ChunkedError> {
 /// chunk-ext-val  = token / quoted-string
 /// ```
 ///
-/// Anything after the size digits must parse as this, so whitespace not
-/// followed by `;` is refused, and a byte at or above `0x80` is accepted only
-/// inside a quoted string, where `obs-text` allows it.
+/// Anything after the size digits must parse as this, plus optional trailing
+/// whitespace; a byte at or above `0x80` is accepted only inside a quoted
+/// string, where `obs-text` allows it.
 fn check_chunk_ext(mut ext: &[u8]) -> Result<(), ChunkedError> {
     fn bws(s: &[u8]) -> &[u8] {
         let n = s.iter().take_while(|&&b| b == b' ' || b == b'\t').count();
         &s[n..]
     }
     fn token(s: &[u8]) -> Result<&[u8], ChunkedError> {
-        let n = s.iter().take_while(|&&b| is_tchar(b)).count();
+        let n = s
+            .iter()
+            .take_while(|&&b| crate::header::is_tchar(b))
+            .count();
         if n == 0 {
             return Err(ChunkedError::BadExtension);
         }
@@ -462,8 +465,14 @@ fn check_chunk_ext(mut ext: &[u8]) -> Result<(), ChunkedError> {
         }
     }
 
-    while !ext.is_empty() {
+    loop {
+        // Trailing whitespace before the CRLF is tolerated, as hyper — the
+        // other backend — tolerates it: it cannot change where the line ends,
+        // so refusing it would only split the backends for nothing.
         ext = bws(ext);
+        if ext.is_empty() {
+            break;
+        }
         ext = ext.strip_prefix(b";").ok_or(ChunkedError::BadExtension)?;
         ext = token(bws(ext))?;
         let rest = bws(ext);
@@ -477,28 +486,6 @@ fn check_chunk_ext(mut ext: &[u8]) -> Result<(), ChunkedError> {
         }
     }
     Ok(())
-}
-
-/// `tchar` (RFC 9110 section 5.6.2).
-fn is_tchar(b: u8) -> bool {
-    b.is_ascii_alphanumeric()
-        || matches!(
-            b,
-            b'!' | b'#'
-                | b'$'
-                | b'%'
-                | b'&'
-                | b'\''
-                | b'*'
-                | b'+'
-                | b'-'
-                | b'.'
-                | b'^'
-                | b'_'
-                | b'`'
-                | b'|'
-                | b'~'
-        )
 }
 
 #[cfg(test)]
@@ -617,6 +604,8 @@ mod tests {
             b"5 ; a = b ;c\r\nhello\r\n0\r\n\r\n",
             b"5;a=\"q \\\" \xe9\"\r\nhello\r\n0\r\n\r\n",
             b"5\t;a=b\r\nhello\r\n0\r\n\r\n",
+            b"5 \r\nhello\r\n0\r\n\r\n",
+            b"5;a=b \t\r\nhello\r\n0\r\n\r\n",
         ] {
             let events = drain(&mut dec(), raw).unwrap_or_else(|e| panic!("{raw:?}: {e:?}"));
             assert_eq!(events[0], data("hello"), "{raw:?}");
@@ -632,8 +621,8 @@ mod tests {
             b"5;a=\r\nhello\r\n0\r\n\r\n",
             b"5;a=\"open\r\nhello\r\n0\r\n\r\n",
             b"5;a b\r\nhello\r\n0\r\n\r\n",
-            b"5 \r\nhello\r\n0\r\n\r\n",
             b"5;a=\"\x01\"\r\nhello\r\n0\r\n\r\n",
+            b"5 x\r\nhello\r\n0\r\n\r\n",
         ] {
             assert_eq!(
                 drain(&mut dec(), raw),

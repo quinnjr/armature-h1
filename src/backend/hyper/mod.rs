@@ -198,13 +198,13 @@ impl PhaseClock {
         }
     }
 
-    /// Record that the response body has no more frames to give.
     /// The flag the current request's body reports its end through. The
     /// body itself resets it when it is created.
     pub(crate) fn request_body_read(&self) -> Rc<Cell<bool>> {
         self.request_body_read.clone()
     }
 
+    /// Record that the response body has no more frames to give.
     pub(crate) fn note_body_end(&self) {
         self.body_done.set(true);
     }

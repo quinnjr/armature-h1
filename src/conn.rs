@@ -449,12 +449,6 @@ where
             // written — a `100 Continue` is written straight to the transport —
             // and before a handler that does not finish at once can hold them
             // back for as long as it takes.
-            if let (Some(after), Some(d)) = (
-                self.cfg.limits.handler_timeout,
-                self.handler_deadline.as_mut(),
-            ) {
-                d.arm(after);
-            }
             let mut early = None;
             if !self.out.is_empty() {
                 if !expects_continue {
@@ -476,6 +470,17 @@ where
                 if early.is_none() {
                     self.flush().await?;
                 }
+            }
+            // Armed only now: writing the earlier responses above is the write
+            // deadline's business, and a slow reader must not spend this
+            // handler's budget. hyper starts the same clock at the call.
+            if early.is_none()
+                && let (Some(after), Some(d)) = (
+                    self.cfg.limits.handler_timeout,
+                    self.handler_deadline.as_mut(),
+                )
+            {
+                d.arm(after);
             }
             // `poll_fn` over the pinned call rather than `select!`, which takes
             // its futures by value: with the request's inline header array
@@ -1030,7 +1035,6 @@ where
     }
 }
 
-/// Why head reading stopped.
 /// Finished pipelined responses, held while the next handler is first polled.
 ///
 /// They are normally put back and written with the next response. If the
@@ -1072,6 +1076,7 @@ impl<IO> IoState<IO> {
     }
 }
 
+/// Why head reading stopped.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum HeadOutcome {
     /// A complete head is buffered.

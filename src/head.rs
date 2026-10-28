@@ -51,6 +51,18 @@ fn find_query(target: &ByteStr) -> Option<usize> {
     target.as_bytes().iter().position(|&b| b == b'?')
 }
 
+/// `scheme = ALPHA *( ALPHA / DIGIT / "+" / "-" / "." )` (RFC 3986
+/// section 3.1).
+///
+/// Shared with the parser's absolute-form check, so a target the parser
+/// accepts as absolute-form is the one `Head` splits as such.
+pub(crate) fn valid_scheme(scheme: &[u8]) -> bool {
+    scheme.first().is_some_and(u8::is_ascii_alphabetic)
+        && scheme
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.'))
+}
+
 /// The authority's byte range when `target` is in absolute form: a scheme,
 /// `://`, then everything up to the first `/`, `?` or `#`.
 ///
@@ -61,12 +73,7 @@ fn find_absolute_authority(target: &[u8]) -> Option<(usize, usize)> {
         return None;
     }
     let i = target.windows(3).position(|w| w == b"://")?;
-    let scheme = &target[..i];
-    let valid_scheme = scheme.first().is_some_and(u8::is_ascii_alphabetic)
-        && scheme
-            .iter()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.'));
-    if !valid_scheme {
+    if !valid_scheme(&target[..i]) {
         return None;
     }
     let start = i + 3;
@@ -164,6 +171,8 @@ impl Head {
     /// absolute-form or CONNECT authority-form target, the `Host` field's
     /// otherwise.
     ///
+    /// `None` when there is none: no `Host`, or an empty one.
+    ///
     /// RFC 9112 section 3.2.2 makes the target's authority win over `Host`.
     /// [`framing::decide`](crate::framing::decide) also rejects a request
     /// whose `Host` disagrees with it, so after that check the two never
@@ -175,7 +184,9 @@ impl Head {
         if self.method == Method::Connect {
             return Some(self.target.as_str());
         }
-        self.get_str(&HeaderId::Host)
+        // An empty `Host` says the target has no authority (RFC 9112 section
+        // 3.2), so it names none.
+        self.get_str(&HeaderId::Host).filter(|h| !h.is_empty())
     }
 
     /// The scheme of an absolute-form target, as received.

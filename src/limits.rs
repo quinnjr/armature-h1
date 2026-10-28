@@ -27,7 +27,7 @@ pub struct Limits {
     /// Maximum header field count. Exceeding this yields 431 and closes.
     ///
     /// Values above [`MAX_HEADERS_CEILING`] are clamped to it, with a
-    /// `tracing::warn!`, by [`Limits::clamp_max_headers`] — called from both
+    /// `tracing::warn!`, by `Limits::clamp_max_headers` (crate-internal) — called from both
     /// [`Config::limits`](crate::server::Config::limits) and the worker setup
     /// in `server::worker_loop`, since `Config`'s fields are public and so
     /// `cfg.limits` can also be set directly, bypassing the former — the
