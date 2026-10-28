@@ -138,10 +138,8 @@ impl Head {
         // Byte-level, OWS-only trimming: `str::trim` would also strip Unicode
         // whitespace and read `close\xC2\xA0` as `close`, disagreeing with
         // every other hop on the connection's fate.
-        self.all(&HeaderId::Connection).any(|v| {
-            v.split(|&b| b == b',')
-                .any(|t| crate::framing::trim_ows(t).eq_ignore_ascii_case(token.as_bytes()))
-        })
+        self.all(&HeaderId::Connection)
+            .any(|v| crate::header::value_has_token(v, token))
     }
 
     /// Whether the connection should persist after this request.

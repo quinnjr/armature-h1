@@ -319,6 +319,14 @@ pub fn intern(name: &str) -> HeaderId {
     HeaderId::Other(ByteStr::from(name))
 }
 
+/// Whether a comma-separated field value lists `token`, compared
+/// case-insensitively with OWS trimmed from each element.
+pub(crate) fn value_has_token(value: &[u8], token: &str) -> bool {
+    value
+        .split(|&b| b == b',')
+        .any(|t| crate::framing::trim_ows(t).eq_ignore_ascii_case(token.as_bytes()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

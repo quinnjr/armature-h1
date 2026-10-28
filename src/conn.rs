@@ -655,13 +655,47 @@ where
         // An unread request body means the next bytes on the wire are body
         // bytes, not a request line. Rather than guess where the body ended,
         // close.
-        let keep_alive = req_keep_alive && !upgrading;
+        let mut keep_alive = req_keep_alive && !upgrading;
 
         let Response {
-            status,
+            mut status,
             mut headers,
-            body,
+            mut body,
         } = resp;
+
+        // A final response needs a final status. Anything outside 200..=599
+        // cannot be one — `1000` is not a status line a peer can parse, and a
+        // 1xx other than 101 is an interim response the client would keep
+        // waiting past for a final one that never comes, as is a 101 the
+        // client never asked for. (A 101 it did ask for but that is not
+        // honoured — the body was left unread — is still written, then the
+        // connection closes; see `upgrading`.) The handler's fields and body
+        // went with that status, so neither is kept.
+        if !write::is_final_status(status, wants_upgrade) {
+            tracing::warn!(
+                status,
+                "handler returned a status that cannot be a final response; sending 500"
+            );
+            status = 500;
+            headers.clear();
+            body = ResponseBody::Empty;
+            keep_alive = false;
+        }
+
+        // A handler that says `Connection: close` is taken at its word. The
+        // writer states persistence itself and drops such a field, so the
+        // socket's fate and what the response says about it cannot disagree.
+        if header::all(&headers, &HeaderId::Connection).any(|v| header::value_has_token(v, "close"))
+        {
+            keep_alive = false;
+        }
+
+        // HTTP/1.0 has no chunked coding, so a streamed body there is
+        // close-delimited: written unframed, and the close marks its end.
+        let close_delimited = version == Version::Http10 && matches!(body, ResponseBody::Stream(_));
+        if close_delimited {
+            keep_alive = false;
+        }
 
         if let Some(name) = &self.cfg.server_name
             && header::get(&headers, &HeaderId::Server).is_none()
@@ -682,13 +716,14 @@ where
             let mut date = self.date.borrow_mut();
             let now = SystemTime::now();
             let date_bytes = date.get(now);
-            write::write_head(
+            write::write_head_for(
                 &mut self.out,
                 version,
                 &ResponseHead { status, headers },
                 &out_body,
                 date_bytes,
                 keep_alive,
+                is_head_request,
             );
         }
 
@@ -750,7 +785,11 @@ where
                                 // buffer goes out, so an idle stream never holds
                                 // a frame back regardless of how little it has
                                 // produced.
-                                write::write_chunk(&mut self.out, &chunk);
+                                if close_delimited {
+                                    self.out.extend_from_slice(&chunk);
+                                } else {
+                                    write::write_chunk(&mut self.out, &chunk);
+                                }
                                 if self.out.len() >= STREAM_FLUSH_BYTES {
                                     self.flush().await?;
                                 }
@@ -771,7 +810,9 @@ where
                             }
                         }
                     }
-                    write::write_last_chunk(&mut self.out, &HeaderVec::new());
+                    if !close_delimited {
+                        write::write_last_chunk(&mut self.out, &HeaderVec::new());
+                    }
                 }
             }
         }
@@ -1333,6 +1374,111 @@ mod tests {
         assert!(out.starts_with("HTTP/1.1 200 OK"), "{out}");
         assert!(!out.contains("100 Continue"), "{out}");
         assert!(out.contains("5\r\nhello\r\n"), "{out}");
+    }
+
+    /// A body stream yielding two fixed chunks.
+    struct TwoChunks(u8);
+
+    impl crate::service::futures_stream::Stream for TwoChunks {
+        fn poll_next(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<Bytes, crate::BodyError>>> {
+            self.0 += 1;
+            Poll::Ready(match self.0 {
+                1 => Some(Ok(Bytes::from_static(b"ab"))),
+                2 => Some(Ok(Bytes::from_static(b"cd"))),
+                _ => None,
+            })
+        }
+    }
+
+    /// RFC 9112 section 6.1: no chunked coding to an HTTP/1.0 client. A
+    /// streamed body there is close-delimited instead.
+    #[tokio::test]
+    async fn a_streamed_body_to_http_10_is_close_delimited() {
+        let (out, closed) = exchange_raw(
+            b"GET / HTTP/1.0\r\nConnection: keep-alive\r\n\r\n",
+            |_req: Request| async {
+                Response::ok().with_body(ResponseBody::Stream(Box::pin(TwoChunks(0))))
+            },
+            Limits::default(),
+        )
+        .await;
+        assert!(out.starts_with("HTTP/1.0 200 OK\r\n"), "{out}");
+        assert!(
+            !out.to_ascii_lowercase().contains("transfer-encoding"),
+            "{out}"
+        );
+        assert!(out.contains("connection: close\r\n"), "{out}");
+        assert!(out.ends_with("\r\n\r\nabcd"), "unframed body: {out}");
+        assert!(closed, "the close is the framing");
+    }
+
+    /// The server decides persistence and says so; a handler's
+    /// `Connection: keep-alive` must not contradict a close it then performs.
+    #[tokio::test]
+    async fn a_handler_keep_alive_does_not_mask_the_servers_close() {
+        let (out, closed) = exchange_raw(
+            b"POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\n\r\nhello",
+            |_req: Request| async {
+                Response::text("hi").header(HeaderId::Connection, Bytes::from_static(b"keep-alive"))
+            },
+            Limits::default(),
+        )
+        .await;
+        assert!(!out.contains("keep-alive"), "{out}");
+        assert!(out.contains("connection: close\r\n"), "{out}");
+        assert!(closed);
+    }
+
+    /// And a handler's `Connection: close` is acted on, not just echoed.
+    #[tokio::test]
+    async fn a_handler_close_closes_the_connection() {
+        let (out, closed) = exchange_raw(
+            b"GET / HTTP/1.1\r\nHost: a\r\n\r\nGET / HTTP/1.1\r\nHost: a\r\n\r\n",
+            |_req: Request| async {
+                Response::text("hi").header(HeaderId::Connection, Bytes::from_static(b"close"))
+            },
+            Limits::default(),
+        )
+        .await;
+        assert_eq!(out.matches("HTTP/1.1 200").count(), 1, "{out}");
+        assert_eq!(out.matches("connection").count(), 1, "{out}");
+        assert!(closed);
+    }
+
+    /// RFC 9110 section 9.3.2: a HEAD response's length describes the GET body.
+    #[tokio::test]
+    async fn a_head_response_keeps_the_handlers_content_length() {
+        let out = exchange(
+            b"HEAD / HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n",
+            |_req: Request| async {
+                Response::ok().header(HeaderId::ContentLength, Bytes::from_static(b"1234"))
+            },
+            Limits::default(),
+        )
+        .await;
+        assert!(out.contains("content-length: 1234\r\n"), "{out}");
+        assert!(out.ends_with("\r\n\r\n"), "no body: {out}");
+    }
+
+    /// A status no final response can carry becomes a 500 and a close.
+    #[tokio::test]
+    async fn an_impossible_final_status_becomes_500() {
+        for status in [1000u16, 99, 102, 101] {
+            let (out, closed) = exchange_raw(
+                b"GET / HTTP/1.1\r\nHost: a\r\n\r\n",
+                move |_req: Request| async move { Response::new(status) },
+                Limits::default(),
+            )
+            .await;
+            assert!(
+                out.starts_with("HTTP/1.1 500 Internal Server Error\r\n"),
+                "{status}: {out}"
+            );
+            assert!(closed, "{status}");
+        }
     }
 
     /// RFC 9110 sections 10.1.1 and 15.2: no 1xx to an HTTP/1.0 client.

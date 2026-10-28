@@ -815,3 +815,46 @@ fn a_wrong_handler_content_length_is_replaced_with_the_true_one() {
         e.body
     );
 }
+
+/// RFC 9110 section 9.3.2: a HEAD response's `Content-Length` describes the
+/// body a GET would have had, so a handler's value survives the empty body.
+#[test]
+fn head_response_keeps_the_handlers_content_length() {
+    let ex = raw_exchange_with_service(
+        quick_limits(),
+        || {
+            |_req: Request| async {
+                Response::ok().header(
+                    armature_h1::HeaderId::ContentLength,
+                    bytes::Bytes::from_static(b"1234"),
+                )
+            }
+        },
+        vec![b"HEAD / HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n".to_vec()],
+        Duration::ZERO,
+    );
+    assert!(
+        ex.body
+            .to_ascii_lowercase()
+            .contains("content-length: 1234\r\n"),
+        "{:?}",
+        ex.body
+    );
+    assert!(ex.body.ends_with("\r\n\r\n"), "no body: {:?}", ex.body);
+}
+
+/// A status no final response can carry is degraded to a 500 and a close,
+/// identically under either backend.
+#[test]
+fn impossible_final_status_becomes_500_and_closes() {
+    for status in [1000u16, 102, 101] {
+        let ex = raw_exchange_with_service(
+            quick_limits(),
+            move || move |_req: Request| async move { Response::new(status) },
+            vec![b"GET / HTTP/1.1\r\nHost: a\r\n\r\n".to_vec()],
+            Duration::ZERO,
+        );
+        assert_eq!(ex.status(), Some(500), "{status}: {:?}", ex.body);
+        assert!(ex.closed, "{status}");
+    }
+}

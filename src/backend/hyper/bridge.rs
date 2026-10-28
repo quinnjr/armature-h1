@@ -204,7 +204,18 @@ impl<S: H1Service + 'static>
                 trailers_slot,
             );
 
-            let resp = service.call(Request { head, body, peer }).await;
+            let mut resp = service.call(Request { head, body, peer }).await;
+            // Parity with `conn::write_response`: a status no final response
+            // can carry becomes a 500, without the fields and body that went
+            // with it, and the connection closes.
+            let impossible_status = !crate::write::is_final_status(resp.status, wants_upgrade);
+            if impossible_status {
+                tracing::warn!(
+                    status = resp.status,
+                    "handler returned a status that cannot be a final response; sending 500"
+                );
+                resp = crate::service::Response::new(500);
+            }
 
             // `fully_read` gates the handoff for the same reason it gates reuse
             // below, and on exactly the signal `conn::write_response` calls
@@ -226,7 +237,7 @@ impl<S: H1Service + 'static>
             // wire under the bespoke stack; the observable contract is that
             // the connection is not reused. hyper *can* drain, but strict
             // parity wins: force close.
-            let force_close = !upgrading && !fully_read.get();
+            let force_close = !upgrading && (!fully_read.get() || impossible_status);
 
             // The handler window is over. Response writing is hyper's, under
             // `write_timeout` (see BACKENDS.md on write_timeout granularity).
@@ -249,6 +260,7 @@ impl<S: H1Service + 'static>
                 version,
                 phase,
                 keep_alive && !force_close,
+                is_head_request,
             ))
         })
     }
@@ -309,6 +321,9 @@ fn convert_response(
     // `keep_alive`: the request asked for it *and* nothing (an unread body, a
     // rejection) forces a close.
     keep_alive: bool,
+    // A `HEAD` response's `Content-Length` describes the `GET` body, as the
+    // native writer treats it.
+    head_request: bool,
 ) -> BridgeResponse {
     let crate::service::Response {
         status,
@@ -363,7 +378,12 @@ fn convert_response(
     // `Content-Length: 1234` under hyper that the native writer strips, and an
     // intermediary that honours the field then waits for a body that never
     // comes: a keep-alive desync reached through a backend divergence.
-    let check_content_length = !crate::write::content_length_is_descriptive(status.as_u16());
+    //
+    // A `HEAD` response is exempt on the same grounds, as natively: its length
+    // describes the body a `GET` would have had (RFC 9110 section 9.3.2), and
+    // hyper never writes a body for it.
+    let check_content_length =
+        !(crate::write::content_length_is_descriptive(status.as_u16()) || head_request);
 
     // hyper writes the status line — and picks its framing — from the
     // response's version, so it has to carry the request's.
@@ -595,7 +615,7 @@ mod tests {
             server_name,
         };
         let clock = Rc::new(PhaseClock::new(Phase::Write));
-        convert_response(resp, &cfg, version, clock, keep_alive)
+        convert_response(resp, &cfg, version, clock, keep_alive, false)
     }
 
     fn header_of(r: &BridgeResponse, name: &str) -> Option<String> {
