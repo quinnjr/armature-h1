@@ -177,6 +177,23 @@ impl Head {
     /// [`framing::decide`](crate::framing::decide) also rejects a request
     /// whose `Host` disagrees with it, so after that check the two never
     /// differ; this is the one accessor to route or authorize on regardless.
+    ///
+    /// ```
+    /// use armature_h1::{Limits, framing, parse_head};
+    /// use bytes::Bytes;
+    ///
+    /// let raw = Bytes::from_static(
+    ///     b"GET http://a.example:8080/admin?x=1 HTTP/1.1\r\nHost: a.example:8080\r\n\r\n",
+    /// );
+    /// let (head, _) = parse_head(&raw, &Limits::default()).unwrap().unwrap();
+    /// assert!(framing::decide(&head, &Limits::default()).is_ok());
+    /// assert_eq!(head.authority(), Some("a.example:8080"));
+    /// assert_eq!(head.path(), "/admin");
+    ///
+    /// let raw = Bytes::from_static(b"GET /x HTTP/1.1\r\nHost: b.example\r\n\r\n");
+    /// let (head, _) = parse_head(&raw, &Limits::default()).unwrap().unwrap();
+    /// assert_eq!(head.authority(), Some("b.example"));
+    /// ```
     pub fn authority(&self) -> Option<&str> {
         if let Some((start, end)) = self.authority_at {
             return Some(&self.target.as_str()[start..end]);
@@ -189,7 +206,21 @@ impl Head {
         self.get_str(&HeaderId::Host).filter(|h| !h.is_empty())
     }
 
-    /// The scheme of an absolute-form target, as received.
+    /// The scheme of an absolute-form target, as received; `None` for every
+    /// other form.
+    ///
+    /// ```
+    /// use armature_h1::{Limits, parse_head};
+    /// use bytes::Bytes;
+    ///
+    /// let raw = Bytes::from_static(b"GET HTTPS://a.example/ HTTP/1.1\r\nHost: a.example\r\n\r\n");
+    /// let (head, _) = parse_head(&raw, &Limits::default()).unwrap().unwrap();
+    /// assert_eq!(head.absolute_scheme(), Some("HTTPS"));
+    ///
+    /// let raw = Bytes::from_static(b"GET / HTTP/1.1\r\nHost: a.example\r\n\r\n");
+    /// let (head, _) = parse_head(&raw, &Limits::default()).unwrap().unwrap();
+    /// assert_eq!(head.absolute_scheme(), None);
+    /// ```
     pub fn absolute_scheme(&self) -> Option<&str> {
         self.authority_at
             .map(|(start, _)| &self.target.as_str()[..start - 3])

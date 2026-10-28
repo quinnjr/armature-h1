@@ -293,7 +293,7 @@ pub(crate) fn connection_field(version: Version, keep_alive: bool) -> Option<&'s
 /// check lives here, at the last point before the bytes reach the wire, rather
 /// than at each of the call sites that could produce one.
 #[inline]
-fn valid_field_value(value: &[u8]) -> bool {
+pub(crate) fn valid_field_value(value: &[u8]) -> bool {
     !value.iter().any(|b| matches!(b, b'\r' | b'\n' | 0))
 }
 
@@ -479,8 +479,16 @@ pub(crate) fn write_head_for(
     // than one writable instance is stale for the same reason as a duplicated
     // length — the emit loop writes them all, and it is their *combined* final
     // coding that delimits the message, not the first one checked.
+    // A status that forbids a body forbids its framing too: a 204 or 1xx
+    // carrying `Transfer-Encoding: chunked` has an intermediary waiting for
+    // chunks that never come (RFC 9112 section 6.1), as the length rule's twin
+    // in `handler_length_is_stale` already holds for `Content-Length`.
     let stale_transfer_encoding = handler_te.is_some_and(|v| {
-        te_count > 1 || *body != OutBody::Chunked || close_delimited || !te_frames_chunked(v)
+        te_count > 1
+            || *body != OutBody::Chunked
+            || close_delimited
+            || forbids_body_framing(resp.status)
+            || !te_frames_chunked(v)
     });
 
     // A handler `Content-Length` that disagrees with the body it framed is
@@ -1091,6 +1099,22 @@ mod tests {
                 "head={head_request}: {got}"
             );
         }
+    }
+
+    /// Nor a handler `Transfer-Encoding`: a status that forbids a body
+    /// forbids its framing.
+    #[test]
+    fn a_204_never_carries_a_handler_transfer_encoding() {
+        let got = render(
+            Version::Http11,
+            &head_of(204, &[(HeaderId::TransferEncoding, "chunked")]),
+            &OutBody::Chunked,
+            true,
+        );
+        assert!(
+            !got.to_ascii_lowercase().contains("transfer-encoding"),
+            "{got}"
+        );
     }
 
     /// A HEAD response may keep a descriptive length, but never beside a

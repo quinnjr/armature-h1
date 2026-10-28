@@ -275,35 +275,26 @@ impl Body {
             BodyKind::Chunked => (0, Some(ChunkedDecoder::new(limits)), false),
         };
         fully_read.set(done);
-        let mut body = Self {
-            state: BodyState {
-                kind,
-                buffered: Bytes::new(),
-                remaining,
-                decoder,
-                trailers: if done { Some(HeaderVec::new()) } else { None },
-                io: Some(io),
-                continue_sent: !needs_continue,
-                needs_continue,
-                done,
-                fully_read,
-                #[cfg(feature = "hyper-backend")]
-                raw: false,
-                #[cfg(feature = "hyper-backend")]
-                consumed: 0,
-                #[cfg(feature = "hyper-backend")]
-                cap: u64::MAX,
-                #[cfg(feature = "hyper-backend")]
-                trailers_slot: None,
-            },
-        };
-        // A body that is finished before it is read — none, or an explicit
-        // zero length — says so through the same signal a read one does, so
-        // the connection has one flag to time it by.
-        if done {
-            body.state.notify_finished();
-        }
-        body
+        Self::from_state(BodyState {
+            kind,
+            buffered: Bytes::new(),
+            remaining,
+            decoder,
+            trailers: if done { Some(HeaderVec::new()) } else { None },
+            io: Some(io),
+            continue_sent: !needs_continue,
+            needs_continue,
+            done,
+            fully_read,
+            #[cfg(feature = "hyper-backend")]
+            raw: false,
+            #[cfg(feature = "hyper-backend")]
+            consumed: 0,
+            #[cfg(feature = "hyper-backend")]
+            cap: u64::MAX,
+            #[cfg(feature = "hyper-backend")]
+            trailers_slot: None,
+        })
     }
 
     /// A body whose transport already de-framed it (the hyper backend).
@@ -327,31 +318,22 @@ impl Body {
         // the native loop reuses the connection.
         let done = matches!(kind, BodyKind::None | BodyKind::Length(0));
         fully_read.set(done);
-        let mut body = Self {
-            state: BodyState {
-                kind,
-                buffered: Bytes::new(),
-                remaining: 0,
-                decoder: None,
-                trailers: if done { Some(HeaderVec::new()) } else { None },
-                io: Some(io),
-                continue_sent: !needs_continue,
-                needs_continue,
-                done,
-                fully_read,
-                raw: true,
-                consumed: 0,
-                cap: max_body_bytes,
-                trailers_slot: Some(trailers_slot),
-            },
-        };
-        // A body that is finished before it is read — none, or an explicit
-        // zero length — says so through the same signal a read one does, so
-        // the connection has one flag to time it by.
-        if done {
-            body.state.notify_finished();
-        }
-        body
+        Self::from_state(BodyState {
+            kind,
+            buffered: Bytes::new(),
+            remaining: 0,
+            decoder: None,
+            trailers: if done { Some(HeaderVec::new()) } else { None },
+            io: Some(io),
+            continue_sent: !needs_continue,
+            needs_continue,
+            done,
+            fully_read,
+            raw: true,
+            consumed: 0,
+            cap: max_body_bytes,
+            trailers_slot: Some(trailers_slot),
+        })
     }
 
     /// A body over a fixed byte string, for tests and synthetic requests.
@@ -412,6 +394,19 @@ impl Body {
     #[inline]
     pub fn trailers(&self) -> Option<&HeaderVec> {
         self.state.trailers.as_ref()
+    }
+
+    /// Wrap a freshly built state; both constructors end here.
+    ///
+    /// A body that is finished before it is read — none, or an explicit zero
+    /// length — says so through the same `BodyIo::body_finished` signal a read
+    /// one does, so the connection has one flag to time the body by.
+    fn from_state(state: BodyState) -> Self {
+        let mut body = Self { state };
+        if body.state.done {
+            body.state.notify_finished();
+        }
+        body
     }
 
     /// Poll for the next body chunk.
@@ -583,6 +578,16 @@ impl Body {
                     s.fail();
                     return Poll::Ready(Some(Err(BodyError::TooLarge)));
                 }
+                // A `Content-Length` body is complete the moment its declared
+                // length is in, as natively — hyper has already held the peer
+                // to that length — not only once a later poll sees EOF. A
+                // handler that takes exactly the bytes it was promised has read
+                // the body: no body deadline left, and the connection may be
+                // reused.
+                if matches!(s.kind, BodyKind::Length(n) if s.consumed == n) {
+                    s.finish();
+                    s.trailers = Some(HeaderVec::new());
+                }
                 return Poll::Ready(Some(Ok(chunk)));
             }
             match Self::fill(s, cx) {
@@ -653,7 +658,12 @@ impl Body {
             if total > cap {
                 // Finished, if not read: the handler stops here, and the body
                 // deadline has nothing left to bound while it answers 413.
-                self.state.fail();
+                // Unless the body already ended in this very chunk — then it
+                // *was* read, the next pipelined request is already pushed
+                // back, and failing it would close the connection under it.
+                if !self.state.done {
+                    self.state.fail();
+                }
                 return Err(BodyError::TooLarge);
             }
             match (&mut acc, &first) {

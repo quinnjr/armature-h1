@@ -1268,3 +1268,55 @@ fn a_body_over_the_handlers_collect_cap_does_not_put_it_under_body_timeout() {
     );
     assert_eq!(ex.status(), Some(413), "{:?}", ex.body);
 }
+
+/// A handler that takes exactly the declared `Content-Length` and then works
+/// past `body_timeout` has read its body, under either backend.
+#[test]
+fn a_body_read_to_its_declared_length_is_finished_without_eof() {
+    let ex = raw_exchange_with_service(
+        quick_limits(),
+        || {
+            |mut req: Request| async move {
+                let mut got = 0;
+                while got < 5 {
+                    got += req.body.chunk().await.expect("a chunk").expect("ok").len();
+                }
+                tokio::time::sleep(Duration::from_millis(900)).await;
+                Response::text("done")
+            }
+        },
+        vec![
+            b"POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello"
+                .to_vec(),
+        ],
+        Duration::ZERO,
+    );
+    assert_eq!(ex.status(), Some(200), "{:?}", ex.body);
+}
+
+/// A body that ended in the same chunk that crossed `collect`'s cap was read:
+/// the 413 goes out and the pipelined request behind it is still served.
+#[test]
+fn collect_over_its_cap_on_a_complete_body_keeps_the_connection() {
+    let ex = raw_exchange_with_service(
+        quick_limits(),
+        || {
+            |mut req: Request| async move {
+                if req.head.path() == "/b" {
+                    return Response::text("b");
+                }
+                let err = req.body.collect(4).await.expect_err("over the cap");
+                Response::status_only(err.status())
+            }
+        },
+        vec![
+            b"POST /a HTTP/1.1\r\nHost: a\r\nContent-Length: 16\r\n\r\n0123456789abcdef\
+              GET /b HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n"
+                .to_vec(),
+        ],
+        Duration::ZERO,
+    );
+    assert_eq!(ex.status(), Some(413), "{:?}", ex.body);
+    assert_eq!(ex.responses(), 2, "/b was served too: {:?}", ex.body);
+    assert!(ex.body.ends_with("b"), "{:?}", ex.body);
+}

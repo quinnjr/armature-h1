@@ -46,7 +46,9 @@ pub struct Limits {
     /// or the handler is not reading it — gets a `408` and a close.
     pub body_timeout: Duration,
     /// Deadline for a handler to produce its response, counted from when it is
-    /// called; `None` (the default) leaves handlers unbounded.
+    /// called — less any time spent first writing earlier pipelined responses
+    /// to a slow reader, which is `write_timeout`'s to bound. `None` (the
+    /// default) leaves handlers unbounded.
     ///
     /// Separate from [`body_timeout`](Self::body_timeout), which bounds the
     /// peer: this bounds the server's own work, so a handler waiting on a
@@ -54,6 +56,18 @@ pub struct Limits {
     /// `max_connections` slot — forever. Expiry answers `503 Service
     /// Unavailable` and closes. Off by default because long-polling and
     /// streaming-setup handlers legitimately run for as long as they like.
+    ///
+    /// ```
+    /// use armature_h1::Limits;
+    /// use std::time::Duration;
+    ///
+    /// let limits = Limits {
+    ///     handler_timeout: Some(Duration::from_secs(5)),
+    ///     ..Default::default()
+    /// };
+    /// assert_eq!(Limits::default().handler_timeout, None, "off unless asked for");
+    /// assert_eq!(limits.handler_timeout, Some(Duration::from_secs(5)));
+    /// ```
     pub handler_timeout: Option<Duration>,
     /// Deadline for the next request to begin on an idle keep-alive connection.
     pub idle_timeout: Duration,

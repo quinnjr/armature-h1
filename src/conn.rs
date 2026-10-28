@@ -737,8 +737,9 @@ where
         // before a request line. Only whole CRLFs, matching the strict line
         // endings everywhere else, and only at the front, where a request line
         // can never begin with CR — so this can never eat part of a head. A
-        // peer streaming nothing but CRLFs is bounded by the header deadline,
-        // and the discarded bytes never accumulate toward `max_head_bytes`.
+        // peer streaming nothing but CRLFs has not begun a request, so it is
+        // bounded by the idle deadline, as a silent one would be; the
+        // discarded bytes never accumulate toward `max_head_bytes`.
         let blank = st
             .buf
             .as_chunks::<2>()

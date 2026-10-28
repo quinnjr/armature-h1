@@ -174,9 +174,13 @@ impl<S: H1Service + 'static>
             let wants_upgrade = head.version == Version::Http11
                 && head.count(&HeaderId::Upgrade) > 0
                 && head.connection_has_token("upgrade");
-            let expects_continue = head
-                .get_str(&HeaderId::Expect)
-                .is_some_and(|v| v.eq_ignore_ascii_case("100-continue"));
+            // HTTP/1.1 only, as natively: hyper itself sends no interim
+            // response to a 1.0 client, and `Body::continue_pending` must not
+            // say one is owed when it never will be.
+            let expects_continue = head.version == Version::Http11
+                && head
+                    .get_str(&HeaderId::Expect)
+                    .is_some_and(|v| v.eq_ignore_ascii_case("100-continue"));
 
             // Captured before `head` moves into the `Request`: hyper writes the
             // status line from the response's own version, so a 1.0 request
@@ -401,9 +405,7 @@ fn convert_response(
     // with one.
     let length_instances = headers
         .iter()
-        .filter(|(id, v)| {
-            *id == HeaderId::ContentLength && ::hyper::http::HeaderValue::from_bytes(v).is_ok()
-        })
+        .filter(|(id, v)| *id == HeaderId::ContentLength && crate::write::valid_field_value(v))
         .count();
 
     // hyper writes the status line — and picks its framing — from the
