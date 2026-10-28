@@ -110,6 +110,8 @@ pub struct ChunkedDecoder {
     decoded: u64,
     max_body: u64,
     max_trailer: usize,
+    /// Trailer fields allowed, as `Limits::max_headers` bounds head fields.
+    max_trailers: usize,
     trailer_bytes: usize,
     trailers: HeaderVec,
 }
@@ -123,6 +125,7 @@ impl ChunkedDecoder {
             decoded: 0,
             max_body: limits.max_body_bytes,
             max_trailer: limits.max_head_bytes,
+            max_trailers: limits.max_headers,
             trailer_bytes: 0,
             trailers: HeaderVec::new(),
         }
@@ -252,6 +255,14 @@ impl ChunkedDecoder {
             return Err(ChunkedError::BadTrailer);
         }
 
+        // A trailer section is a field section like the head's, and is held to
+        // the same rules: a bounded count, token names, and no control bytes
+        // in values. Fields that would fail the head parser must not reach a
+        // handler just because they arrived after the body.
+        if self.trailers.len() >= self.max_trailers {
+            return Err(ChunkedError::BadTrailer);
+        }
+
         let colon = memchr::memchr(b':', line).ok_or(ChunkedError::BadTrailer)?;
         let name = &line[..colon];
         if name.is_empty() {
@@ -260,6 +271,10 @@ impl ChunkedDecoder {
         // Whitespace between the field name and the colon is rejected in a
         // trailer for the same reason as in a header (RFC 9112 section 5.1).
         if name.last().is_some_and(|b| b.is_ascii_whitespace()) {
+            return Err(ChunkedError::BadTrailer);
+        }
+
+        if !std::str::from_utf8(name).is_ok_and(crate::write::valid_field_name) {
             return Err(ChunkedError::BadTrailer);
         }
 
@@ -289,6 +304,14 @@ impl ChunkedDecoder {
         }
         while end > start && (line[end - 1] == b' ' || line[end - 1] == b'\t') {
             end -= 1;
+        }
+
+        // RFC 9110 section 5.5: CTLs other than HTAB are not field content.
+        if line[start..end]
+            .iter()
+            .any(|&b| (b < 0x20 && b != b'\t') || b == 0x7f)
+        {
+            return Err(ChunkedError::BadTrailer);
         }
 
         self.trailers.push((id, line.slice(start..end)));
@@ -656,6 +679,62 @@ mod tests {
     fn rejects_trailer_without_colon() {
         assert_eq!(
             drain(&mut dec(), b"0\r\nnonsense\r\n\r\n"),
+            Err(ChunkedError::BadTrailer)
+        );
+    }
+
+    /// Trailer names are tokens, as head field names are.
+    #[test]
+    fn rejects_a_non_token_trailer_name() {
+        for raw in [
+            &b"0\r\nx y: a\r\n\r\n"[..],
+            b"0\r\nx\x0b: a\r\n\r\n",
+            b"0\r\nx\"q: a\r\n\r\n",
+        ] {
+            assert_eq!(
+                drain(&mut dec(), raw),
+                Err(ChunkedError::BadTrailer),
+                "{raw:?}"
+            );
+        }
+    }
+
+    /// No control bytes but HTAB in a trailer value.
+    #[test]
+    fn rejects_control_bytes_in_a_trailer_value() {
+        for raw in [
+            &b"0\r\nEtag: a\rb\r\n\r\n"[..],
+            b"0\r\nEtag: a\0b\r\n\r\n",
+            b"0\r\nEtag: a\x7fb\r\n\r\n",
+        ] {
+            assert_eq!(
+                drain(&mut dec(), raw),
+                Err(ChunkedError::BadTrailer),
+                "{raw:?}"
+            );
+        }
+        assert!(drain(&mut dec(), b"0\r\nEtag: a\tb\r\n\r\n").is_ok());
+    }
+
+    /// The trailer count is bounded by `max_headers`, not only by bytes.
+    #[test]
+    fn enforces_the_trailer_count_limit() {
+        let limits = Limits {
+            max_headers: 2,
+            ..Default::default()
+        };
+        assert!(
+            drain(
+                &mut ChunkedDecoder::new(&limits),
+                b"0\r\na: 1\r\nb: 2\r\n\r\n"
+            )
+            .is_ok()
+        );
+        assert_eq!(
+            drain(
+                &mut ChunkedDecoder::new(&limits),
+                b"0\r\na: 1\r\nb: 2\r\nc: 3\r\n\r\n"
+            ),
             Err(ChunkedError::BadTrailer)
         );
     }

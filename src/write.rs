@@ -232,7 +232,7 @@ fn valid_field_value(value: &[u8]) -> bool {
 /// a name containing a colon, a space, or CRLF splits the response exactly as a
 /// value does.
 #[inline]
-fn valid_field_name(name: &str) -> bool {
+pub(crate) fn valid_field_name(name: &str) -> bool {
     !name.is_empty()
         && name.bytes().all(|b| {
             b.is_ascii_alphanumeric()
