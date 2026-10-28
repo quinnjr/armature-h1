@@ -144,6 +144,21 @@ pub fn parse_head(buf: &Bytes, limits: &Limits) -> Result<Option<(Head, usize)>,
         }
         return Ok(None);
     };
+    parse_head_region(buf, head_len, limits).map(|head| Some((head, head_len)))
+}
+
+/// Parse a head whose terminator is already known to end at `head_len`.
+///
+/// For a caller that found the terminator itself — the connection does, while
+/// deciding whether to read more — so the head is not scanned for it twice.
+/// `buf[..head_len]` must end with the first CRLFCRLF in `buf`.
+pub(crate) fn parse_head_region(
+    buf: &Bytes,
+    head_len: usize,
+    limits: &Limits,
+) -> Result<Head, ParseError> {
+    debug_assert!(limits.max_headers <= MAX_HEADERS_CEILING);
+    debug_assert_eq!(find_head_end(buf), Some(head_len));
 
     if head_len > limits.max_head_bytes {
         return Err(ParseError::HeadTooLarge);
@@ -183,7 +198,7 @@ fn finish_parse_head(
     parsed: httparse::Status<usize>,
     head_len: usize,
     limits: &Limits,
-) -> Result<Option<(Head, usize)>, ParseError> {
+) -> Result<Head, ParseError> {
     let httparse::Status::Complete(consumed) = parsed else {
         // `find_head_end` located a terminator, so httparse should have
         // completed. A Partial here means the head contained something httparse
@@ -245,10 +260,7 @@ fn finish_parse_head(
         headers.push((id, buf.slice_ref(h.value)));
     }
 
-    Ok(Some((
-        Head::new(method, target, version, headers),
-        head_len,
-    )))
+    Ok(Head::new(method, target, version, headers))
 }
 
 /// Reject a request target containing characters no URI may contain.

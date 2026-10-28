@@ -12,7 +12,7 @@ use crate::deadline::ConnDeadline;
 use crate::header::{self, HeaderId, HeaderVec};
 use crate::service::{BodyIo, H1Service, ResponseBody, Upgraded};
 use crate::write::{self, DateCache, OutBody, ResponseHead};
-use crate::{Body, Limits, Method, Request, Response, Version, framing, parse, parse_head};
+use crate::{Body, Limits, Method, Request, Response, Version, framing, parse};
 use bytes::{Bytes, BytesMut};
 use std::cell::{Cell, RefCell};
 use std::future::Future;
@@ -85,6 +85,11 @@ struct IoState<IO> {
     /// that consumes or rewrites `buf`, so a stale value can never hide a
     /// terminator: correctness only ever depends on `buf` itself.
     scanned: usize,
+    /// Where the buffered head ends, once the scanner has found its terminator.
+    ///
+    /// Kept so the head is not searched again to split it off and again to
+    /// parse it. Cleared alongside `scanned`, for the same reason.
+    head_end: Option<usize>,
     /// A `100 Continue` owed to the peer but not yet written.
     pending_continue: bool,
 }
@@ -96,6 +101,7 @@ impl<IO> IoState<IO> {
     /// an offset into a buffer that no longer exists in that form.
     fn reset_scan(&mut self) {
         self.scanned = 0;
+        self.head_end = None;
     }
 }
 
@@ -240,6 +246,7 @@ where
                 io,
                 buf,
                 scanned: 0,
+                head_end: None,
                 pending_continue: false,
             })),
             service,
@@ -345,16 +352,18 @@ where
             // the body or the next pipelined request.
             let head_bytes = {
                 let mut st = self.shared.borrow_mut();
-                let end = parse::find_head_end(&st.buf).unwrap_or(st.buf.len());
+                // `read_until_head_or_idle` only returns Ready once a terminator
+                // is present, so the fallback search is unreachable in practice.
+                let Some(end) = st.head_end.or_else(|| parse::find_head_end(&st.buf)) else {
+                    return Ok(None);
+                };
                 let head = st.buf.split_to(end).freeze();
                 st.reset_scan();
                 head
             };
-            let head = match parse_head(&head_bytes, &self.cfg.limits) {
-                Ok(Some((head, _))) => head,
-                // `read_until_head_or_idle` only returns Ready once a terminator
-                // is present, so this is unreachable in practice.
-                Ok(None) => return Ok(None),
+            let head_len = head_bytes.len();
+            let head = match parse::parse_head_region(&head_bytes, head_len, &self.cfg.limits) {
+                Ok(head) => head,
                 Err(e) => {
                     self.write_error(Version::Http11, e.status()).await?;
                     return Ok(None);
@@ -402,19 +411,26 @@ where
             //
             // Cancelling the handler mid-await drops its `Body`, and with it the
             // last borrow of the transport, so the 408 can be written here.
-            let call = self.service.call(Request {
+            let mut call = std::pin::pin!(self.service.call(Request {
                 head,
                 body,
                 peer: self.peer,
-            });
+            }));
             self.deadline.arm(self.cfg.limits.body_timeout);
+            // `poll_fn` over the pinned call rather than `select!`, which takes
+            // its futures by value: with the request's inline header array
+            // inside, the handler's future is large enough that moving it into
+            // and out of the `select!` state cost more than parsing the head.
+            // Deadline first, as `biased` had it.
             let resp = {
                 let deadline = &mut self.deadline;
-                tokio::select! {
-                    biased;
-                    () = deadline.expired() => None,
-                    r = call => Some(r),
-                }
+                std::future::poll_fn(|cx| {
+                    if deadline.poll_expired(cx).is_ready() {
+                        return Poll::Ready(None);
+                    }
+                    call.as_mut().poll(cx).map(Some)
+                })
+                .await
             };
             self.deadline.disarm();
             let Some(resp) = resp else {
@@ -560,7 +576,8 @@ where
             return false;
         }
         let from = st.scanned.saturating_sub(3);
-        if parse::find_head_end(&st.buf[from..]).is_some() {
+        if let Some(end) = parse::find_head_end(&st.buf[from..]) {
+            st.head_end = Some(from + end);
             return true;
         }
         st.scanned = st.buf.len();
