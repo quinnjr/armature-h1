@@ -1193,7 +1193,13 @@ async fn peek_preface(
     // One deadline for the whole preface, not one per read: re-arming per read
     // let a peer dribble a matching byte every `header_timeout` and hold the
     // connection slot for 24 of them.
-    let deadline = tokio::time::Instant::now() + cfg.limits.header_timeout;
+    //
+    // Checked, as `tokio::time::timeout` is: `Duration::MAX` is how an embedder
+    // switches the deadline off, and a plain `+` would panic on it.
+    let now = tokio::time::Instant::now();
+    let deadline = now
+        .checked_add(cfg.limits.header_timeout)
+        .unwrap_or_else(|| now + Duration::from_secs(86_400 * 365 * 30));
     loop {
         match is_h2c_preface(&buf) {
             Preface::NeedMore => {}
@@ -2051,5 +2057,26 @@ mod tests {
         }
         let handed = (0..1000).filter(|_| b.pick(1, &rng) != 1).count();
         assert!(handed > 800, "{handed} of 1000");
+    }
+
+    /// `Duration::MAX` switches the preface deadline off rather than
+    /// overflowing it.
+    #[tokio::test]
+    async fn an_unbounded_header_timeout_does_not_overflow_the_preface_deadline() {
+        let listener = tokio::net::TcpListener::bind(loopback()).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = tokio::spawn(async move {
+            let mut c = tokio::net::TcpStream::connect(addr).await.unwrap();
+            c.write_all(b"GET / HTTP/1.1\r\n").await.unwrap();
+            c
+        });
+        let (stream, _) = listener.accept().await.unwrap();
+        let cfg = Config::new(loopback()).limits(Limits {
+            header_timeout: Duration::MAX,
+            ..Default::default()
+        });
+        let got = peek_preface(stream, &cfg).await;
+        assert!(matches!(got, Some((_, _, Preface::Http1))));
+        drop(client.await);
     }
 }

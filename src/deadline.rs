@@ -61,7 +61,12 @@ impl ConnDeadline {
     /// Rounding up rather than down matters: a deadline must never fire early,
     /// or a slow-but-legitimate client gets a 408 it did not earn.
     pub fn arm(&mut self, after: Duration) {
-        let target = Instant::now() + round_up(after, self.tick);
+        // Checked: `Duration::MAX` is how a deadline is switched off, and an
+        // `Instant` cannot always hold now plus that much.
+        let now = Instant::now();
+        let target = now
+            .checked_add(round_up(after, self.tick))
+            .unwrap_or(now + FAR_FUTURE);
         self.target = Some(target);
         // A later deadline leaves the timer where it is: it wakes early and
         // `poll_expired` re-points it. Only an earlier one has to move it now.
@@ -291,5 +296,14 @@ mod tests {
             round_up(Duration::from_millis(1), TICK),
             Duration::from_millis(100)
         );
+    }
+
+    /// `Duration::MAX` arms a deadline that does not fire, without panicking.
+    #[tokio::test(start_paused = true)]
+    async fn an_unbounded_duration_never_expires() {
+        let mut d = ConnDeadline::new(TICK);
+        d.arm(Duration::MAX);
+        tokio::time::advance(Duration::from_secs(86_400)).await;
+        assert!(!is_expired(&mut d).await);
     }
 }
