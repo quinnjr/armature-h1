@@ -1014,3 +1014,83 @@ fn hyper_chunk_extension_outside_its_grammar_is_served() {
     );
     assert_eq!(ex.status(), Some(200), "{:?}", ex.body);
 }
+
+/// A handler's `Connection: keep-alive, Upgrade` keeps `Upgrade` once the
+/// persistence token is dropped, under either backend.
+#[test]
+fn a_handler_connection_field_keeps_its_other_tokens() {
+    let ex = raw_exchange_with_service(
+        quick_limits(),
+        || {
+            |_req: Request| async {
+                Response::text("hi").header(
+                    armature_h1::HeaderId::Connection,
+                    bytes::Bytes::from_static(b"keep-alive, x-hop"),
+                )
+            }
+        },
+        vec![b"GET / HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n".to_vec()],
+        Duration::ZERO,
+    );
+    // One field or several is the same list (RFC 9110 section 5.3); hyper
+    // folds them into one line.
+    let lower = ex.body.to_ascii_lowercase();
+    let tokens: Vec<&str> = lower
+        .split("\r\n")
+        .filter_map(|l| l.strip_prefix("connection:"))
+        .flat_map(|v| v.split(','))
+        .map(str::trim)
+        .collect();
+    assert!(tokens.contains(&"x-hop"), "{:?}", ex.body);
+    assert!(tokens.contains(&"close"), "{:?}", ex.body);
+    assert!(!tokens.contains(&"keep-alive"), "{:?}", ex.body);
+}
+
+/// An empty `Host` (RFC 9112 section 3.2) is served.
+#[test]
+fn empty_host_is_served() {
+    let ex = raw_exchange(b"GET / HTTP/1.1\r\nHost:\r\nConnection: close\r\n\r\n");
+    assert_eq!(ex.status(), Some(200), "{:?}", ex.body);
+}
+
+/// `handler_timeout` bounds the handler itself: a 503 and a close, under
+/// either backend.
+#[test]
+fn handler_timeout_503_close() {
+    let ex = raw_exchange_with_service(
+        Limits {
+            handler_timeout: Some(Duration::from_millis(300)),
+            ..quick_limits()
+        },
+        || {
+            |_req: Request| async {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                Response::text("late")
+            }
+        },
+        vec![b"GET / HTTP/1.1\r\nHost: a\r\n\r\n".to_vec()],
+        Duration::ZERO,
+    );
+    ex.assert_rejected_and_closed(503);
+}
+
+/// Unset, it bounds nothing (see `a_slow_handler_without_a_body_...`), and set
+/// generously, a handler inside it is served normally.
+#[test]
+fn a_handler_inside_its_handler_timeout_is_served() {
+    let ex = raw_exchange_with_service(
+        Limits {
+            handler_timeout: Some(Duration::from_secs(5)),
+            ..quick_limits()
+        },
+        || {
+            |_req: Request| async {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                Response::text("ok")
+            }
+        },
+        vec![b"GET / HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n".to_vec()],
+        Duration::ZERO,
+    );
+    assert_eq!(ex.status(), Some(200), "{:?}", ex.body);
+}

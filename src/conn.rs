@@ -216,6 +216,9 @@ pub struct Connection<IO, S> {
     cfg: Rc<ConnConfig>,
     date: Rc<RefCell<DateCache>>,
     deadline: ConnDeadline,
+    /// The `Limits::handler_timeout` clock, created only when one is set, so a
+    /// connection without it costs no second timer.
+    handler_deadline: Option<ConnDeadline>,
     out: BytesMut,
     /// Reused across requests: allocating a fresh flag per request would put an
     /// allocation back on the steady-state path.
@@ -253,6 +256,10 @@ where
         buffered: Bytes,
     ) -> Self {
         let deadline = ConnDeadline::new(cfg.tick);
+        let handler_deadline = cfg
+            .limits
+            .handler_timeout
+            .map(|_| ConnDeadline::new(cfg.tick));
         let mut buf = BytesMut::with_capacity(READ_CHUNK.max(buffered.len()));
         buf.extend_from_slice(&buffered);
         Self {
@@ -267,6 +274,7 @@ where
             cfg,
             date,
             deadline,
+            handler_deadline,
             out: BytesMut::with_capacity(1024),
             body_read: Rc::new(Cell::new(false)),
             peer: None,
@@ -441,13 +449,29 @@ where
             // written — a `100 Continue` is written straight to the transport —
             // and before a handler that does not finish at once can hold them
             // back for as long as it takes.
+            if let (Some(after), Some(d)) = (
+                self.cfg.limits.handler_timeout,
+                self.handler_deadline.as_mut(),
+            ) {
+                d.arm(after);
+            }
             let mut early = None;
             if !self.out.is_empty() {
-                if !expects_continue
-                    && let Poll::Ready(resp) =
-                        std::future::poll_fn(|cx| Poll::Ready(call.as_mut().poll(cx))).await
-                {
-                    early = Some(resp);
+                if !expects_continue {
+                    // Held by a guard across the one poll, so a handler that
+                    // panics in it does not take finished responses with it.
+                    let mut held = HeldOutput {
+                        shared: self.shared.clone(),
+                        bytes: Some(self.out.split()),
+                    };
+                    let polled =
+                        std::future::poll_fn(|cx| Poll::Ready(call.as_mut().poll(cx))).await;
+                    let mut bytes = held.bytes.take().unwrap_or_default();
+                    bytes.unsplit(std::mem::take(&mut self.out));
+                    self.out = bytes;
+                    if let Poll::Ready(resp) = polled {
+                        early = Some(resp);
+                    }
                 }
                 if early.is_none() {
                     self.flush().await?;
@@ -464,26 +488,44 @@ where
             // expiry means nothing, and a handler may take as long as it needs.
             // A body still incomplete at the deadline is a stalled peer (or a
             // handler sitting on bytes it never reads), and gets the 408.
+            //
+            // `handler_timeout`, when set, bounds the handler itself and is the
+            // server's failure, not the peer's: 503 rather than 408.
             let resp = if let Some(resp) = early {
-                Some(resp)
-            } else if body_read.get() {
-                Some(call.as_mut().await)
+                Ok(resp)
             } else {
-                self.deadline.arm(self.cfg.limits.body_timeout);
+                let body_armed = !body_read.get();
+                if body_armed {
+                    self.deadline.arm(self.cfg.limits.body_timeout);
+                }
                 let deadline = &mut self.deadline;
+                let mut handler_deadline = self.handler_deadline.as_mut();
                 let resp = std::future::poll_fn(|cx| {
-                    if !body_read.get() && deadline.poll_expired(cx).is_ready() {
-                        return Poll::Ready(None);
+                    if body_armed && !body_read.get() && deadline.poll_expired(cx).is_ready() {
+                        return Poll::Ready(Err(408));
                     }
-                    call.as_mut().poll(cx).map(Some)
+                    if let Some(d) = handler_deadline.as_mut()
+                        && d.poll_expired(cx).is_ready()
+                    {
+                        return Poll::Ready(Err(503));
+                    }
+                    call.as_mut().poll(cx).map(Ok)
                 })
                 .await;
-                self.deadline.disarm();
+                if body_armed {
+                    self.deadline.disarm();
+                }
                 resp
             };
-            let Some(resp) = resp else {
-                self.write_error(version, 408).await?;
-                return Ok(None);
+            if let Some(d) = self.handler_deadline.as_mut() {
+                d.disarm();
+            }
+            let resp = match resp {
+                Ok(resp) => resp,
+                Err(status) => {
+                    self.write_error(version, status).await?;
+                    return Ok(None);
+                }
             };
 
             // An unconsumed or errored body leaves an unknown number of bytes on
@@ -718,7 +760,12 @@ where
 
         // HTTP/1.0 has no chunked coding, so a streamed body there is
         // close-delimited: written unframed, and the close marks its end.
-        let close_delimited = version == Version::Http10 && matches!(body, ResponseBody::Stream(_));
+        // Only a body that is actually written: a HEAD, a 204/304 or a 1xx
+        // writes none, so it has nothing to delimit and no reason to close.
+        let close_delimited = version == Version::Http10
+            && matches!(body, ResponseBody::Stream(_))
+            && !is_head_request
+            && !write::forbids_body_framing(status);
         if close_delimited {
             keep_alive = false;
         }
@@ -984,6 +1031,47 @@ where
 }
 
 /// Why head reading stopped.
+/// Finished pipelined responses, held while the next handler is first polled.
+///
+/// They are normally put back and written with the next response. If the
+/// handler panics instead, unwinding drops this, and the drop makes one
+/// non-blocking attempt to write them: they were complete before that handler
+/// ever ran, and the peer is owed them whatever it does.
+struct HeldOutput<IO: AsyncWrite + Unpin> {
+    shared: Rc<RefCell<IoState<IO>>>,
+    bytes: Option<BytesMut>,
+}
+
+impl<IO: AsyncWrite + Unpin> Drop for HeldOutput<IO> {
+    fn drop(&mut self) {
+        let Some(bytes) = self.bytes.take() else {
+            return;
+        };
+        let Ok(mut st) = self.shared.try_borrow_mut() else {
+            return;
+        };
+        st.write_now(&bytes);
+    }
+}
+
+impl<IO> IoState<IO> {
+    /// Write what the transport takes without waiting, then flush the same
+    /// way. Best effort: a write that would block is abandoned.
+    fn write_now(&mut self, mut bytes: &[u8])
+    where
+        IO: AsyncWrite + Unpin,
+    {
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        while !bytes.is_empty() {
+            match std::pin::Pin::new(&mut self.io).poll_write(&mut cx, bytes) {
+                Poll::Ready(Ok(n)) if n > 0 => bytes = &bytes[n..],
+                _ => return,
+            }
+        }
+        let _ = std::pin::Pin::new(&mut self.io).poll_flush(&mut cx);
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum HeadOutcome {
     /// A complete head is buffered.
@@ -1329,6 +1417,42 @@ mod tests {
             .await;
     }
 
+    /// A held-back response was finished before the next handler ran; that
+    /// handler panicking must not take it down with the connection.
+    #[tokio::test]
+    async fn a_panicking_handler_does_not_lose_held_back_responses() {
+        let service = |req: Request| async move {
+            assert!(req.head.path() != "/boom", "handler panic, on purpose");
+            Response::text("first")
+        };
+        let (mut client, server) = tokio::io::duplex(64 * 1024);
+        let local = tokio::task::LocalSet::new();
+        let conn = Connection::new(
+            server,
+            service,
+            cfg(Limits::default()),
+            Rc::new(RefCell::new(DateCache::new())),
+        );
+        let server_task = local.spawn_local(async move { conn.serve().await });
+        let out = local
+            .run_until(async move {
+                client
+                    .write_all(
+                        b"GET /a HTTP/1.1\r\nHost: a\r\n\r\nGET /boom HTTP/1.1\r\nHost: a\r\n\r\n",
+                    )
+                    .await
+                    .unwrap();
+                assert!(server_task.await.is_err(), "the handler panicked");
+                let mut out = Vec::new();
+                let _ = tokio::time::timeout(Duration::from_secs(2), client.read_to_end(&mut out))
+                    .await;
+                String::from_utf8_lossy(&out).into_owned()
+            })
+            .await;
+        assert!(out.starts_with("HTTP/1.1 200 OK"), "{out:?}");
+        assert!(out.ends_with("first"), "{out:?}");
+    }
+
     /// A `100 Continue` is written straight to the transport, so a response
     /// held back for the batch must go out ahead of it.
     #[tokio::test]
@@ -1439,6 +1563,31 @@ mod tests {
         assert!(out.contains("connection: close\r\n"), "{out}");
         assert!(out.ends_with("\r\n\r\nabcd"), "unframed body: {out}");
         assert!(closed, "the close is the framing");
+    }
+
+    /// No body is written for a HEAD, so there is nothing to close-delimit:
+    /// an HTTP/1.0 keep-alive HEAD on a streaming handler stays open.
+    #[tokio::test]
+    async fn a_head_on_http_10_with_a_streamed_body_keeps_the_connection() {
+        let out = exchange(
+            b"HEAD / HTTP/1.0\r\nConnection: keep-alive\r\n\r\nGET / HTTP/1.0\r\n\r\n",
+            |_req: Request| async {
+                Response::ok().with_body(ResponseBody::Stream(Box::pin(TwoChunks(0))))
+            },
+            Limits::default(),
+        )
+        .await;
+        let first = out.split("HTTP/1.0 200").nth(1).expect("HEAD answered");
+        assert!(first.contains("connection: keep-alive\r\n"), "{out}");
+        assert!(
+            !first.to_ascii_lowercase().contains("transfer-encoding"),
+            "{out}"
+        );
+        assert_eq!(
+            out.matches("HTTP/1.0 200").count(),
+            2,
+            "the GET is served too: {out}"
+        );
     }
 
     /// The server decides persistence and says so; a handler's

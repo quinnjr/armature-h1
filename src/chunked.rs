@@ -389,6 +389,13 @@ fn parse_chunk_size(line: &[u8]) -> Result<u64, ChunkedError> {
     // Leading zeros carry no value, so they do not count against the digit
     // limit: `00000000000000000005` is five, not an overflow. The size line as
     // a whole is still bounded, so this cannot be stretched indefinitely.
+    //
+    // Accepting them does not open a parser differential with a conforming
+    // peer: RFC 9112 section 7.1 gives `chunk-size = 1*HEXDIG` with no length
+    // limit, and hyper — the other backend, and a common front end — reads the
+    // same value. The only peer that disagrees is one that truncates a size
+    // to a fixed number of digits, which already misreads every RFC-conforming
+    // sender; refusing here would not make it safe.
     let significant = &digits[digits.iter().take_while(|&&b| b == b'0').count()..];
     if significant.len() > MAX_SIZE_DIGITS {
         return Err(ChunkedError::SizeOverflow);

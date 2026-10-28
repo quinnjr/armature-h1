@@ -206,7 +206,16 @@ impl<S: H1Service + 'static>
                 trailers_slot,
             );
 
-            let mut resp = service.call(Request { head, body, peer }).await;
+            let call = service.call(Request { head, body, peer });
+            // Parity with `conn::Connection::serve`: `handler_timeout` bounds
+            // the handler and answers 503, then the connection closes.
+            let (mut resp, handler_timed_out) = match cfg.limits.handler_timeout {
+                Some(after) => match tokio::time::timeout(after, call).await {
+                    Ok(resp) => (resp, false),
+                    Err(_) => (crate::service::Response::new(503), true),
+                },
+                None => (call.await, false),
+            };
             // Parity with `conn::write_response`: a status no final response
             // can carry becomes a 500, without the fields and body that went
             // with it, and the connection closes.
@@ -239,7 +248,8 @@ impl<S: H1Service + 'static>
             // wire under the bespoke stack; the observable contract is that
             // the connection is not reused. hyper *can* drain, but strict
             // parity wins: force close.
-            let force_close = !upgrading && (!fully_read.get() || impossible_status);
+            let force_close =
+                !upgrading && (!fully_read.get() || impossible_status || handler_timed_out);
 
             // The handler window is over. Response writing is hyper's, under
             // `write_timeout` (see BACKENDS.md on write_timeout granularity).
@@ -393,7 +403,12 @@ fn convert_response(
         .status(status)
         .version(wire_version(version));
     let mut has_server = false;
-    let mut has_connection = false;
+    // Parity with `conn::write_response`: a handler `Connection: close` is
+    // acted on, not just echoed.
+    let keep_alive = keep_alive
+        && !headers.iter().any(|(id, v)| {
+            *id == HeaderId::Connection && crate::header::value_has_token(v, "close")
+        });
     for (id, value) in headers.into_iter() {
         // `expected_len.is_none()` is tested first and on its own: a `Stream`
         // has no length any field could agree with, and an *unparseable* value
@@ -424,9 +439,27 @@ fn convert_response(
         // closes unconditionally (it closes on `body_consumed` regardless of
         // what the handler wrote). Dropping the handler's value is the only
         // lever the bridge has over hyper's accounting.
-        if id == HeaderId::Connection && !keep_alive {
-            continue;
-        }
+        //
+        // As natively, only the persistence tokens are dropped: `upgrade` and
+        // any other token beside them stays, or a 101 loses the
+        // `Connection: upgrade` its handshake needs.
+        let value = if id == HeaderId::Connection {
+            let rest: Vec<&[u8]> = value
+                .split(|&b| b == b',')
+                .map(crate::framing::trim_ows)
+                .filter(|t| {
+                    !t.is_empty()
+                        && !t.eq_ignore_ascii_case(b"close")
+                        && !t.eq_ignore_ascii_case(b"keep-alive")
+                })
+                .collect();
+            if rest.is_empty() {
+                continue;
+            }
+            Bytes::from(rest.join(&b", "[..]))
+        } else {
+            value
+        };
         // Dropped rather than written, for the reason the native writer gives:
         // there is no error left to return once a response is being built, and
         // dropping is the only outcome that does not put attacker-chosen bytes
@@ -453,9 +486,6 @@ fn convert_response(
         if id == HeaderId::Server {
             has_server = true;
         }
-        if id == HeaderId::Connection {
-            has_connection = true;
-        }
         builder = builder.header(name, value);
     }
     if !has_server
@@ -465,13 +495,17 @@ fn convert_response(
         builder = builder.header(::hyper::http::header::SERVER, v);
     }
     // The same decision the native writer emits from, taken from the same
-    // function rather than restated here, so the two backends cannot drift: a
-    // handler that set `Connection` itself owns the field; HTTP/1.1
+    // function rather than restated here, so the two backends cannot drift:
+    // HTTP/1.1
     // persistence is the default and saying so would be noise; HTTP/1.0
     // persistence has to be stated, because hyper closes a 1.0 connection
     // whose response does not; and a connection that will not persist says so,
     // which hyper leaves implicit on 1.0.
-    if !has_connection && let Some(field) = crate::write::connection_field(version, keep_alive) {
+    // The persistence token is always the server's own, and a 101's
+    // connection continues as another protocol, where it means nothing.
+    if status != ::hyper::http::StatusCode::SWITCHING_PROTOCOLS
+        && let Some(field) = crate::write::connection_field(version, keep_alive)
+    {
         builder = builder.header(
             ::hyper::http::header::CONNECTION,
             ::hyper::http::HeaderValue::from_static(field),

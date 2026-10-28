@@ -159,6 +159,28 @@ pub(crate) fn forbids_body_framing(status: u16) -> bool {
     matches!(status, 204 | 304) || (100..200).contains(&status)
 }
 
+/// Write a handler `Connection` field minus its `close` and `keep-alive`
+/// tokens, or nothing if no other token is left.
+fn write_connection_without_persistence(out: &mut BytesMut, value: &[u8]) {
+    let mut first = true;
+    for token in value
+        .split(|&b| b == b',')
+        .map(crate::framing::trim_ows)
+        .filter(|t| {
+            !t.is_empty()
+                && !t.eq_ignore_ascii_case(b"close")
+                && !t.eq_ignore_ascii_case(b"keep-alive")
+        })
+    {
+        out.put_slice(if first { b"connection: " } else { b", " });
+        out.put_slice(token);
+        first = false;
+    }
+    if !first {
+        out.put_slice(b"\r\n");
+    }
+}
+
 /// Whether `status` can stand as the final response to a request.
 ///
 /// Anything outside 200..=599 cannot: `1000` is not a status line a peer can
@@ -341,8 +363,12 @@ pub(crate) fn write_head_for(
     keep_alive: bool,
     head_request: bool,
 ) {
+    // HTTP/1.0 has no chunked coding: a stream there carries no framing field
+    // and ends with the connection. It only costs the connection when a body
+    // is actually written — not for HEAD, nor a status that forbids one.
     let close_delimited = version == Version::Http10 && *body == OutBody::Chunked;
-    let keep_alive = keep_alive && !close_delimited;
+    let keep_alive =
+        keep_alive && !(close_delimited && !head_request && !forbids_body_framing(resp.status));
 
     out.put_slice(version.as_bytes());
     out.put_u8(b' ');
@@ -462,13 +488,6 @@ pub(crate) fn write_head_for(
             tracing::warn!("dropping response transfer-encoding that does not frame the body");
             continue;
         }
-        if id == &HeaderId::Connection
-            && (header::value_has_token(value, "close")
-                || header::value_has_token(value, "keep-alive"))
-        {
-            tracing::debug!("dropping handler connection field; the server states persistence");
-            continue;
-        }
         if !field_writable[i] {
             // The status line is already in `out`, so there is no error left to
             // return; dropping the field is the only outcome that does not put
@@ -477,6 +496,17 @@ pub(crate) fn write_head_for(
                 field = id.as_str(),
                 "dropping response header with an invalid field name or value"
             );
+            continue;
+        }
+        if id == &HeaderId::Connection
+            && (header::value_has_token(value, "close")
+                || header::value_has_token(value, "keep-alive"))
+        {
+            // Persistence is the server's to state, so those two tokens go;
+            // the rest of the list stays. Dropping the whole field would take
+            // `upgrade` with it, and a 101 without `Connection: upgrade` is a
+            // handshake the client aborts.
+            write_connection_without_persistence(out, value);
             continue;
         }
         out.put_slice(id.as_str().as_bytes());
@@ -1001,6 +1031,32 @@ mod tests {
         let got = render(Version::Http10, &head_of(200, &[]), &OutBody::None, true);
         assert!(got.contains("connection: keep-alive\r\n"));
         assert!(got.starts_with("HTTP/1.0 200 OK\r\n"));
+    }
+
+    /// Only the persistence tokens are the server's: `upgrade` beside them
+    /// survives, or a 101 would go out without `Connection: upgrade`.
+    #[test]
+    fn keeps_other_connection_tokens_beside_a_persistence_token() {
+        let got = render(
+            Version::Http11,
+            &head_of(101, &[(HeaderId::Connection, "keep-alive, Upgrade")]),
+            &OutBody::None,
+            false,
+        );
+        assert!(got.contains("connection: Upgrade\r\n"), "{got}");
+        assert!(!got.contains("keep-alive"), "{got}");
+
+        let got = render(
+            Version::Http11,
+            &head_of(200, &[(HeaderId::Connection, "close, x-hop")]),
+            &OutBody::None,
+            false,
+        );
+        assert!(got.contains("connection: x-hop\r\n"), "{got}");
+        assert!(
+            got.contains("connection: close\r\n"),
+            "the server's own: {got}"
+        );
     }
 
     #[test]

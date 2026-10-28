@@ -90,9 +90,12 @@ impl FramingError {
 /// rather than resolved silently, the same answer this module gives every
 /// other pair of fields that could be read two ways.
 fn check_authority(head: &Head) -> Result<(), FramingError> {
+    // An empty `Host` is what RFC 9112 section 3.2 requires of a client whose
+    // target URI has no authority, so it is well-formed — it just names
+    // nothing, and there is nothing for it to disagree with.
     let host = match head.get(&HeaderId::Host) {
-        Some(v) => Some(parse_authority(v).ok_or(FramingError::InvalidHost)?),
-        None => None,
+        Some(v) if !v.is_empty() => Some(parse_authority(v).ok_or(FramingError::InvalidHost)?),
+        _ => None,
     };
     let Some(scheme) = head.absolute_scheme() else {
         return Ok(());
@@ -450,8 +453,7 @@ mod tests {
     #[test]
     fn a_malformed_host_is_rejected() {
         for raw in [
-            &b"GET / HTTP/1.1\r\nHost: \r\n\r\n"[..],
-            b"GET / HTTP/1.1\r\nHost: user@a\r\n\r\n",
+            &b"GET / HTTP/1.1\r\nHost: user@a\r\n\r\n"[..],
             b"GET / HTTP/1.1\r\nHost: a/b\r\n\r\n",
             b"GET / HTTP/1.1\r\nHost: a:port\r\n\r\n",
             b"GET / HTTP/1.1\r\nHost: [zz]\r\n\r\n",
@@ -467,6 +469,22 @@ mod tests {
             decide_raw(b"GET / HTTP/1.1\r\nHost: a:\r\n\r\n"),
             Ok(BodyKind::None)
         );
+    }
+
+    /// RFC 9112 section 3.2: an empty `Host` is how a client says the target
+    /// URI has no authority. It is accepted, and names nothing to compare.
+    #[test]
+    fn an_empty_host_is_accepted() {
+        for raw in [
+            &b"OPTIONS * HTTP/1.1\r\nHost:\r\n\r\n"[..],
+            b"GET / HTTP/1.1\r\nHost: \r\n\r\n",
+        ] {
+            assert_eq!(
+                decide(&head(raw), &Limits::default()),
+                Ok(BodyKind::None),
+                "{raw:?}"
+            );
+        }
     }
 
     // ---- positive cases ----

@@ -487,7 +487,7 @@ impl Server {
         // capacity it logged.
         let started = Arc::new(AtomicUsize::new(0));
 
-        let (balance, mut inboxes) = Balance::new(per_worker.len());
+        let (balance, mut inboxes) = Balance::new(per_worker.len(), cfg.limits.max_connections);
         let balance = Arc::new(balance);
 
         let mut handles = Vec::with_capacity(cfg.workers);
@@ -654,10 +654,25 @@ type Handoff = (std::net::TcpStream, SocketAddr);
 /// that one instead of serving it. Counts are open connections, handoffs in
 /// flight included, which is what keeps two workers from both handing to the
 /// same idle one in a burst.
+///
+/// Every count change goes through [`reserve`](Self::reserve), which never
+/// takes a worker past `cap`: picking a worker and counting the connection
+/// against it is one compare-and-swap, so concurrent acceptors cannot all pile
+/// onto the same nearly-full worker. That keeps `Limits::max_connections` an
+/// exact per-worker bound, as it was when each worker counted only itself.
 struct Balance {
-    open: Box<[AtomicUsize]>,
+    open: Box<[PaddedCount]>,
     inbox: Box<[tokio::sync::mpsc::UnboundedSender<Handoff>]>,
+    cap: usize,
 }
+
+/// One worker's open-connection count, alone on its cache line.
+///
+/// Every worker writes its own count on each open and close and reads all of
+/// them on each accept; packed together, those writes would bounce one line
+/// between every core on the machine.
+#[repr(align(128))]
+struct PaddedCount(AtomicUsize);
 
 /// What a worker uses to take part in balancing.
 struct Peers {
@@ -673,30 +688,70 @@ const RETIRED: usize = usize::MAX / 2;
 type Inboxes = Vec<Option<tokio::sync::mpsc::UnboundedReceiver<Handoff>>>;
 
 impl Balance {
-    fn new(workers: usize) -> (Self, Inboxes) {
+    fn new(workers: usize, cap: usize) -> (Self, Inboxes) {
         let (senders, receivers): (Vec<_>, Vec<_>) = (0..workers)
             .map(|_| {
                 let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
                 (tx, Some(rx))
             })
             .unzip();
-        let open = (0..workers).map(|_| AtomicUsize::new(0)).collect();
+        let open = (0..workers)
+            .map(|_| PaddedCount(AtomicUsize::new(0)))
+            .collect();
         (
             Self {
                 open,
                 inbox: senders.into_boxed_slice(),
+                cap: cap.max(1),
             },
             receivers,
         )
+    }
+
+    fn count(&self, worker: usize) -> usize {
+        self.open[worker].0.load(Ordering::Relaxed)
+    }
+
+    /// Count one more connection against `worker`, unless that would take it
+    /// past the cap (a retired worker is always past it).
+    fn reserve(&self, worker: usize) -> bool {
+        let count = &self.open[worker].0;
+        let mut n = count.load(Ordering::Relaxed);
+        while n < self.cap {
+            match count.compare_exchange_weak(n, n + 1, Ordering::Relaxed, Ordering::Relaxed) {
+                Ok(_) => return true,
+                Err(seen) => n = seen,
+            }
+        }
+        false
+    }
+
+    /// Give back a slot taken with [`reserve`](Self::reserve).
+    fn release(&self, worker: usize) {
+        self.open[worker].0.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    /// Find a slot for a connection `me` just accepted: the least-loaded
+    /// worker if it is strictly less loaded than `me`, else `me`, else anyone
+    /// with room. `None` when every worker is at its cap.
+    fn place(&self, me: usize) -> Option<usize> {
+        let target = self.pick(me);
+        if target != me && self.reserve(target) {
+            return Some(target);
+        }
+        if self.reserve(me) {
+            return Some(me);
+        }
+        (0..self.open.len()).find(|&i| self.reserve(i))
     }
 
     /// The worker that should serve a connection `me` just accepted: `me`,
     /// unless another holds strictly fewer connections.
     fn pick(&self, me: usize) -> usize {
         let mut best = me;
-        let mut best_open = self.open[me].load(Ordering::Relaxed);
-        for (i, n) in self.open.iter().enumerate() {
-            let n = n.load(Ordering::Relaxed);
+        let mut best_open = self.count(me);
+        for i in 0..self.open.len() {
+            let n = self.count(i);
             if n < best_open {
                 best = i;
                 best_open = n;
@@ -707,7 +762,7 @@ impl Balance {
 
     /// Take `worker` out of the running for handoffs, for good.
     fn retire(&self, worker: usize) {
-        self.open[worker].store(RETIRED, Ordering::Relaxed);
+        self.open[worker].0.store(RETIRED, Ordering::Relaxed);
     }
 }
 
@@ -803,7 +858,7 @@ async fn worker_loop<F, S, G, H, U, C>(
         Err(e) => {
             // Counted by the sender; uncount it, or this worker looks busier
             // than it is for the rest of its life.
-            balance.open[worker].fetch_sub(1, Ordering::Relaxed);
+            balance.release(worker);
             tracing::debug!(error = %e, worker, "could not register a handed-off connection");
         }
     };
@@ -821,7 +876,7 @@ async fn worker_loop<F, S, G, H, U, C>(
                 if *rx.borrow() {
                     break;
                 }
-                if balance.open[worker].load(Ordering::Relaxed) >= max_connections {
+                if balance.count(worker) >= max_connections {
                     // At the cap: do not accept until a connection closes (or
                     // shutdown). New connections wait in the listen backlog.
                     tokio::select! {
@@ -831,9 +886,8 @@ async fn worker_loop<F, S, G, H, U, C>(
                             }
                         }
                         _ = slot_freed.notified() => {}
-                        // Only a worker below its cap is ever picked, but one
-                        // already on its way may land after this one filled up;
-                        // it is served rather than stranded in the channel.
+                        // A handoff reserved its slot before it was sent, so
+                        // serving it never takes this worker past the cap.
                         Some(handoff) = inbox.recv() => adopt(handoff),
                     }
                     continue;
@@ -895,8 +949,13 @@ async fn worker_loop<F, S, G, H, U, C>(
                         if cfg.tcp.nodelay {
                             let _ = stream.set_nodelay(true);
                         }
-                        let target = balance.pick(worker);
-                        balance.open[target].fetch_add(1, Ordering::Relaxed);
+                        let Some(target) = balance.place(worker) else {
+                            // Every worker filled up between this one's cap check
+                            // and the accept — handoffs racing it. Shed this one
+                            // rather than exceed the cap.
+                            tracing::debug!(worker, "every worker is at max_connections; closing an accepted connection");
+                            continue;
+                        };
                         if target == worker {
                             serve(stream, peer);
                             continue;
@@ -906,17 +965,17 @@ async fn worker_loop<F, S, G, H, U, C>(
                         let std_stream = match stream.into_std() {
                             Ok(s) => s,
                             Err(e) => {
-                                balance.open[target].fetch_sub(1, Ordering::Relaxed);
+                                balance.release(target);
                                 tracing::debug!(error = %e, worker, "could not detach a connection to hand off");
                                 continue;
                             }
                         };
                         if let Err(back) = balance.inbox[target].send((std_stream, peer)) {
                             // Its inbox is closed: that worker has exited.
-                            balance.open[target].fetch_sub(1, Ordering::Relaxed);
                             balance.retire(target);
-                            balance.open[worker].fetch_add(1, Ordering::Relaxed);
-                            adopt(back.0);
+                            if balance.reserve(worker) {
+                                adopt(back.0);
+                            }
                         }
                     }
                 }
@@ -924,11 +983,19 @@ async fn worker_loop<F, S, G, H, U, C>(
         })
         .await;
 
-    // No new connections for this worker from here on, its own or handed over.
-    // Anything still queued was counted against it; dropping it closes it.
+    // No new connections for this worker from here on, its own or handed over:
+    // retired, it is never picked, and a sender racing the close gets its
+    // connection back and serves it itself. Connections already queued were
+    // accepted before shutdown like any other, so they are served within the
+    // grace window rather than reset.
     balance.retire(worker);
     inbox.close();
-    while inbox.try_recv().is_ok() {}
+    while let Ok(handoff) = inbox.try_recv() {
+        // Retiring overwrote the count; recount so the slot's release on close
+        // has something to release. RETIRED is far enough from overflow.
+        balance.open[worker].0.fetch_add(1, Ordering::Relaxed);
+        adopt(handoff);
+    }
     // Drain: give in-flight connections a bounded window to finish.
     let _ = tokio::time::timeout(cfg.shutdown_grace, local).await;
 }
@@ -942,7 +1009,7 @@ struct ConnSlot {
 
 impl Drop for ConnSlot {
     fn drop(&mut self) {
-        self.balance.open[self.worker].fetch_sub(1, Ordering::Relaxed);
+        self.balance.release(self.worker);
         self.freed.notify_one();
     }
 }
@@ -1794,15 +1861,30 @@ mod tests {
 
     #[test]
     fn pick_prefers_self_on_a_tie_and_the_least_loaded_otherwise() {
-        let (b, _inboxes) = Balance::new(3);
+        let (b, _inboxes) = Balance::new(3, 100);
         assert_eq!(b.pick(1), 1, "all equal: stay");
-        b.open[1].store(2, Ordering::Relaxed);
-        b.open[2].store(1, Ordering::Relaxed);
+        b.open[1].0.store(2, Ordering::Relaxed);
+        b.open[2].0.store(1, Ordering::Relaxed);
         assert_eq!(b.pick(1), 0);
-        b.open[0].store(1, Ordering::Relaxed);
+        b.open[0].0.store(1, Ordering::Relaxed);
         assert_eq!(b.pick(2), 2, "tied with the least: stay");
         b.retire(0);
-        b.open[2].store(5, Ordering::Relaxed);
+        b.open[2].0.store(5, Ordering::Relaxed);
         assert_eq!(b.pick(2), 1, "a retired worker is never picked");
+    }
+
+    /// The cap holds under the pick: a worker at `cap` is never reserved,
+    /// whoever is asking.
+    #[test]
+    fn place_never_exceeds_the_cap() {
+        let (b, _inboxes) = Balance::new(3, 2);
+        let mut placed = Vec::new();
+        for i in 0..6 {
+            placed.push(b.place(i % 3).expect("room left"));
+        }
+        assert!(b.place(0).is_none(), "every worker is full");
+        assert!((0..3).all(|w| b.count(w) == 2), "{placed:?}");
+        b.release(1);
+        assert_eq!(b.place(0), Some(1));
     }
 }
