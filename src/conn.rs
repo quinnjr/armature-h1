@@ -15,6 +15,7 @@ use crate::write::{self, DateCache, OutBody, ResponseHead};
 use crate::{Body, Limits, Method, Request, Response, Version, framing, parse, parse_head};
 use bytes::{Bytes, BytesMut};
 use std::cell::{Cell, RefCell};
+use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
 use std::rc::Rc;
@@ -101,30 +102,23 @@ impl<IO> IoState<IO> {
 impl<IO: AsyncRead + AsyncWrite + Unpin> IoState<IO> {
     /// Read once into `buf`, appending. `Ok(0)` means EOF.
     fn poll_read_more(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<usize>> {
-        let start = self.buf.len();
-        // Grow with zeroed bytes so the read target is an initialized slice.
-        // Reading into uninitialized capacity would need `unsafe`, which this
-        // crate forbids; the cost is one memset per syscall, which is small
-        // against the syscall itself. `tokio_util::io::poll_read_buf` is the
-        // alternative if a benchmark ever shows this mattering.
-        self.buf.resize(start + READ_CHUNK, 0);
-        let mut read_buf = tokio::io::ReadBuf::new(&mut self.buf[start..]);
-        let poll = std::pin::Pin::new(&mut self.io).poll_read(cx, &mut read_buf);
-        let filled = read_buf.filled().len();
-        match poll {
-            Poll::Pending => {
-                self.buf.truncate(start);
-                Poll::Pending
-            }
-            Poll::Ready(Err(e)) => {
-                self.buf.truncate(start);
-                Poll::Ready(Err(e))
-            }
-            Poll::Ready(Ok(())) => {
-                self.buf.truncate(start + filled);
-                Poll::Ready(Ok(filled))
-            }
-        }
+        // Read straight into the buffer's spare capacity. This used to grow the
+        // buffer with zeroed bytes first, because filling uninitialized
+        // capacity needs `unsafe` this crate forbids. That was an 8 KiB memset
+        // on every poll, the `Pending` one included, and it was the single
+        // largest cost in a profile of the keep-alive path. Tokio's `read_buf`
+        // does the uninitialized-read bookkeeping on its side of the boundary.
+        //
+        // Reserving first is what keeps this a read of up to a whole chunk:
+        // with no spare capacity, `BytesMut` would hand `read_buf` a 64-byte
+        // sliver. Once the previous request's slices are dropped, the reserve
+        // reclaims the existing allocation rather than growing it.
+        self.buf.reserve(READ_CHUNK);
+        let read = std::pin::pin!(tokio::io::AsyncReadExt::read_buf(
+            &mut self.io,
+            &mut self.buf
+        ));
+        read.poll(cx)
     }
 }
 
@@ -530,12 +524,15 @@ where
                 Some(Err(e)) => return Err(e),
                 Some(Ok(0)) => return Ok(HeadOutcome::Eof),
                 Some(Ok(_)) => {
+                    // Checked before arming the header deadline: a head that
+                    // arrives whole in one read — nearly every one — has no
+                    // use for it, and arming is not free.
+                    if self.has_complete_head() {
+                        return Ok(HeadOutcome::Ready);
+                    }
                     if !started {
                         started = true;
                         self.deadline.arm(self.cfg.limits.header_timeout);
-                    }
-                    if self.has_complete_head() {
-                        return Ok(HeadOutcome::Ready);
                     }
                     // Refuse to buffer an unterminated head forever.
                     if self.shared.borrow().buf.len() > self.cfg.limits.max_head_bytes {
