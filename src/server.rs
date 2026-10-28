@@ -668,7 +668,7 @@ struct Balance {
     /// Per worker, woken whenever a slot of that worker's is released — by
     /// any thread, since another worker gives back a slot it reserved on this
     /// one when a handoff fails. A worker parked at its cap waits on it.
-    freed: Box<[tokio::sync::Notify]>,
+    freed: Box<[PaddedNotify]>,
     cap: usize,
 }
 
@@ -679,6 +679,18 @@ struct Balance {
 /// between every core on the machine.
 #[repr(align(128))]
 struct PaddedCount(AtomicUsize);
+
+/// One worker's slot-freed signal, alone on its cache line for the same
+/// reason as [`PaddedCount`]: every connection close notifies its worker's.
+#[repr(align(128))]
+struct PaddedNotify(tokio::sync::Notify);
+
+/// How often a worker parked because every worker is at its cap looks again.
+///
+/// Its own slot-freed signal wakes it at once; a slot freed on another worker
+/// does not, so this bounds how long the room appearing elsewhere goes unused.
+/// Only reached when the whole server is full.
+const FULL_RECHECK: Duration = Duration::from_millis(50);
 
 /// What a worker uses to take part in balancing.
 struct Peers {
@@ -735,11 +747,18 @@ impl Balance {
             Self {
                 open,
                 inbox: senders.into_boxed_slice(),
-                freed: (0..workers).map(|_| tokio::sync::Notify::new()).collect(),
+                freed: (0..workers)
+                    .map(|_| PaddedNotify(tokio::sync::Notify::new()))
+                    .collect(),
                 cap: cap.max(1),
             },
             receivers,
         )
+    }
+
+    /// Whether any worker is below its cap.
+    fn has_room(&self) -> bool {
+        (0..self.open.len()).any(|i| self.count(i) < self.cap)
     }
 
     fn count(&self, worker: usize) -> usize {
@@ -763,7 +782,7 @@ impl Balance {
     /// Give back a slot taken with [`reserve`](Self::reserve).
     fn release(&self, worker: usize) {
         self.open[worker].0.fetch_sub(1, Ordering::Relaxed);
-        self.freed[worker].notify_one();
+        self.freed[worker].0.notify_one();
     }
 
     /// Find a slot for a connection `me` just accepted: the worker
@@ -935,19 +954,22 @@ async fn worker_loop<F, S, G, H, U, C>(
                 if *rx.borrow() {
                     break;
                 }
-                if balance.count(worker) >= max_connections {
-                    // At the cap: do not accept until a connection closes (or
-                    // shutdown). New connections wait in the listen backlog.
+                // At its own cap, a worker still accepts while any other has
+                // room: `place` hands the connection over. Only with every
+                // worker full does it stop, and new connections wait in the
+                // listen backlog instead of on a core that cannot serve them.
+                if balance.count(worker) >= max_connections && !balance.has_room() {
                     tokio::select! {
                         changed = rx.changed() => {
                             if changed.is_err() || *rx.borrow() {
                                 break;
                             }
                         }
-                        _ = balance.freed[worker].notified() => {}
+                        _ = balance.freed[worker].0.notified() => {}
                         // A handoff reserved its slot before it was sent, so
                         // serving it never takes this worker past the cap.
                         Some(handoff) = inbox.recv() => adopt(handoff),
+                        () = tokio::time::sleep(FULL_RECHECK) => {}
                     }
                     continue;
                 }
@@ -1054,7 +1076,11 @@ async fn worker_loop<F, S, G, H, U, C>(
     inbox.close();
     local
         .run_until(async {
-            while let Ok(handoff) = inbox.try_recv() {
+            // `recv`, not `try_recv`: a send that already passed the open
+            // check can still be landing, and `try_recv` would report the
+            // channel empty under it. After `close`, `recv` returns every
+            // message that made it in and only then `None`.
+            while let Some(handoff) = inbox.recv().await {
                 // Retiring overwrote the count; recount so the slot's release
                 // on close has something to release. RETIRED is far enough
                 // from overflow.
@@ -2031,7 +2057,7 @@ mod tests {
         let b = Arc::new(b);
         assert!(b.reserve(0));
         let waiting = b.clone();
-        let parked = tokio::spawn(async move { waiting.freed[0].notified().await });
+        let parked = tokio::spawn(async move { waiting.freed[0].0.notified().await });
         let releaser = b.clone();
         std::thread::spawn(move || releaser.release(0))
             .join()
@@ -2078,5 +2104,50 @@ mod tests {
         let got = peek_preface(stream, &cfg).await;
         assert!(matches!(got, Some((_, _, Preface::Http1))));
         drop(client.await);
+    }
+
+    /// A worker at its own cap keeps accepting while another has room, and
+    /// hands the connection over: with a cap of one per worker, two held-open
+    /// connections are both served however the kernel hashes them.
+    #[test]
+    fn a_full_worker_hands_off_while_another_has_room() {
+        let cfg = test_config(2).limits(Limits {
+            idle_timeout: Duration::from_secs(10),
+            header_timeout: Duration::from_secs(10),
+            max_connections: 1,
+            ..Default::default()
+        });
+        let server = Server::bind(cfg).expect("bind");
+        let addr = server.local_addr();
+        let handle = server.handle();
+        let client = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let served = rt.block_on(async move {
+                let mut open = Vec::new();
+                let mut served = 0;
+                for _ in 0..2 {
+                    let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+                    s.write_all(b"GET / HTTP/1.1\r\nHost: a\r\n\r\n")
+                        .await
+                        .unwrap();
+                    let mut buf = vec![0u8; 512];
+                    if let Ok(Ok(n)) =
+                        tokio::time::timeout(Duration::from_secs(2), s.read(&mut buf)).await
+                        && buf[..n].starts_with(b"HTTP/1.1 200")
+                    {
+                        served += 1;
+                    }
+                    open.push(s);
+                }
+                served
+            });
+            handle.shutdown();
+            served
+        });
+        server.serve(|| hello).expect("serve");
+        assert_eq!(client.join().unwrap(), 2);
     }
 }
