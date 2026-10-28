@@ -7,6 +7,44 @@ and this crate adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.h
 
 ## [Unreleased]
 
+### Performance
+
+Measured against `axum` 0.8 (hyper `http1`) on identical in-process and
+loopback harnesses. Userspace cost per keep-alive request is now below
+axum's (GET: 30.3k → 10.6k instructions, axum 12.1k), syscalls per request
+match it (4 → 2), and a pipelined batch is served at roughly 4.5× the rate.
+
+- Reads fill the buffer's spare capacity through tokio's `read_buf` instead of
+  zero-filling 8 KiB on every read poll, the `Pending` one included.
+- `ConnDeadline` arms lazily: it records the deadline and touches the timer
+  only to move it earlier, instead of re-registering it on every phase. This
+  also removes two eventfd wakeup writes per request.
+- The handler future is raced against the body deadline in place rather than
+  moved through `select!`, and each head's terminator is found once instead
+  of three times.
+- A keep-alive response whose successor is already buffered is held back, up
+  to 32 KiB, so a pipelined batch goes out in one write. Nothing held back can
+  wait on the peer or on a slow handler.
+
+### Fixed
+
+- `100 Continue` is no longer written inside a streamed response whose handler
+  reads the body after its head goes out, no longer sent to HTTP/1.0 clients,
+  and no longer counted as sent after a short write.
+- A streamed body to an HTTP/1.0 client is close-delimited instead of chunked.
+- The server states connection persistence itself: a handler `Connection`
+  field naming `close` or `keep-alive` is not written, and a handler `close` is
+  acted on.
+- A `HEAD` response keeps the handler's `Content-Length` instead of having it
+  rewritten to `0`.
+- A handler status that cannot be final (outside 200–599, or a 1xx other than
+  a requested 101) is sent as `500` and closes, under both backends.
+- Trailers must have token names, no control bytes other than HTAB in values,
+  and at most `Limits::max_headers` fields, as head fields must.
+- The h2c preface sniff is bounded by one `header_timeout` in total rather
+  than one per read.
+- Error responses are written under `write_timeout` like every other write.
+
 ## [0.4.0] - 2026-10-17
 
 ### Security
