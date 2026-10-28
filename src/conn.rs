@@ -99,8 +99,12 @@ struct IoState<IO> {
     /// Kept so the head is not searched again to split it off and again to
     /// parse it. Cleared alongside `scanned`, for the same reason.
     head_end: Option<usize>,
-    /// A `100 Continue` owed to the peer but not yet written.
-    pending_continue: bool,
+    /// How many bytes of a `100 Continue` are owed to the peer and not yet
+    /// written; zero when none is.
+    ///
+    /// A count rather than a flag because a write can be short: one that
+    /// accepted half the interim response must not count as having sent it.
+    pending_continue: usize,
 }
 
 impl<IO> IoState<IO> {
@@ -190,17 +194,18 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> BodyIo for IoState<IO> {
     }
 
     fn poll_send_continue(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        if !self.pending_continue {
-            return Poll::Ready(Ok(()));
-        }
-        match std::pin::Pin::new(&mut self.io).poll_write(cx, CONTINUE) {
-            Poll::Pending => Poll::Pending,
-            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
-            Poll::Ready(Ok(_)) => {
-                self.pending_continue = false;
-                Poll::Ready(Ok(()))
+        while self.pending_continue > 0 {
+            let rest = &CONTINUE[CONTINUE.len() - self.pending_continue..];
+            match std::pin::Pin::new(&mut self.io).poll_write(cx, rest) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Ready(Ok(0)) => return Poll::Ready(Err(io::ErrorKind::WriteZero.into())),
+                Poll::Ready(Ok(n)) => self.pending_continue -= n.min(self.pending_continue),
             }
         }
+        // A buffering transport (TLS) would otherwise sit on it while the
+        // client waits for it before sending the body.
+        std::pin::Pin::new(&mut self.io).poll_flush(cx)
     }
 }
 
@@ -256,7 +261,7 @@ where
                 buf,
                 scanned: 0,
                 head_end: None,
-                pending_continue: false,
+                pending_continue: 0,
             })),
             service,
             cfg,
@@ -393,12 +398,17 @@ where
 
             let wants_upgrade =
                 head.count(&HeaderId::Upgrade) > 0 && head.connection_has_token("upgrade");
-            let expects_continue = head
-                .get_str(&HeaderId::Expect)
-                .is_some_and(|v| v.eq_ignore_ascii_case("100-continue"));
+            // HTTP/1.1 only: a 1.0 client cannot be sent a 1xx (RFC 9110
+            // section 15.2) and the expectation is to be ignored from one
+            // (section 10.1.1). It would read the interim response as final.
+            let expects_continue = version == Version::Http11
+                && head
+                    .get_str(&HeaderId::Expect)
+                    .is_some_and(|v| v.eq_ignore_ascii_case("100-continue"));
             let is_head_request = head.method == Method::Head;
 
-            self.shared.borrow_mut().pending_continue = expects_continue;
+            self.shared.borrow_mut().pending_continue =
+                if expects_continue { CONTINUE.len() } else { 0 };
 
             let dyn_io: Rc<RefCell<dyn BodyIo>> = self.shared.clone();
             // Shared with the body so the loop can tell, after the handler
@@ -665,6 +675,7 @@ where
             ResponseBody::Stream(_) => OutBody::Chunked,
         };
 
+        self.settle_continue().await?;
         // Not cleared: it may hold earlier pipelined responses still owed to
         // the peer, and this one goes out after them.
         {
@@ -840,11 +851,44 @@ where
         .await
     }
 
+    /// Resolve an owed `100 Continue` before a final response goes out.
+    ///
+    /// Once a final response is on its way an interim one is no longer owed,
+    /// and writing it later would land inside that response — in the middle
+    /// of a body a streaming handler produces by reading the request. So one
+    /// not yet begun is dropped; one a short write left half-sent is finished,
+    /// because the peer is already parsing it.
+    async fn settle_continue(&mut self) -> io::Result<()> {
+        let pending = self.shared.borrow().pending_continue;
+        if pending == CONTINUE.len() {
+            self.shared.borrow_mut().pending_continue = 0;
+            return Ok(());
+        }
+        if pending == 0 {
+            return Ok(());
+        }
+        let shared = self.shared.clone();
+        self.deadline.arm(self.cfg.limits.write_timeout);
+        let deadline = &mut self.deadline;
+        let sent = std::future::poll_fn(|cx| {
+            if deadline.poll_expired(cx).is_ready() {
+                return Poll::Ready(Err(io::ErrorKind::TimedOut.into()));
+            }
+            shared.borrow_mut().poll_send_continue(cx)
+        })
+        .await;
+        self.deadline.disarm();
+        sent
+    }
+
     /// Write a bare error response and close.
     ///
     /// Always `Connection: close`: a connection whose framing we do not fully
     /// agree on is never reused.
     async fn write_error(&mut self, version: Version, status: u16) -> io::Result<()> {
+        if self.settle_continue().await.is_err() {
+            return Ok(());
+        }
         // Appended rather than written alone: earlier pipelined responses may
         // still be waiting in `out`, and they are owed first.
         {
@@ -1233,6 +1277,90 @@ mod tests {
         let cont = out.find("HTTP/1.1 100 Continue").expect("interim response");
         let echoed = out.rfind("hello").expect("echoed body");
         assert!(ok < cont && cont < echoed, "{out}");
+    }
+
+    /// Drive one connection over a duplex of `capacity` bytes.
+    async fn exchange_with_capacity<S>(input: &'static [u8], service: S, capacity: usize) -> String
+    where
+        S: H1Service + 'static,
+    {
+        let (mut client, server) = tokio::io::duplex(capacity);
+        let local = tokio::task::LocalSet::new();
+        let conn = Connection::new(
+            server,
+            service,
+            cfg(Limits::default()),
+            Rc::new(RefCell::new(DateCache::new())),
+        );
+        let server_task = local.spawn_local(async move { conn.serve().await });
+        local
+            .run_until(async move {
+                client.write_all(input).await.unwrap();
+                let mut out = Vec::new();
+                let _ = tokio::time::timeout(Duration::from_secs(2), client.read_to_end(&mut out))
+                    .await;
+                let _ = server_task.await;
+                String::from_utf8_lossy(&out).into_owned()
+            })
+            .await
+    }
+
+    /// A body that streams the request body back.
+    struct EchoStream(Body);
+
+    impl crate::service::futures_stream::Stream for EchoStream {
+        fn poll_next(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<Bytes, crate::BodyError>>> {
+            self.0.poll_chunk(cx)
+        }
+    }
+
+    /// A handler that streams the request body back reads it only after its
+    /// response head is out; the `100 Continue` it would trigger then is no
+    /// longer owed, and writing it would land inside the chunked body.
+    #[tokio::test]
+    async fn no_100_continue_inside_a_streamed_response() {
+        let out = exchange(
+            b"POST / HTTP/1.1\r\nHost: a\r\nExpect: 100-continue\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello",
+            |req: Request| async move {
+                Response::ok().with_body(ResponseBody::Stream(Box::pin(EchoStream(req.body))))
+            },
+            Limits::default(),
+        )
+        .await;
+        assert!(out.starts_with("HTTP/1.1 200 OK"), "{out}");
+        assert!(!out.contains("100 Continue"), "{out}");
+        assert!(out.contains("5\r\nhello\r\n"), "{out}");
+    }
+
+    /// RFC 9110 sections 10.1.1 and 15.2: no 1xx to an HTTP/1.0 client.
+    #[tokio::test]
+    async fn no_100_continue_for_http_10() {
+        let out = exchange(
+            b"POST / HTTP/1.0\r\nExpect: 100-continue\r\nContent-Length: 5\r\n\r\nhello",
+            echo_service,
+            Limits::default(),
+        )
+        .await;
+        assert!(!out.contains("100 Continue"), "{out}");
+        assert!(out.ends_with("hello"), "{out}");
+    }
+
+    /// A short write of the interim response must not count as sending it.
+    #[tokio::test]
+    async fn a_short_write_of_100_continue_is_completed() {
+        let out = exchange_with_capacity(
+            b"POST / HTTP/1.1\r\nHost: a\r\nExpect: 100-continue\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello",
+            echo_service,
+            8,
+        )
+        .await;
+        assert!(
+            out.starts_with("HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\n"),
+            "{out}"
+        );
     }
 
     /// An error response for a later pipelined request is appended to the
