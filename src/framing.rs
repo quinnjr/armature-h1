@@ -109,9 +109,16 @@ fn check_authority(head: &Head) -> Result<(), FramingError> {
             .filter(|(_, port)| port.is_some())
             .ok_or(FramingError::InvalidAuthority)?;
         if let Some((host, port)) = host {
-            let same = host.eq_ignore_ascii_case(target_host)
-                && port.is_none_or(|p| Some(p) == target_port);
-            if !same {
+            // CONNECT has no default port of its own. A port-less `Host` reads
+            // as 80 or 443 to anything that routes it as http(s) — RFC 9110's
+            // own CONNECT example pairs `:80` with a bare `Host` — so it
+            // matches only a target on one of those. `Host: internal` against
+            // `internal:22` would let a `Host` reader and the tunnel disagree.
+            let same_port = match port {
+                Some(p) => target_port == Some(p),
+                None => matches!(target_port, Some(80 | 443)),
+            };
+            if !host.eq_ignore_ascii_case(target_host) || !same_port {
                 return Err(FramingError::HostMismatch);
             }
         }
@@ -484,6 +491,15 @@ mod tests {
         );
         assert_eq!(
             ok(b"CONNECT a.example:443 HTTP/1.1\r\nHost: a.example:8443\r\n\r\n"),
+            Err(FramingError::HostMismatch)
+        );
+        // A port-less Host stands for 80/443 only, never another port.
+        assert_eq!(
+            ok(b"CONNECT a.example:80 HTTP/1.1\r\nHost: a.example\r\n\r\n"),
+            Ok(BodyKind::None)
+        );
+        assert_eq!(
+            ok(b"CONNECT internal.example:22 HTTP/1.1\r\nHost: internal.example\r\n\r\n"),
             Err(FramingError::HostMismatch)
         );
     }

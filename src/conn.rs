@@ -404,8 +404,12 @@ where
                 }
             };
 
-            let wants_upgrade =
-                head.count(&HeaderId::Upgrade) > 0 && head.connection_has_token("upgrade");
+            // HTTP/1.1 only, as for `100 Continue` below: a 1.0 client cannot
+            // be sent a 1xx, and `Upgrade` from one is ignored (RFC 9110
+            // sections 7.8, 15.2), so a 101 for it is no upgrade.
+            let wants_upgrade = version == Version::Http11
+                && head.count(&HeaderId::Upgrade) > 0
+                && head.connection_has_token("upgrade");
             // HTTP/1.1 only: a 1.0 client cannot be sent a 1xx (RFC 9110
             // section 15.2) and the expectation is to be ignored from one
             // (section 10.1.1). It would read the interim response as final.
@@ -647,7 +651,12 @@ where
                     if self.has_complete_head() {
                         return Ok(HeadOutcome::Ready);
                     }
-                    if !started {
+                    // Blank lines the scanner just discarded are not the start
+                    // of a request: a stray CRLF on an idle connection (the
+                    // legacy one some clients send after a body) leaves it
+                    // idle, under `idle_timeout` and a silent close, not
+                    // facing a 408 for a request it never began.
+                    if !started && !self.shared.borrow().buf.is_empty() {
                         started = true;
                         self.deadline.arm(self.cfg.limits.header_timeout);
                     }
@@ -812,7 +821,7 @@ where
         // framing accounts for, and a keep-alive peer reads them as the start of
         // the next response. A handler that attaches a body to a 304 should lose
         // the body, not desync the connection.
-        let body_forbidden = matches!(status, 204 | 304) || (100..200).contains(&status);
+        let body_forbidden = write::forbids_body_framing(status);
         if !is_head_request && !upgrading && !body_forbidden {
             match body {
                 ResponseBody::Empty => {}

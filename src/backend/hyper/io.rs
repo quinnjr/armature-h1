@@ -61,15 +61,16 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> IoShared<IO> {
             // "first byte of a request" the phase transition is about; the
             // transport read below applies the same `> before` rule.
             if n > 0 {
-                out.put_slice(&self.buffered.split_to(n));
-                self.note_read();
+                let chunk = self.buffered.split_to(n);
+                out.put_slice(&chunk);
+                self.note_read(&chunk);
             }
             return Poll::Ready(Ok(()));
         }
         let before = out.filled().len();
         let poll = Pin::new(&mut self.io).poll_read(cx, out);
         if matches!(poll, Poll::Ready(Ok(()))) && out.filled().len() > before {
-            self.note_read();
+            self.note_read(&out.filled()[before..]);
         }
         poll
     }
@@ -80,8 +81,14 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> IoShared<IO> {
     /// pipelined head landing while a response is still going out; re-phasing
     /// to `Head` there would put `header_timeout` over the remainder of a
     /// perfectly healthy stream and kill it. See the module docs.
-    fn note_read(&self) {
-        if self.clock.phase() == Phase::Idle {
+    ///
+    /// And only on a byte that can begin one: blank lines before a request
+    /// line are ignored (RFC 9112 section 2.2), so a stray CRLF on an idle
+    /// connection leaves it idle — under `idle_timeout` and a silent close —
+    /// rather than starting a `header_timeout` that ends in a 408 for a
+    /// request never sent. Native's scanner draws the same line.
+    fn note_read(&self, bytes: &[u8]) {
+        if self.clock.phase() == Phase::Idle && bytes.iter().any(|&b| b != b'\r' && b != b'\n') {
             self.clock.set(Phase::Head);
         }
     }

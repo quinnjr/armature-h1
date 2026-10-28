@@ -170,8 +170,10 @@ impl<S: H1Service + 'static>
                 }
             };
 
-            let wants_upgrade =
-                head.count(&HeaderId::Upgrade) > 0 && head.connection_has_token("upgrade");
+            // HTTP/1.1 only, as natively (RFC 9110 sections 7.8, 15.2).
+            let wants_upgrade = head.version == Version::Http11
+                && head.count(&HeaderId::Upgrade) > 0
+                && head.connection_has_token("upgrade");
             let expects_continue = head
                 .get_str(&HeaderId::Expect)
                 .is_some_and(|v| v.eq_ignore_ascii_case("100-continue"));
@@ -208,13 +210,17 @@ impl<S: H1Service + 'static>
 
             let call = service.call(Request { head, body, peer });
             // Parity with `conn::Connection::serve`: `handler_timeout` bounds
-            // the handler and answers 503, then the connection closes.
-            let (mut resp, handler_timed_out) = match cfg.limits.handler_timeout {
+            // the handler and answers a bare 503 — the same `reject` shape
+            // native's `write_error` produces — then the connection closes.
+            let mut resp = match cfg.limits.handler_timeout {
                 Some(after) => match tokio::time::timeout(after, call).await {
-                    Ok(resp) => (resp, false),
-                    Err(_) => (crate::service::Response::new(503), true),
+                    Ok(resp) => resp,
+                    Err(_) => {
+                        phase.set(Phase::Write);
+                        return Ok(reject(503, version, phase));
+                    }
                 },
-                None => (call.await, false),
+                None => call.await,
             };
             // Parity with `conn::write_response`: a status no final response
             // can carry becomes a 500, without the fields and body that went
@@ -248,8 +254,7 @@ impl<S: H1Service + 'static>
             // wire under the bespoke stack; the observable contract is that
             // the connection is not reused. hyper *can* drain, but strict
             // parity wins: force close.
-            let force_close =
-                !upgrading && (!fully_read.get() || impossible_status || handler_timed_out);
+            let force_close = !upgrading && (!fully_read.get() || impossible_status);
 
             // The handler window is over. Response writing is hyper's, under
             // `write_timeout` (see BACKENDS.md on write_timeout granularity).

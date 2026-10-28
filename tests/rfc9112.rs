@@ -1094,3 +1094,95 @@ fn a_handler_inside_its_handler_timeout_is_served() {
     );
     assert_eq!(ex.status(), Some(200), "{:?}", ex.body);
 }
+
+/// A stray CRLF after a response (RFC 9112 section 2.2's legacy trailing
+/// line) is not the start of a request: the connection stays idle and closes
+/// silently on the idle deadline, without a 408 for a request never sent.
+#[test]
+fn a_stray_crlf_on_an_idle_connection_is_not_a_request() {
+    let ex = raw_exchange_slow(
+        Limits {
+            header_timeout: Duration::from_millis(200),
+            idle_timeout: Duration::from_millis(900),
+            ..quick_limits()
+        },
+        vec![
+            b"GET / HTTP/1.1\r\nHost: a\r\n\r\n".to_vec(),
+            b"\r\n".to_vec(),
+        ],
+        Duration::from_millis(50),
+    );
+    assert_eq!(ex.responses(), 1, "{:?}", ex.body);
+    assert!(!ex.body.contains("408"), "{:?}", ex.body);
+    assert!(ex.closed);
+}
+
+/// RFC 9110 sections 7.8 and 15.2: `Upgrade` from an HTTP/1.0 client is
+/// ignored, so a handler's 101 for one cannot stand as its final response.
+#[test]
+fn a_101_to_an_http_10_upgrade_request_becomes_500() {
+    let ex = raw_exchange_with_service(
+        quick_limits(),
+        || {
+            |_req: Request| async {
+                Response::new(101)
+                    .header(
+                        armature_h1::HeaderId::Connection,
+                        bytes::Bytes::from_static(b"upgrade"),
+                    )
+                    .header(
+                        armature_h1::HeaderId::Upgrade,
+                        bytes::Bytes::from_static(b"websocket"),
+                    )
+            }
+        },
+        vec![b"GET / HTTP/1.0\r\nConnection: upgrade\r\nUpgrade: websocket\r\n\r\n".to_vec()],
+        Duration::ZERO,
+    );
+    assert_eq!(ex.status(), Some(500), "{:?}", ex.body);
+    assert!(ex.closed);
+}
+
+/// The handler-timeout 503 is the bare rejection under either backend: no
+/// configured `Server` field, as with every other error response.
+#[test]
+fn the_handler_timeout_503_is_a_bare_rejection() {
+    let server = Server::bind(
+        config(Limits {
+            handler_timeout: Some(Duration::from_millis(200)),
+            ..quick_limits()
+        })
+        .server_name(bytes::Bytes::from_static(b"armature-test")),
+    )
+    .expect("bind");
+    let addr = server.local_addr();
+    let handle = server.handle();
+    let client = std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let out = rt.block_on(async move {
+            let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+            s.write_all(b"GET / HTTP/1.1\r\nHost: a\r\n\r\n")
+                .await
+                .unwrap();
+            let mut out = Vec::new();
+            let _ = tokio::time::timeout(Duration::from_secs(3), s.read_to_end(&mut out)).await;
+            String::from_utf8_lossy(&out).into_owned()
+        });
+        handle.shutdown();
+        out
+    });
+    server
+        .serve(|| {
+            |_req: Request| async {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                Response::text("late")
+            }
+        })
+        .expect("serve");
+    let out = client.join().unwrap();
+    assert!(out.starts_with("HTTP/1.1 503"), "{out:?}");
+    assert!(!out.to_ascii_lowercase().contains("server:"), "{out:?}");
+}
