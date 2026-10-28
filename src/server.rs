@@ -940,6 +940,33 @@ async fn worker_loop<F, S, G, H, U, C>(
             tracing::debug!(error = %e, worker, "could not register a handed-off connection");
         }
     };
+    // A connection accepted with nowhere to put it, at most one per worker:
+    // with it held, this worker accepts nothing more until it is placed.
+    let mut pending: Option<Handoff> = None;
+    // Place a detached connection: on this worker, on another, or — with
+    // every worker at its cap — nowhere yet, handing it back to be held. A
+    // send fails only when the target has exited, which retires it for good,
+    // so this ends.
+    let route = |mut handoff: Handoff| -> Option<Handoff> {
+        loop {
+            // Not `?`: `None` from this closure means "placed", and the
+            // connection must come back to be held, not be dropped.
+            let Some(target) = balance.place(worker, &rng) else {
+                return Some(handoff);
+            };
+            if target == worker {
+                adopt(handoff);
+                return None;
+            }
+            match balance.inbox[target].send(handoff) {
+                Ok(()) => return None,
+                Err(back) => {
+                    balance.retire(target);
+                    handoff = back.0;
+                }
+            }
+        }
+    };
 
     local
         .run_until(async {
@@ -954,11 +981,19 @@ async fn worker_loop<F, S, G, H, U, C>(
                 if *rx.borrow() {
                     break;
                 }
+                // A connection accepted when every worker turned out to be full
+                // is held, not closed, and placed first once there is room.
+                if let Some(held) = pending.take() {
+                    pending = route(held);
+                }
                 // At its own cap, a worker still accepts while any other has
                 // room: `place` hands the connection over. Only with every
-                // worker full does it stop, and new connections wait in the
-                // listen backlog instead of on a core that cannot serve them.
-                if balance.count(worker) >= max_connections && !balance.has_room() {
+                // worker full — or one connection already held for want of
+                // room — does it stop, and new connections wait in the listen
+                // backlog instead of on a core that cannot serve them.
+                if pending.is_some()
+                    || (balance.count(worker) >= max_connections && !balance.has_room())
+                {
                     tokio::select! {
                         changed = rx.changed() => {
                             if changed.is_err() || *rx.borrow() {
@@ -984,6 +1019,13 @@ async fn worker_loop<F, S, G, H, U, C>(
                         }
                     }
                     Some(handoff) = inbox.recv() => adopt(handoff),
+                    // Accepting at its own cap only because another worker had
+                    // room: look again now and then, so that once every worker
+                    // fills up this one parks above — leaving new connections
+                    // in its backlog — rather than accepting them only to
+                    // close them.
+                    () = tokio::time::sleep(FULL_RECHECK),
+                        if balance.count(worker) >= max_connections => {}
                     accepted = listener.accept() => {
                         let (stream, peer) = match accepted {
                             Ok(pair) => pair,
@@ -1030,33 +1072,35 @@ async fn worker_loop<F, S, G, H, U, C>(
                         if cfg.tcp.nodelay {
                             let _ = stream.set_nodelay(true);
                         }
-                        let Some(target) = balance.place(worker, &rng) else {
-                            // Every worker filled up between this one's cap check
-                            // and the accept — handoffs racing it. Shed this one
-                            // rather than exceed the cap.
-                            tracing::debug!(worker, "every worker is at max_connections; closing an accepted connection");
-                            continue;
-                        };
-                        if target == worker {
-                            serve(stream, peer);
-                            continue;
-                        }
-                        // Out of this runtime's reactor and into the target's.
-                        // Socket options set above stay with the socket.
-                        let std_stream = match stream.into_std() {
-                            Ok(s) => s,
-                            Err(e) => {
-                                balance.release(target);
-                                tracing::debug!(error = %e, worker, "could not detach a connection to hand off");
-                                continue;
-                            }
-                        };
-                        if let Err(back) = balance.inbox[target].send((std_stream, peer)) {
-                            // Its inbox is closed: that worker has exited.
-                            balance.retire(target);
-                            if balance.reserve(worker) {
-                                adopt(back.0);
-                            }
+                        match balance.place(worker, &rng) {
+                            // The fast path: served here, never leaving this
+                            // reactor.
+                            Some(target) if target == worker => serve(stream, peer),
+                            Some(target) => match stream.into_std() {
+                                // Out of this runtime's reactor and into the
+                                // target's. Socket options set above stay with
+                                // the socket.
+                                Ok(std_stream) => {
+                                    if let Err(back) =
+                                        balance.inbox[target].send((std_stream, peer))
+                                    {
+                                        // The target has exited.
+                                        balance.retire(target);
+                                        pending = route(back.0);
+                                    }
+                                }
+                                Err(e) => {
+                                    balance.release(target);
+                                    tracing::debug!(error = %e, worker, "could not detach a connection to hand off");
+                                }
+                            },
+                            // Every worker filled up between this one's check
+                            // and the accept. Hold it rather than close it or
+                            // exceed a cap.
+                            None => match stream.into_std() {
+                                Ok(std_stream) => pending = Some((std_stream, peer)),
+                                Err(e) => tracing::debug!(error = %e, worker, "could not hold an accepted connection"),
+                            },
                         }
                     }
                 }
@@ -1080,6 +1124,11 @@ async fn worker_loop<F, S, G, H, U, C>(
             // check can still be landing, and `try_recv` would report the
             // channel empty under it. After `close`, `recv` returns every
             // message that made it in and only then `None`.
+            // One held for want of room was accepted before shutdown too.
+            if let Some(held) = pending.take() {
+                balance.open[worker].0.fetch_add(1, Ordering::Relaxed);
+                adopt(held);
+            }
             while let Some(handoff) = inbox.recv().await {
                 // Retiring overwrote the count; recount so the slot's release
                 // on close has something to release. RETIRED is far enough
@@ -2149,5 +2198,77 @@ mod tests {
         });
         server.serve(|| hello).expect("serve");
         assert_eq!(client.join().unwrap(), 2);
+    }
+
+    /// With every worker at its cap, a new connection waits in the backlog —
+    /// it is neither served nor closed — and is served once a slot frees. A
+    /// worker that started accepting at its cap because another had room must
+    /// not go on accepting and closing once that room is gone.
+    #[test]
+    fn a_full_server_queues_new_connections_instead_of_closing_them() {
+        let cfg = test_config(2).limits(Limits {
+            idle_timeout: Duration::from_secs(10),
+            header_timeout: Duration::from_secs(10),
+            max_connections: 1,
+            ..Default::default()
+        });
+        let server = Server::bind(cfg).expect("bind");
+        let addr = server.local_addr();
+        let handle = server.handle();
+        let client = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let outcome = rt.block_on(async move {
+                let mut held = Vec::new();
+                for _ in 0..2 {
+                    let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+                    s.write_all(b"GET / HTTP/1.1\r\nHost: a\r\n\r\n")
+                        .await
+                        .unwrap();
+                    let mut buf = vec![0u8; 512];
+                    let n = s.read(&mut buf).await.unwrap();
+                    assert!(buf[..n].starts_with(b"HTTP/1.1 200"));
+                    held.push(s);
+                }
+                // Long enough for any worker to have noticed it is full.
+                tokio::time::sleep(FULL_RECHECK * 4).await;
+                let mut extra = Vec::new();
+                for _ in 0..4 {
+                    let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+                    s.write_all(b"GET / HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n")
+                        .await
+                        .unwrap();
+                    extra.push(s);
+                }
+                let mut buf = vec![0u8; 512];
+                for s in &mut extra {
+                    match tokio::time::timeout(Duration::from_millis(200), s.read(&mut buf)).await {
+                        Err(_) => {}
+                        Ok(r) => return format!("queued connection was answered or closed: {r:?}"),
+                    }
+                }
+                // Free every slot; each queued connection is then served.
+                drop(held);
+                for s in &mut extra {
+                    let mut out = Vec::new();
+                    let _ =
+                        tokio::time::timeout(Duration::from_secs(3), s.read_to_end(&mut out)).await;
+                    if !out.starts_with(b"HTTP/1.1 200") {
+                        return format!(
+                            "not served once room freed: {:?}",
+                            String::from_utf8_lossy(&out)
+                        );
+                    }
+                }
+                String::new()
+            });
+            handle.shutdown();
+            outcome
+        });
+        server.serve(|| hello).expect("serve");
+        let outcome = client.join().unwrap();
+        assert!(outcome.is_empty(), "{outcome}");
     }
 }
