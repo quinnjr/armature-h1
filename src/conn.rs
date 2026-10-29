@@ -475,6 +475,8 @@ where
             // panics — in `call` itself or in its first poll — does not take
             // finished responses down with it.
             self.start_body_deadline();
+            // Per request: only this request's held output earns a restart.
+            self.held_in_out = false;
             let mut held = None;
             if !self.out.is_empty() {
                 if expects_continue {
@@ -2150,6 +2152,63 @@ mod tests {
             out.contains("llo"),
             "{}",
             &out[out.len().saturating_sub(120)..]
+        );
+    }
+
+    /// A restart earned by one request's held output does not carry over to a
+    /// later request on the connection: that one's body keeps the deadline
+    /// from its own handler's call.
+    #[tokio::test]
+    async fn a_held_output_restart_does_not_carry_to_a_later_request() {
+        let service = |req: Request| async move {
+            if req.head.path() != "/echo" {
+                // Answers on its first poll, behind held output.
+                return Response::text("quick");
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            Response::ok().with_body(ResponseBody::Stream(Box::pin(EchoStream(req.body))))
+        };
+        let (mut client, server) = tokio::io::duplex(64 * 1024);
+        let local = tokio::task::LocalSet::new();
+        let conn = Connection::new(
+            server,
+            service,
+            cfg(Limits {
+                body_timeout: Duration::from_millis(300),
+                ..Default::default()
+            }),
+            Rc::new(RefCell::new(DateCache::new())),
+        );
+        let server_task = local.spawn_local(async move { conn.serve().await });
+        let out = local
+            .run_until(async move {
+                client
+                    .write_all(
+                        b"GET /a HTTP/1.1\r\nHost: a\r\n\r\nGET /b HTTP/1.1\r\nHost: a\r\n\r\n",
+                    )
+                    .await
+                    .unwrap();
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                client
+                    .write_all(
+                        b"POST /echo HTTP/1.1\r\nHost: a\r\nContent-Length: 6\r\nConnection: close\r\n\r\nabc",
+                    )
+                    .await
+                    .unwrap();
+                // Past this body's deadline, inside one a stale restart gives.
+                tokio::time::sleep(Duration::from_millis(450)).await;
+                let _ = client.write_all(b"def").await;
+                let mut out = Vec::new();
+                let _ = tokio::time::timeout(Duration::from_secs(3), client.read_to_end(&mut out))
+                    .await;
+                let _ = server_task.await;
+                String::from_utf8_lossy(&out).into_owned()
+            })
+            .await;
+        assert!(out.contains("abc"), "{out}");
+        assert!(
+            !out.ends_with("0\r\n\r\n"),
+            "cut off at its own deadline: {out}"
         );
     }
 
