@@ -7,6 +7,8 @@ and this crate adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.h
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-10-29
+
 ### Performance
 
 Measured against `axum` 0.8 (hyper `http1`) on identical in-process and
