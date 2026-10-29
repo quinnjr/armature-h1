@@ -626,6 +626,10 @@ pub fn write_chunk(out: &mut BytesMut, data: &[u8]) {
 /// Trailers are held to the same field-name and field-value rules as headers: a
 /// CRLF in a trailer value ends the trailer section early, and the bytes after
 /// it become the start of whatever the peer reads next.
+///
+/// Fields for which [`HeaderId::forbidden_in_trailers`] holds — framing,
+/// routing and authentication fields — are dropped, whichever way the name is
+/// spelled.
 pub fn write_last_chunk(out: &mut BytesMut, trailers: &HeaderVec) {
     out.put_slice(b"0\r\n");
     for (id, value) in trailers.iter() {

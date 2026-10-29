@@ -661,6 +661,37 @@ fn the_last_expect_field_decides_on_both_backends() {
     );
     assert!(!e.body.contains("100 Continue"), "{}", e.body);
     assert!(e.body.contains("HTTP/1.1 200 OK"), "{}", e.body);
+
+    // What the handler is told agrees with the wire. Under hyper the interim
+    // response above is hyper's own, so this is what pins the bridge's reading.
+    async fn report_pending(req: Request) -> Response {
+        let mut r = Response::new(200);
+        r.body = armature_h1::ResponseBody::Full(bytes::Bytes::from(format!(
+            "pending={}",
+            req.body.continue_pending()
+        )));
+        r
+    }
+    for (raw, want) in [
+        (
+            &b"POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\nExpect: foo\r\n\
+               Expect: 100-continue\r\nConnection: close\r\n\r\nhello"[..],
+            "pending=true",
+        ),
+        (
+            &b"POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\nExpect: 100-continue\r\n\
+               Expect: foo\r\nConnection: close\r\n\r\nhello"[..],
+            "pending=false",
+        ),
+    ] {
+        let e = raw_exchange_with_service(
+            quick_limits(),
+            || report_pending,
+            vec![raw.to_vec()],
+            Duration::ZERO,
+        );
+        assert!(e.body.ends_with(want), "{}", e.body);
+    }
 }
 
 #[test]
