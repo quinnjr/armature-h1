@@ -64,7 +64,7 @@ pub enum FramingError {
     #[error("unsupported scheme in the request target")]
     UnsupportedScheme,
     /// `Host` named a different authority than an absolute-form or CONNECT
-    /// target.
+    /// target, or was empty beside one.
     #[error("Host disagrees with the request target's authority")]
     HostMismatch,
     /// The declared body exceeded `Limits::max_body_bytes`.
@@ -94,9 +94,14 @@ impl FramingError {
 /// other pair of fields that could be read two ways.
 fn check_authority(head: &Head) -> Result<(), FramingError> {
     // An empty `Host` is what RFC 9112 section 3.2 requires of a client whose
-    // target URI has no authority, so it is well-formed — it just names
-    // nothing, and there is nothing for it to disagree with.
-    let host = match head.get(&HeaderId::Host) {
+    // target URI has no authority, so it is well-formed for an origin-form
+    // target — it just names nothing. Beside a target that *does* carry an
+    // authority it is a contradiction, not an absence: an application or
+    // proxy reading `Host` sees no host where `Head::authority` sees one, so
+    // it is refused like any other disagreement.
+    let host_field = head.get(&HeaderId::Host);
+    let empty_host = host_field.is_some_and(|v| v.is_empty());
+    let host = match host_field {
         Some(v) if !v.is_empty() => Some(parse_authority(v).ok_or(FramingError::InvalidHost)?),
         _ => None,
     };
@@ -108,6 +113,9 @@ fn check_authority(head: &Head) -> Result<(), FramingError> {
         let (target_host, target_port) = parse_authority(head.target().as_bytes())
             .filter(|(_, port)| port.is_some())
             .ok_or(FramingError::InvalidAuthority)?;
+        if empty_host {
+            return Err(FramingError::HostMismatch);
+        }
         if let Some((host, port)) = host {
             // CONNECT has no default port of its own. A port-less `Host` reads
             // as 80 or 443 to anything that routes it as http(s) — RFC 9110's
@@ -137,6 +145,9 @@ fn check_authority(head: &Head) -> Result<(), FramingError> {
     let authority = head.authority().unwrap_or_default();
     let (target_host, target_port) =
         parse_authority(authority.as_bytes()).ok_or(FramingError::InvalidAuthority)?;
+    if empty_host {
+        return Err(FramingError::HostMismatch);
+    }
     if let Some((host, port)) = host {
         let same = host.eq_ignore_ascii_case(target_host)
             && port.unwrap_or(default_port) == target_port.unwrap_or(default_port);
@@ -460,6 +471,11 @@ mod tests {
             &b"GET http://a.example/ HTTP/1.1\r\nHost: b.example\r\n\r\n"[..],
             b"GET http://a.example/ HTTP/1.1\r\nHost: a.example:8080\r\n\r\n",
             b"GET https://a.example/ HTTP/1.1\r\nHost: a.example:80\r\n\r\n",
+            // Empty beside a target with an authority: a `Host` reader sees
+            // no host where `Head::authority` sees `internal`.
+            b"GET http://internal/ HTTP/1.1\r\nHost:\r\n\r\n",
+            b"GET http://internal/ HTTP/1.1\r\nHost: \r\n\r\n",
+            b"CONNECT internal:443 HTTP/1.1\r\nHost:\r\n\r\n",
         ] {
             assert_eq!(
                 decide(&head(raw), &Limits::default()),
@@ -475,7 +491,6 @@ mod tests {
             &b"GET http://trusted@evil.example/ HTTP/1.1\r\nHost: evil.example\r\n\r\n"[..],
             b"GET http:///x HTTP/1.1\r\nHost: a\r\n\r\n",
             b"GET http://a.example:99999/ HTTP/1.1\r\nHost: a.example\r\n\r\n",
-            b"GET http://a%zz/ HTTP/1.1\r\nHost: a\r\n\r\n",
         ] {
             assert_eq!(
                 decide(&head(raw), &Limits::default()),
@@ -483,6 +498,22 @@ mod tests {
                 "{raw:?}"
             );
         }
+
+        // A broken percent-encoding no longer gets past the parser, but the
+        // authority check still refuses one on its own: `decide` is also run on
+        // heads the hyper bridge builds.
+        let mut headers = crate::header::HeaderVec::new();
+        headers.push((crate::HeaderId::Host, Bytes::from_static(b"a")));
+        let broken = crate::Head::new(
+            crate::Method::Get,
+            crate::ByteStr::from_static("http://a%zz/"),
+            crate::Version::Http11,
+            headers,
+        );
+        assert_eq!(
+            decide(&broken, &Limits::default()),
+            Err(FramingError::InvalidAuthority)
+        );
     }
 
     /// CONNECT's target is its authority, held to the same rules.

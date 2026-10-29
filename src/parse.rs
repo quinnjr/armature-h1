@@ -239,8 +239,7 @@ fn finish_parse_head(
     };
 
     let target_token = req.path.ok_or(ParseError::InvalidRequestLine)?;
-    validate_target(target_token.as_bytes())?;
-    validate_target_form(target_token.as_bytes(), &method)?;
+    validate_request_target(target_token.as_bytes(), &method)?;
     let target = ByteStr::from_utf8(buf.slice_ref(target_token.as_bytes()))
         .map_err(|_| ParseError::NonUtf8Target)?;
 
@@ -294,11 +293,23 @@ fn finish_parse_head(
 /// The differential fuzz target against hyper found this gap: hyper parses the
 /// target into a `http::Uri` and rejects what does not fit, while this crate was
 /// passing the bytes straight through to routing.
+///
+/// A `%` must start a complete percent-encoding (RFC 3986 section 2.1): `/a%zz`
+/// and a trailing `/a%` are not URIs, and the decoders downstream of routing
+/// disagree on them — one leaves the bytes alone, another drops the `%`,
+/// another errors — so two hops can read different paths from one target.
 fn validate_target(target: &[u8]) -> Result<(), ParseError> {
     if target.is_empty() {
         return Err(ParseError::InvalidTarget);
     }
-    for &b in target {
+    for (i, &b) in target.iter().enumerate() {
+        if b == b'%'
+            && !target
+                .get(i + 1..i + 3)
+                .is_some_and(|h| h.iter().all(u8::is_ascii_hexdigit))
+        {
+            return Err(ParseError::InvalidTarget);
+        }
         let ok = b.is_ascii_alphanumeric()
             || matches!(
                 b,
@@ -329,6 +340,20 @@ fn validate_target(target: &[u8]) -> Result<(), ParseError> {
         }
     }
     Ok(())
+}
+
+/// Both request-target checks: the URI character set and the four RFC 9112
+/// forms.
+///
+/// One entry point so the hyper bridge, which receives the target already
+/// parsed into an `http::Uri`, holds it to the same rules as the native parser.
+/// `http::Uri` is laxer on both counts — it reads `host:port` as authority-form
+/// for any method and admits `\\` and raw UTF-8 in a path — and `Head::path`
+/// is only guaranteed to start with `/` for a non-CONNECT, non-OPTIONS target if
+/// every backend refuses the rest.
+pub(crate) fn validate_request_target(target: &[u8], method: &Method) -> Result<(), ParseError> {
+    validate_target(target)?;
+    validate_target_form(target, method)
 }
 
 /// Reject a request target that matches none of the four permitted forms.
@@ -606,6 +631,11 @@ mod tests {
             // reach routing as path bytes an upstream hop would have stripped.
             &b"GET /a#frag HTTP/1.1\r\nHost: a\r\n\r\n"[..],
             &b"GET /a?q=1#frag HTTP/1.1\r\nHost: a\r\n\r\n"[..],
+            // A `%` that does not start a complete percent-encoding.
+            &b"GET /a%zz HTTP/1.1\r\nHost: a\r\n\r\n"[..],
+            &b"GET /a%2 HTTP/1.1\r\nHost: a\r\n\r\n"[..],
+            &b"GET /a% HTTP/1.1\r\nHost: a\r\n\r\n"[..],
+            &b"GET /a?q=%g1 HTTP/1.1\r\nHost: a\r\n\r\n"[..],
         ] {
             assert_eq!(
                 parse_head(&Bytes::copy_from_slice(raw), &Limits::default()),
@@ -666,6 +696,7 @@ mod tests {
             &b"GET / HTTP/1.1\r\nHost: a\r\n\r\n"[..],
             &b"GET /a/b?x=1&y=2 HTTP/1.1\r\nHost: a\r\n\r\n"[..],
             &b"GET /a%20b HTTP/1.1\r\nHost: a\r\n\r\n"[..],
+            &b"GET /a%2Fb%2f%C3%A9 HTTP/1.1\r\nHost: a\r\n\r\n"[..],
             &b"GET /~user/a.b_c-d HTTP/1.1\r\nHost: a\r\n\r\n"[..],
             &b"GET /a?q=1;2,3!$&'()*+= HTTP/1.1\r\nHost: a\r\n\r\n"[..],
             &b"OPTIONS * HTTP/1.1\r\nHost: a\r\n\r\n"[..],

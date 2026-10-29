@@ -150,13 +150,19 @@ impl Head {
     /// range. The one remaining `O(len)` cost is the UTF-8 revalidation inside
     /// [`ByteStr::as_str`], which stays because the crate forbids `unsafe` and
     /// so cannot skip the check.
-    #[inline]
     ///
     /// For an absolute-form target (`GET http://a.example/x`), the path
     /// component alone: `/x`, or `/` when the URI's path is empty (RFC 9112
     /// section 3.2.1). The scheme and authority are not part of the path, and
     /// a router or an auth check matching on a leading `/` must not see them;
     /// read the authority with [`authority`](Self::authority).
+    ///
+    /// An origin-form path may itself begin with `//` (`GET //evil.example/x`
+    /// is a valid target whose path is `//evil.example/x`). Echoed into a
+    /// `Location` or joined onto a base URL, that reads as a scheme-relative
+    /// reference to another host, so collapse leading slashes before using the
+    /// path as a URL.
+    #[inline]
     pub fn path(&self) -> &str {
         let t = self.target.as_str();
         let end = self.query_at.unwrap_or(t.len());
@@ -175,8 +181,16 @@ impl Head {
     ///
     /// RFC 9112 section 3.2.2 makes the target's authority win over `Host`.
     /// [`framing::decide`](crate::framing::decide) also rejects a request
-    /// whose `Host` disagrees with it, so after that check the two never
-    /// differ; this is the one accessor to route or authorize on regardless.
+    /// whose `Host` disagrees with it, or is empty beside it, so after that
+    /// check the two name the same authority; this is the one accessor to
+    /// route or authorize on regardless.
+    ///
+    /// "The same authority" is RFC 3986's equivalence, not byte equality: the
+    /// value is returned as the client spelled it, so the host may differ in
+    /// case from `Host`'s and may carry the scheme's default port where
+    /// `Host` omits it (`A.EXAMPLE:80` beside `Host: a.example`). Compare it
+    /// case-insensitively and with the default port normalized; an exact
+    /// string match against an allowlist would refuse equivalent spellings.
     ///
     /// ```
     /// use armature_h1::{Limits, framing, parse_head};
@@ -208,6 +222,10 @@ impl Head {
 
     /// The scheme of an absolute-form target, as received; `None` for every
     /// other form.
+    ///
+    /// This is the client's claim, not the transport's: `GET https://a/` over
+    /// plaintext reports `https`. Decide whether a request arrived over TLS from
+    /// the listener that accepted it, never from this.
     ///
     /// ```
     /// use armature_h1::{Limits, parse_head};

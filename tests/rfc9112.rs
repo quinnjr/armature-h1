@@ -415,6 +415,49 @@ fn fragment_in_target_400_close() {
     raw_exchange(b"GET /a#frag HTTP/1.1\r\nHost: a\r\n\r\n").assert_rejected_and_closed(400);
 }
 
+/// Targets outside the URI character set, a `%` that starts no percent-encoding,
+/// and targets matching none of the four RFC 9112 section 3.2 forms are refused
+/// by both backends. `http::Uri` alone admits every one of these — `@host:port`
+/// as authority-form under GET, which would reach `Head::path` without a leading
+/// `/` — so the hyper bridge re-validates the target it is handed.
+#[test]
+fn malformed_targets_400_close_on_both_backends() {
+    for raw in [
+        &b"GET /a\\b HTTP/1.1\r\nHost: a\r\n\r\n"[..],
+        &b"GET /a\xc3\xa9 HTTP/1.1\r\nHost: a\r\n\r\n"[..],
+        &b"GET /a%zz HTTP/1.1\r\nHost: a\r\n\r\n"[..],
+        &b"GET @evil.example:80 HTTP/1.1\r\nHost: a\r\n\r\n"[..],
+        &b"GET evil.example HTTP/1.1\r\nHost: a\r\n\r\n"[..],
+        &b"GET * HTTP/1.1\r\nHost: a\r\n\r\n"[..],
+    ] {
+        raw_exchange(raw).assert_rejected_and_closed(400);
+    }
+}
+
+/// RFC 9112 section 7.1.2: the trailer section is field lines ending in CRLF.
+/// A bare LF there is a line-ending disagreement between hops, and under this
+/// one an embedded request vanished into the "trailers" — so it is refused.
+#[test]
+#[cfg_attr(
+    feature = "hyper-backend",
+    ignore = "see BACKENDS.md: bare LF in the chunked trailer section \
+              (hyper discards the section before the bridge sees it)"
+)]
+fn bare_lf_in_trailer_section_400_close() {
+    raw_exchange(
+        b"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n\
+          3\r\nabc\r\n0\r\n\nGET /hidden HTTP/1.1\r\nHost: a\r\n\r\n",
+    )
+    .assert_rejected_and_closed(400);
+    // The same after a well-formed trailer line: the bare-LF empty line ends
+    // the section for one reader and not for another.
+    raw_exchange(
+        b"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n\
+          3\r\nabc\r\n0\r\nX: a\r\n\nGET /hidden HTTP/1.1\r\nHost: a\r\n\r\n",
+    )
+    .assert_rejected_and_closed(400);
+}
+
 /// Positive twin of `fragment_in_target_400_close` for the hyper backend:
 /// BACKENDS.md documents `http::uri::PathAndQuery::from_shared` truncating
 /// at `#` before hyper builds the `Request`, so the bridge never sees the
@@ -596,6 +639,59 @@ fn expect_100_continue_interim_then_final() {
     );
     assert!(e.body.contains("HTTP/1.1 200 OK"), "{}", e.body);
     assert!(e.body.ends_with("hello"), "{}", e.body);
+}
+
+/// With more than one `Expect` field the last one decides, on both backends:
+/// hyper's head parser reads them in order and keeps the last.
+#[test]
+fn the_last_expect_field_decides_on_both_backends() {
+    let e = raw_exchange(
+        b"POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\nExpect: foo\r\n\
+          Expect: 100-continue\r\nConnection: close\r\n\r\nhello",
+    );
+    assert!(
+        e.body.starts_with("HTTP/1.1 100 Continue\r\n\r\n"),
+        "{}",
+        e.body
+    );
+
+    let e = raw_exchange(
+        b"POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\nExpect: 100-continue\r\n\
+          Expect: foo\r\nConnection: close\r\n\r\nhello",
+    );
+    assert!(!e.body.contains("100 Continue"), "{}", e.body);
+    assert!(e.body.contains("HTTP/1.1 200 OK"), "{}", e.body);
+
+    // What the handler is told agrees with the wire. Under hyper the interim
+    // response above is hyper's own, so this is what pins the bridge's reading.
+    async fn report_pending(req: Request) -> Response {
+        let mut r = Response::new(200);
+        r.body = armature_h1::ResponseBody::Full(bytes::Bytes::from(format!(
+            "pending={}",
+            req.body.continue_pending()
+        )));
+        r
+    }
+    for (raw, want) in [
+        (
+            &b"POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\nExpect: foo\r\n\
+               Expect: 100-continue\r\nConnection: close\r\n\r\nhello"[..],
+            "pending=true",
+        ),
+        (
+            &b"POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\nExpect: 100-continue\r\n\
+               Expect: foo\r\nConnection: close\r\n\r\nhello"[..],
+            "pending=false",
+        ),
+    ] {
+        let e = raw_exchange_with_service(
+            quick_limits(),
+            || report_pending,
+            vec![raw.to_vec()],
+            Duration::ZERO,
+        );
+        assert!(e.body.ends_with(want), "{}", e.body);
+    }
 }
 
 #[test]
@@ -966,6 +1062,13 @@ fn absolute_form_routes_on_its_path_component() {
 fn absolute_form_with_a_disagreeing_host_400_close() {
     raw_exchange(b"GET http://a.example/ HTTP/1.1\r\nHost: b.example\r\n\r\n")
         .assert_rejected_and_closed(400);
+}
+
+/// An empty `Host` beside an absolute-form target is a disagreement too: a
+/// `Host` reader would see no host where the target names one.
+#[test]
+fn absolute_form_with_an_empty_host_400_close() {
+    raw_exchange(b"GET http://internal/ HTTP/1.1\r\nHost:\r\n\r\n").assert_rejected_and_closed(400);
 }
 
 #[test]

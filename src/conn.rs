@@ -442,9 +442,12 @@ where
             // section 15.2) and the expectation is to be ignored from one
             // (section 10.1.1). It would read the interim response as final.
             let expects_continue = version == Version::Http11
+                // The last field decides, as in hyper's head parser, so the
+                // backends agree on `Expect: foo` then `Expect: 100-continue`.
                 && head
-                    .get_str(&HeaderId::Expect)
-                    .is_some_and(|v| v.eq_ignore_ascii_case("100-continue"));
+                    .all(&HeaderId::Expect)
+                    .last()
+                    .is_some_and(|v| v.eq_ignore_ascii_case(b"100-continue"));
             let is_head_request = head.method == Method::Head;
 
             {
@@ -887,8 +890,9 @@ where
         // A handler that says `Connection: close` is taken at its word. The
         // writer states persistence itself and drops such a field, so the
         // socket's fate and what the response says about it cannot disagree.
-        if header::all(&headers, &HeaderId::Connection).any(|v| header::value_has_token(v, "close"))
-        {
+        if headers.iter().any(|(id, v)| {
+            id.canonical() == &HeaderId::Connection && header::value_has_token(v, "close")
+        }) {
             keep_alive = false;
         }
 
@@ -905,7 +909,9 @@ where
         }
 
         if let Some(name) = &self.cfg.server_name
-            && header::get(&headers, &HeaderId::Server).is_none()
+            && !headers
+                .iter()
+                .any(|(id, _)| id.canonical() == &HeaderId::Server)
         {
             headers.push((HeaderId::Server, name.clone()));
         }
@@ -1901,6 +1907,30 @@ mod tests {
         assert!(closed);
     }
 
+    /// The same when the handler names the field through `HeaderId::Other`
+    /// rather than the interned variant.
+    #[tokio::test]
+    async fn a_handler_close_spelled_as_other_closes_the_connection() {
+        let (out, closed) = exchange_raw(
+            b"GET / HTTP/1.1\r\nHost: a\r\n\r\nGET / HTTP/1.1\r\nHost: a\r\n\r\n",
+            |_req: Request| async {
+                Response::text("hi").header(
+                    HeaderId::Other(crate::ByteStr::from_static("Connection")),
+                    Bytes::from_static(b"close"),
+                )
+            },
+            Limits::default(),
+        )
+        .await;
+        assert_eq!(out.matches("HTTP/1.1 200").count(), 1, "{out}");
+        assert_eq!(
+            out.to_ascii_lowercase().matches("connection").count(),
+            1,
+            "{out}"
+        );
+        assert!(closed);
+    }
+
     /// RFC 9110 section 9.3.2: a HEAD response's length describes the GET body.
     #[tokio::test]
     async fn a_head_response_keeps_the_handlers_content_length() {
@@ -2531,6 +2561,46 @@ mod tests {
             })
             .await;
         assert!(out.contains("server: armature-h1"), "{out}");
+    }
+
+    /// A handler `Server` named through `HeaderId::Other` still suppresses
+    /// the configured one, so the response carries a single `Server`.
+    #[tokio::test]
+    async fn a_handler_server_spelled_as_other_suppresses_the_configured_one() {
+        async fn own_server(_req: Request) -> Response {
+            Response::ok().header(
+                HeaderId::Other(crate::ByteStr::from_static("Server")),
+                Bytes::from_static(b"handler"),
+            )
+        }
+        let (mut client, server) = tokio::io::duplex(4096);
+        let local = tokio::task::LocalSet::new();
+        let conn = Connection::new(
+            server,
+            own_server,
+            Rc::new(ConnConfig {
+                limits: Limits::default(),
+                tick: Duration::from_millis(10),
+                server_name: Some(Bytes::from_static(b"armature-h1")),
+            }),
+            Rc::new(RefCell::new(DateCache::new())),
+        );
+        let task = local.spawn_local(async move { conn.serve().await });
+        let out = local
+            .run_until(async move {
+                client
+                    .write_all(b"GET / HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n")
+                    .await
+                    .unwrap();
+                let mut out = Vec::new();
+                let _ = tokio::time::timeout(Duration::from_secs(2), client.read_to_end(&mut out))
+                    .await;
+                let _ = task.await;
+                String::from_utf8_lossy(&out).into_owned()
+            })
+            .await;
+        assert_eq!(out.matches("server: ").count(), 1, "{out}");
+        assert!(out.contains("server: handler"), "{out}");
     }
 
     #[tokio::test]
