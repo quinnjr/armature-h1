@@ -294,6 +294,25 @@ fn steady_state_keepalive_get_stays_within_budget() {
     );
 }
 
+/// The `Date` cache reformats once a second, on the request path, so it must
+/// not allocate when it does.
+///
+/// Pinned on its own because the steady-state cases only cross a second
+/// boundary by chance: when it allocated, they failed about once in fifty runs.
+#[test]
+fn date_reformat_does_not_allocate() {
+    let mut cache = DateCache::new();
+    let start = std::time::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+    cache.get(start);
+    arm();
+    for s in 1..=10 {
+        cache.get(start + Duration::from_secs(s));
+    }
+    let allocs = disarm();
+    assert_eq!(allocs, 0, "each new second reformatted with an allocation");
+    assert_eq!(cache.get(start), b"Tue, 14 Nov 2023 22:13:20 GMT");
+}
+
 /// The same case, with the connection's peer address populated.
 ///
 /// Every other case here builds its connection with `Connection::new` alone,
