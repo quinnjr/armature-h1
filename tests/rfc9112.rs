@@ -968,6 +968,13 @@ fn absolute_form_with_a_disagreeing_host_400_close() {
         .assert_rejected_and_closed(400);
 }
 
+/// An empty `Host` beside an absolute-form target is a disagreement too: a
+/// `Host` reader would see no host where the target names one.
+#[test]
+fn absolute_form_with_an_empty_host_400_close() {
+    raw_exchange(b"GET http://internal/ HTTP/1.1\r\nHost:\r\n\r\n").assert_rejected_and_closed(400);
+}
+
 #[test]
 fn absolute_form_with_userinfo_400_close() {
     raw_exchange(b"GET http://trusted@evil.example/ HTTP/1.1\r\nHost: evil.example\r\n\r\n")
