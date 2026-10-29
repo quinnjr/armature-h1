@@ -461,7 +461,7 @@ pub(crate) fn write_head_for(
         if !ok {
             continue;
         }
-        match id {
+        match id.canonical() {
             HeaderId::Date => has_date = true,
             HeaderId::ContentLength => {
                 len_count += 1;
@@ -537,6 +537,9 @@ pub(crate) fn write_head_for(
 
     // Handler-supplied headers first, so the checks below can see them.
     for (i, (id, value)) in resp.headers.iter().enumerate() {
+        // Judged, and written, as the field the wire reads: an `Other` that
+        // spells `content-length` is a framing field like any other.
+        let id = id.canonical();
         if stale_content_length && id == &HeaderId::ContentLength {
             tracing::warn!("dropping response content-length that disagrees with the body length");
             continue;
@@ -623,9 +626,25 @@ pub fn write_chunk(out: &mut BytesMut, data: &[u8]) {
 /// Trailers are held to the same field-name and field-value rules as headers: a
 /// CRLF in a trailer value ends the trailer section early, and the bytes after
 /// it become the start of whatever the peer reads next.
+///
+/// Fields for which [`HeaderId::forbidden_in_trailers`] holds — framing,
+/// routing and authentication fields — are dropped, whichever way the name is
+/// spelled.
 pub fn write_last_chunk(out: &mut BytesMut, trailers: &HeaderVec) {
     out.put_slice(b"0\r\n");
     for (id, value) in trailers.iter() {
+        // Framing, routing and authentication fields have no place after the
+        // body (RFC 9110 section 6.5.1): a recipient that merges trailers into
+        // the header section would act on a length or a credential that was
+        // never part of the head. The request side refuses them; the response
+        // side drops them, by the name the wire reads.
+        if id.canonical().forbidden_in_trailers() {
+            tracing::warn!(
+                field = id.as_str(),
+                "dropping a field forbidden in trailers"
+            );
+            continue;
+        }
         if !writable(id, value) {
             tracing::warn!(
                 field = id.as_str(),
@@ -969,6 +988,37 @@ mod tests {
     }
 
     #[test]
+    fn an_other_spelling_a_framing_field_is_judged_as_that_field() {
+        // `HeaderId::Other` is public, so a relay handler can copy upstream
+        // names into it verbatim. Judged as opaque names, these went out as
+        // written beside the writer's own framing: two lengths, a chunked
+        // advertisement over an unchunked body, and both persistence tokens.
+        let other = |n: &'static str| HeaderId::Other(crate::ByteStr::from_static(n));
+        let got = render(
+            Version::Http11,
+            &head_of(
+                200,
+                &[
+                    (other("content-length"), "0"),
+                    (other("Transfer-Encoding"), "chunked"),
+                    (other("Connection"), "keep-alive, x-hop"),
+                ],
+            ),
+            &OutBody::Fixed(Bytes::from_static(b"hello")),
+            false,
+        );
+        assert_eq!(
+            got,
+            "HTTP/1.1 200 OK\r\n\
+             connection: x-hop\r\n\
+             date: Thu, 01 Jan 1970 00:00:00 GMT\r\n\
+             content-length: 5\r\n\
+             connection: close\r\n\
+             \r\n"
+        );
+    }
+
+    #[test]
     fn duplicate_content_length_is_stale_and_reclaimed() {
         // Conflicting: the classic splitting shape.
         let got = render(
@@ -1296,6 +1346,20 @@ mod tests {
         let mut out = BytesMut::new();
         write_last_chunk(&mut out, &trailers);
         assert_eq!(&out[..], b"0\r\n\r\n");
+    }
+
+    #[test]
+    fn write_last_chunk_drops_fields_forbidden_in_trailers() {
+        let mut trailers = HeaderVec::new();
+        trailers.push((HeaderId::ContentLength, Bytes::from_static(b"5")));
+        trailers.push((
+            HeaderId::Other(crate::ByteStr::from_static("Transfer-Encoding")),
+            Bytes::from_static(b"chunked"),
+        ));
+        trailers.push((HeaderId::Etag, Bytes::from_static(b"\"v1\"")));
+        let mut out = BytesMut::new();
+        write_last_chunk(&mut out, &trailers);
+        assert_eq!(&out[..], b"0\r\netag: \"v1\"\r\n\r\n");
     }
 
     #[test]

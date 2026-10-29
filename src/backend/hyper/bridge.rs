@@ -92,6 +92,14 @@ pub(crate) fn convert_head(
     if cumulative > limits.max_head_bytes {
         return Err(431);
     }
+    // Re-validated, because `http::Uri` is laxer than the native parser: it
+    // takes `@evil.example:80` as authority-form under GET, and `\\` or raw
+    // UTF-8 in a path, all of which reach `Head::path` unless refused here.
+    // Checked where the native reader checks it: after the head-size limits,
+    // before the framing ones.
+    if crate::parse::validate_request_target(target_str.as_bytes(), &method).is_err() {
+        return Err(400);
+    }
     if declared_len.is_some_and(|n| n > limits.max_body_bytes) {
         return Err(413);
     }
@@ -189,9 +197,12 @@ impl<S: H1Service + 'static>
             // response to a 1.0 client, and `Body::continue_pending` must not
             // say one is owed when it never will be.
             let expects_continue = head.version == Version::Http11
+                // The last field decides, as in hyper's head parser, so the
+                // backends agree on `Expect: foo` then `Expect: 100-continue`.
                 && head
-                    .get_str(&HeaderId::Expect)
-                    .is_some_and(|v| v.eq_ignore_ascii_case("100-continue"));
+                    .all(&HeaderId::Expect)
+                    .last()
+                    .is_some_and(|v| v.eq_ignore_ascii_case(b"100-continue"));
 
             // Captured before `head` moves into the `Request`: hyper writes the
             // status line from the response's own version, so a 1.0 request
@@ -430,7 +441,9 @@ fn convert_response(
     // with one.
     let length_instances = headers
         .iter()
-        .filter(|(id, v)| *id == HeaderId::ContentLength && crate::write::valid_field_value(v))
+        .filter(|(id, v)| {
+            id.canonical() == &HeaderId::ContentLength && crate::write::valid_field_value(v)
+        })
         .count();
 
     // hyper writes the status line — and picks its framing — from the
@@ -445,9 +458,12 @@ fn convert_response(
     // acted on, not just echoed.
     let keep_alive = keep_alive
         && !headers.iter().any(|(id, v)| {
-            *id == HeaderId::Connection && crate::header::value_has_token(v, "close")
+            id.canonical() == &HeaderId::Connection && crate::header::value_has_token(v, "close")
         });
     for (id, value) in headers.into_iter() {
+        // Judged as the field the wire reads, exactly as the native writer
+        // judges it: an `Other` spelling `transfer-encoding` is dropped too.
+        let id = id.into_canonical();
         // `expected_len.is_none()` is tested first and on its own: a `Stream`
         // has no length any field could agree with, and an *unparseable* value
         // also reads as `None`, so comparing the two directly would let
@@ -937,6 +953,40 @@ mod tests {
             )));
         let out = conv(resp, Version::Http11);
         assert_eq!(header_of(&out, "transfer-encoding"), None);
+    }
+
+    /// `HeaderId::Other` is public, so a relay handler can name a framing field
+    /// through it. The bridge judges it as that field, like the native writer:
+    /// the `Transfer-Encoding` is dropped and the `Connection: close` honoured.
+    #[test]
+    fn an_other_spelling_a_framing_field_is_judged_as_that_field() {
+        let other = |n: &'static str| HeaderId::Other(crate::ByteStr::from_static(n));
+        let resp = crate::service::Response::new(200)
+            .header(other("Transfer-Encoding"), Bytes::from_static(b"chunked"))
+            .header(other("connection"), Bytes::from_static(b"close"))
+            .with_body(crate::service::ResponseBody::Full(Bytes::from_static(
+                b"hi",
+            )));
+        let out = conv(resp, Version::Http11);
+        assert_eq!(header_of(&out, "transfer-encoding"), None);
+        assert_eq!(header_of(&out, "connection").as_deref(), Some("close"));
+    }
+
+    /// A length named both ways is a duplicate, and a duplicate is stale: the
+    /// bridge drops both and hyper frames the body itself, once.
+    #[test]
+    fn a_length_spelled_both_ways_is_a_duplicate() {
+        let resp = crate::service::Response::new(200)
+            .header(HeaderId::ContentLength, Bytes::from_static(b"2"))
+            .header(
+                HeaderId::Other(crate::ByteStr::from_static("Content-Length")),
+                Bytes::from_static(b"2"),
+            )
+            .with_body(crate::service::ResponseBody::Full(Bytes::from_static(
+                b"hi",
+            )));
+        let out = conv(resp, Version::Http11);
+        assert_eq!(out.headers().get_all("content-length").iter().count(), 0);
     }
 
     /// `http::StatusCode` has no representation for a status outside

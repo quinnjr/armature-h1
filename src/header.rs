@@ -119,6 +119,38 @@ impl HeaderId {
         HeaderId::Origin,
     ];
 
+    /// The id this field really is.
+    ///
+    /// [`HeaderId::Other`] is public, so a handler can build one that spells a
+    /// well-known name (`Other("Content-Length")`) instead of going through
+    /// [`intern`]. Every decision the response side makes by variant —
+    /// framing, persistence, `Server` — reads the field through this, so such
+    /// a field is judged as what the wire will read it as rather than slipping
+    /// past those checks as an opaque name.
+    #[inline]
+    pub(crate) fn canonical(&self) -> &HeaderId {
+        match self {
+            HeaderId::Other(name) => match HeaderId::from_bytes(name.as_bytes()) {
+                Some(known) => Self::WELL_KNOWN
+                    .iter()
+                    .find(|w| **w == known)
+                    .unwrap_or(self),
+                None => self,
+            },
+            _ => self,
+        }
+    }
+
+    /// [`canonical`](Self::canonical), by value.
+    #[cfg(feature = "hyper-backend")]
+    #[inline]
+    pub(crate) fn into_canonical(self) -> HeaderId {
+        match self.canonical() {
+            HeaderId::Other(_) => self,
+            known => known.clone(),
+        }
+    }
+
     /// Match a field name against the well-known set, case-insensitively.
     ///
     /// Returns `None` when the name is not well-known; the caller then builds
