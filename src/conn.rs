@@ -12,9 +12,10 @@ use crate::deadline::ConnDeadline;
 use crate::header::{self, HeaderId, HeaderVec};
 use crate::service::{BodyIo, H1Service, ResponseBody, Upgraded};
 use crate::write::{self, DateCache, OutBody, ResponseHead};
-use crate::{Body, Limits, Method, Request, Response, Version, framing, parse, parse_head};
+use crate::{Body, Limits, Method, Request, Response, Version, framing, parse};
 use bytes::{Bytes, BytesMut};
 use std::cell::{Cell, RefCell};
+use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
 use std::rc::Rc;
@@ -30,6 +31,15 @@ const READ_CHUNK: usize = 8 * 1024;
 ///
 /// Matches [`READ_CHUNK`] so a stream and a read move data in comparable units.
 const STREAM_FLUSH_BYTES: usize = 8 * 1024;
+
+/// How many bytes of finished responses may wait in the write buffer for the
+/// next pipelined one.
+///
+/// A response whose successor is already buffered is not flushed on its own:
+/// pipelined requests are answered with one write instead of one per request.
+/// The cap bounds how much a client can make the server hold back by
+/// pipelining.
+const PIPELINE_FLUSH_BYTES: usize = 32 * 1024;
 
 /// The interim response for `Expect: 100-continue`.
 const CONTINUE: &[u8] = b"HTTP/1.1 100 Continue\r\n\r\n";
@@ -84,8 +94,22 @@ struct IoState<IO> {
     /// that consumes or rewrites `buf`, so a stale value can never hide a
     /// terminator: correctness only ever depends on `buf` itself.
     scanned: usize,
-    /// A `100 Continue` owed to the peer but not yet written.
-    pending_continue: bool,
+    /// Where the buffered head ends, once the scanner has found its terminator.
+    ///
+    /// Kept so the head is not searched again to split it off and again to
+    /// parse it. Cleared alongside `scanned`, for the same reason.
+    head_end: Option<usize>,
+    /// Whether the current request's body is finished — read to its end or
+    /// failed — so its deadline has nothing left to bound.
+    body_finished: bool,
+    /// The current request body's generation; see [`BodyIo::body_started`].
+    body_generation: u64,
+    /// How many bytes of a `100 Continue` are owed to the peer and not yet
+    /// written; zero when none is.
+    ///
+    /// A count rather than a flag because a write can be short: one that
+    /// accepted half the interim response must not count as having sent it.
+    pending_continue: usize,
 }
 
 impl<IO> IoState<IO> {
@@ -95,36 +119,30 @@ impl<IO> IoState<IO> {
     /// an offset into a buffer that no longer exists in that form.
     fn reset_scan(&mut self) {
         self.scanned = 0;
+        self.head_end = None;
     }
 }
 
 impl<IO: AsyncRead + AsyncWrite + Unpin> IoState<IO> {
     /// Read once into `buf`, appending. `Ok(0)` means EOF.
     fn poll_read_more(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<usize>> {
-        let start = self.buf.len();
-        // Grow with zeroed bytes so the read target is an initialized slice.
-        // Reading into uninitialized capacity would need `unsafe`, which this
-        // crate forbids; the cost is one memset per syscall, which is small
-        // against the syscall itself. `tokio_util::io::poll_read_buf` is the
-        // alternative if a benchmark ever shows this mattering.
-        self.buf.resize(start + READ_CHUNK, 0);
-        let mut read_buf = tokio::io::ReadBuf::new(&mut self.buf[start..]);
-        let poll = std::pin::Pin::new(&mut self.io).poll_read(cx, &mut read_buf);
-        let filled = read_buf.filled().len();
-        match poll {
-            Poll::Pending => {
-                self.buf.truncate(start);
-                Poll::Pending
-            }
-            Poll::Ready(Err(e)) => {
-                self.buf.truncate(start);
-                Poll::Ready(Err(e))
-            }
-            Poll::Ready(Ok(())) => {
-                self.buf.truncate(start + filled);
-                Poll::Ready(Ok(filled))
-            }
-        }
+        // Read straight into the buffer's spare capacity. This used to grow the
+        // buffer with zeroed bytes first, because filling uninitialized
+        // capacity needs `unsafe` this crate forbids. That was an 8 KiB memset
+        // on every poll, the `Pending` one included, and it was the single
+        // largest cost in a profile of the keep-alive path. Tokio's `read_buf`
+        // does the uninitialized-read bookkeeping on its side of the boundary.
+        //
+        // Reserving first is what keeps this a read of up to a whole chunk:
+        // with no spare capacity, `BytesMut` would hand `read_buf` a 64-byte
+        // sliver. Once the previous request's slices are dropped, the reserve
+        // reclaims the existing allocation rather than growing it.
+        self.buf.reserve(READ_CHUNK);
+        let read = std::pin::pin!(tokio::io::AsyncReadExt::read_buf(
+            &mut self.io,
+            &mut self.buf
+        ));
+        read.poll(cx)
     }
 }
 
@@ -180,18 +198,31 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> BodyIo for IoState<IO> {
         self.buf = joined;
     }
 
-    fn poll_send_continue(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        if !self.pending_continue {
-            return Poll::Ready(Ok(()));
+    fn body_started(&mut self) -> u64 {
+        self.body_generation = self.body_generation.wrapping_add(1);
+        self.body_finished = false;
+        self.body_generation
+    }
+
+    fn body_finished(&mut self, generation: u64) {
+        if generation == self.body_generation {
+            self.body_finished = true;
         }
-        match std::pin::Pin::new(&mut self.io).poll_write(cx, CONTINUE) {
-            Poll::Pending => Poll::Pending,
-            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
-            Poll::Ready(Ok(_)) => {
-                self.pending_continue = false;
-                Poll::Ready(Ok(()))
+    }
+
+    fn poll_send_continue(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        while self.pending_continue > 0 {
+            let rest = &CONTINUE[CONTINUE.len() - self.pending_continue..];
+            match std::pin::Pin::new(&mut self.io).poll_write(cx, rest) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Ready(Ok(0)) => return Poll::Ready(Err(io::ErrorKind::WriteZero.into())),
+                Poll::Ready(Ok(n)) => self.pending_continue -= n.min(self.pending_continue),
             }
         }
+        // A buffering transport (TLS) would otherwise sit on it while the
+        // client waits for it before sending the body.
+        std::pin::Pin::new(&mut self.io).poll_flush(cx)
     }
 }
 
@@ -202,6 +233,16 @@ pub struct Connection<IO, S> {
     cfg: Rc<ConnConfig>,
     date: Rc<RefCell<DateCache>>,
     deadline: ConnDeadline,
+    /// The `Limits::handler_timeout` clock, created only when one is set, so a
+    /// connection without it costs no second timer.
+    handler_deadline: Option<ConnDeadline>,
+    /// When the current request's body must have arrived by, set as its
+    /// handler is called. Outlives the handler: a streamed response may still
+    /// be reading the body, and the deadline holds until the body finishes.
+    body_deadline_at: Option<tokio::time::Instant>,
+    /// Earlier pipelined responses were put back in `out` to go out with the
+    /// current one's head, so the body deadline restarts once they have.
+    held_in_out: bool,
     out: BytesMut,
     /// Reused across requests: allocating a fresh flag per request would put an
     /// allocation back on the steady-state path.
@@ -239,6 +280,10 @@ where
         buffered: Bytes,
     ) -> Self {
         let deadline = ConnDeadline::new(cfg.tick);
+        let handler_deadline = cfg
+            .limits
+            .handler_timeout
+            .map(|_| ConnDeadline::new(cfg.tick));
         let mut buf = BytesMut::with_capacity(READ_CHUNK.max(buffered.len()));
         buf.extend_from_slice(&buffered);
         Self {
@@ -246,12 +291,18 @@ where
                 io,
                 buf,
                 scanned: 0,
-                pending_continue: false,
+                head_end: None,
+                pending_continue: 0,
+                body_finished: false,
+                body_generation: 0,
             })),
             service,
             cfg,
             date,
             deadline,
+            handler_deadline,
+            body_deadline_at: None,
+            held_in_out: false,
             out: BytesMut::with_capacity(1024),
             body_read: Rc::new(Cell::new(false)),
             peer: None,
@@ -351,16 +402,18 @@ where
             // the body or the next pipelined request.
             let head_bytes = {
                 let mut st = self.shared.borrow_mut();
-                let end = parse::find_head_end(&st.buf).unwrap_or(st.buf.len());
+                // `read_until_head_or_idle` only returns Ready once a terminator
+                // is present, so the fallback search is unreachable in practice.
+                let Some(end) = st.head_end.or_else(|| parse::find_head_end(&st.buf)) else {
+                    return Ok(None);
+                };
                 let head = st.buf.split_to(end).freeze();
                 st.reset_scan();
                 head
             };
-            let head = match parse_head(&head_bytes, &self.cfg.limits) {
-                Ok(Some((head, _))) => head,
-                // `read_until_head_or_idle` only returns Ready once a terminator
-                // is present, so this is unreachable in practice.
-                Ok(None) => return Ok(None),
+            let head_len = head_bytes.len();
+            let head = match parse::parse_head_region(&head_bytes, head_len, &self.cfg.limits) {
+                Ok(head) => head,
                 Err(e) => {
                     self.write_error(Version::Http11, e.status()).await?;
                     return Ok(None);
@@ -379,14 +432,26 @@ where
                 }
             };
 
-            let wants_upgrade =
-                head.count(&HeaderId::Upgrade) > 0 && head.connection_has_token("upgrade");
-            let expects_continue = head
-                .get_str(&HeaderId::Expect)
-                .is_some_and(|v| v.eq_ignore_ascii_case("100-continue"));
+            // HTTP/1.1 only, as for `100 Continue` below: a 1.0 client cannot
+            // be sent a 1xx, and `Upgrade` from one is ignored (RFC 9110
+            // sections 7.8, 15.2), so a 101 for it is no upgrade.
+            let wants_upgrade = version == Version::Http11
+                && head.count(&HeaderId::Upgrade) > 0
+                && head.connection_has_token("upgrade");
+            // HTTP/1.1 only: a 1.0 client cannot be sent a 1xx (RFC 9110
+            // section 15.2) and the expectation is to be ignored from one
+            // (section 10.1.1). It would read the interim response as final.
+            let expects_continue = version == Version::Http11
+                && head
+                    .get_str(&HeaderId::Expect)
+                    .is_some_and(|v| v.eq_ignore_ascii_case("100-continue"));
             let is_head_request = head.method == Method::Head;
 
-            self.shared.borrow_mut().pending_continue = expects_continue;
+            {
+                let mut st = self.shared.borrow_mut();
+                st.pending_continue = if expects_continue { CONTINUE.len() } else { 0 };
+                st.body_finished = false;
+            }
 
             let dyn_io: Rc<RefCell<dyn BodyIo>> = self.shared.clone();
             // Shared with the body so the loop can tell, after the handler
@@ -401,30 +466,161 @@ where
                 body_read.clone(),
             );
 
+            // Earlier responses may still be waiting in `out` for this one (see
+            // `PIPELINE_FLUSH_BYTES`). They go out before anything else can be
+            // written — a `100 Continue` is written straight to the transport —
+            // and before a handler that does not finish at once can hold them
+            // back for as long as it takes. Until then they sit in a guard that
+            // exists before the handler is even called, so a handler that
+            // panics — in `call` itself or in its first poll — does not take
+            // finished responses down with it.
+            self.start_body_deadline();
+            // Per request: only this request's held output earns a restart.
+            self.held_in_out = false;
+            let mut held = None;
+            if !self.out.is_empty() {
+                if expects_continue {
+                    self.flush().await?;
+                    self.start_body_deadline();
+                } else {
+                    held = Some(HeldOutput {
+                        shared: self.shared.clone(),
+                        bytes: Some(self.out.split()),
+                    });
+                }
+            }
+
+            // The handler's response, written once where it is produced. The
+            // request and response each carry an inline header array, and
+            // every wrapper or block boundary they pass through is another copy
+            // of it — on the keep-alive path, more than parsing the head costs.
+            let mut produced: Option<Response> = None;
+            // Pinned as an `Option` so it can be dropped in place the moment it
+            // has produced its response — or fails — rather than at the end of
+            // the iteration: a hand-written future that keeps its `Request`
+            // would otherwise hold the `Body`, and with it the transport,
+            // through the response write and an upgrade handoff, as hyper's
+            // dispatcher never does.
+            let mut call = std::pin::pin!(Some(self.service.call(Request {
+                head,
+                body,
+                peer: self.peer,
+            })));
+
+            if let Some(mut held) = held.take() {
+                let polled = std::future::poll_fn(|cx| {
+                    Poll::Ready(match call.as_mut().as_pin_mut() {
+                        Some(f) => f.poll(cx),
+                        None => Poll::Pending,
+                    })
+                })
+                .await;
+                if polled.is_ready() {
+                    call.set(None);
+                }
+                let mut bytes = held.bytes.take().unwrap_or_default();
+                bytes.unsplit(std::mem::take(&mut self.out));
+                self.out = bytes;
+                match polled {
+                    Poll::Ready(resp) => {
+                        produced = Some(resp);
+                        // Written with this response's head instead; the body
+                        // deadline restarts after that flush.
+                        self.held_in_out = true;
+                    }
+                    Poll::Pending => {
+                        self.flush().await?;
+                        self.start_body_deadline();
+                    }
+                }
+            }
+
             // The body deadline covers the handler's read of it. Nothing else
             // polls this deadline, so the handler call itself has to race it:
             // arming a timer nobody awaits would leave a handler blocked on body
             // bytes the peer never sends holding the connection forever.
             //
-            // Cancelling the handler mid-await drops its `Body`, and with it the
-            // last borrow of the transport, so the 408 can be written here.
-            let call = self.service.call(Request {
-                head,
-                body,
-                peer: self.peer,
-            });
-            self.deadline.arm(self.cfg.limits.body_timeout);
-            let resp = {
-                let deadline = &mut self.deadline;
-                tokio::select! {
-                    biased;
-                    () = deadline.expired() => None,
-                    r = call => Some(r),
+            // `poll_fn` over the pinned call rather than `select!`, which takes
+            // its futures by value, and for the same reason as above.
+            //
+            // `body_timeout` bounds the body's arrival, not the handler: once
+            // the body has been read to its end — or when there never was one —
+            // an expiry means nothing, and a handler may take as long as it
+            // needs. A body still incomplete at the deadline is a stalled peer
+            // (or a handler sitting on bytes it never reads), and gets the 408,
+            // checked before the handler as `biased` had it.
+            //
+            // `handler_timeout`, when set, bounds the handler itself and is the
+            // server's failure, not the peer's: 503 rather than 408. It is
+            // checked after the handler, as `tokio::time::timeout` (the hyper
+            // backend's) checks after its inner future, so a handler ready on
+            // the same wakeup wins under both. Armed only here: writing the
+            // earlier responses above is the write deadline's business, and a
+            // slow reader must not spend this handler's budget.
+            let mut failed = None;
+            if produced.is_none() {
+                if let (Some(after), Some(d)) = (
+                    self.cfg.limits.handler_timeout,
+                    self.handler_deadline.as_mut(),
+                ) {
+                    d.arm(after);
                 }
-            };
-            self.deadline.disarm();
-            let Some(resp) = resp else {
-                self.write_error(version, 408).await?;
+                // Finished covers a body that failed as well as one read to its
+                // end: either way no bytes are awaited, so a handler composing
+                // its answer to a bad body is not cut off with a 408 it did
+                // nothing to earn.
+                let body_finished = || self.shared.borrow().body_finished;
+                // One deadline per body, from when its handler is called —
+                // restarted after any earlier pipelined responses were flushed
+                // — and the same instant a streamed response is later held to.
+                // `None` is a deadline switched off with `Duration::MAX`.
+                let body_armed = !body_finished() && self.body_deadline_at.is_some();
+                if let Some(at) = self.body_deadline_at.filter(|_| body_armed) {
+                    self.deadline
+                        .arm(at.saturating_duration_since(tokio::time::Instant::now()));
+                }
+                let deadline = &mut self.deadline;
+                let mut handler_deadline = self.handler_deadline.as_mut();
+                let produced = &mut produced;
+                failed = std::future::poll_fn(|cx| {
+                    if body_armed && !body_finished() && deadline.poll_expired(cx).is_ready() {
+                        return Poll::Ready(Some(408));
+                    }
+                    if let Some(f) = call.as_mut().as_pin_mut()
+                        && let Poll::Ready(resp) = f.poll(cx)
+                    {
+                        call.set(None);
+                        *produced = Some(resp);
+                        return Poll::Ready(None);
+                    }
+                    if let Some(d) = handler_deadline.as_mut()
+                        && d.poll_expired(cx).is_ready()
+                    {
+                        return Poll::Ready(Some(503));
+                    }
+                    Poll::Pending
+                })
+                .await;
+                if body_armed {
+                    self.deadline.disarm();
+                }
+                if let Some(d) = self.handler_deadline.as_mut() {
+                    d.disarm();
+                }
+            }
+            // On failure the handler's future — and whatever it holds: its
+            // `Body`, the last borrow of the transport, a pool connection, a
+            // lock — is dropped before the error response is written, rather
+            // than kept alive for as long as that write takes.
+            if let Some(status) = failed {
+                call.set(None);
+                self.write_error(version, status).await?;
+                return Ok(None);
+            }
+            let Some(resp) = produced else {
+                // Unreachable: no failure means the handler produced one.
+                call.set(None);
+                self.write_error(version, 500).await?;
                 return Ok(None);
             };
 
@@ -493,8 +689,14 @@ where
         if self.has_complete_head() {
             return Ok(HeadOutcome::Ready);
         }
+        // Responses are only held back while a successor head is buffered, so
+        // this cannot find any; it is what guarantees none ever waits on a
+        // read.
+        if !self.out.is_empty() {
+            self.flush().await?;
+        }
 
-        let had_bytes = !self.shared.borrow().buf.is_empty();
+        let had_bytes = self.request_started();
         // Idle applies before the first byte; the header deadline applies once
         // the request has begun. Conflating them would let a client hold a
         // connection open indefinitely mid-head.
@@ -529,13 +731,35 @@ where
                 }
                 Some(Err(e)) => return Err(e),
                 Some(Ok(0)) => return Ok(HeadOutcome::Eof),
-                Some(Ok(_)) => {
-                    if !started {
-                        started = true;
-                        self.deadline.arm(self.cfg.limits.header_timeout);
-                    }
+                Some(Ok(n)) => {
+                    // Judged on this read's bytes alone, before the scanner
+                    // below strips blank lines: rescanning the whole buffer on
+                    // every read would let a peer trickling CR/LF noise make
+                    // each read cost the buffer's length.
+                    let fresh_begins = {
+                        let st = self.shared.borrow();
+                        let len = st.buf.len();
+                        parse::begins_request(&st.buf[len - n.min(len)..])
+                    };
+                    // Checked before arming the header deadline: a head that
+                    // arrives whole in one read — nearly every one — has no
+                    // use for it, and arming is not free.
                     if self.has_complete_head() {
                         return Ok(HeadOutcome::Ready);
+                    }
+                    // Blank lines the scanner just discarded are not the start
+                    // of a request: a stray CRLF on an idle connection (the
+                    // legacy one some clients send after a body) leaves it
+                    // idle, under `idle_timeout` and a silent close, not
+                    // facing a 408 for a request it never began.
+                    //
+                    // A CR or LF on its own is not one either: a stray CRLF
+                    // split across reads leaves a lone `\r` until its `\n`
+                    // arrives. Only a byte that can begin a request line starts
+                    // one — the same rule the hyper adapter applies.
+                    if !started && fresh_begins {
+                        started = true;
+                        self.deadline.arm(self.cfg.limits.header_timeout);
                     }
                     // Refuse to buffer an unterminated head forever.
                     if self.shared.borrow().buf.len() > self.cfg.limits.max_head_bytes {
@@ -544,6 +768,24 @@ where
                 }
             }
         }
+    }
+
+    /// Start the current request body's deadline from now.
+    ///
+    /// Restarted after earlier pipelined responses are flushed: writing them to
+    /// a slow reader is `write_timeout`'s to bound, and must not spend a body
+    /// that arrived in time — the hyper backend starts the same clock at the
+    /// service call, after the previous response is out. `None` when it cannot
+    /// be represented: `Duration::MAX` is how the deadline is switched off.
+    fn start_body_deadline(&mut self) {
+        self.body_deadline_at =
+            tokio::time::Instant::now().checked_add(self.cfg.limits.body_timeout);
+    }
+
+    /// Whether what is already buffered has begun a request; see
+    /// [`parse::begins_request`]. Scanned once per request, on entry.
+    fn request_started(&self) -> bool {
+        parse::begins_request(&self.shared.borrow().buf)
     }
 
     /// Whether a complete head is buffered, resuming the search where the last
@@ -557,13 +799,33 @@ where
     /// and it always sees the whole head region.
     fn has_complete_head(&self) -> bool {
         let mut st = self.shared.borrow_mut();
+        // RFC 9112 section 2.2: a server SHOULD ignore empty lines received
+        // before a request line. Only whole CRLFs, matching the strict line
+        // endings everywhere else, and only at the front, where a request line
+        // can never begin with CR — so this can never eat part of a head. A
+        // peer streaming nothing but CRLFs has not begun a request, so it is
+        // bounded by the idle deadline, as a silent one would be; the
+        // discarded bytes never accumulate toward `max_head_bytes`.
+        let blank = st
+            .buf
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .take_while(|pair| *pair == b"\r\n")
+            .count()
+            * 2;
+        if blank > 0 {
+            bytes::Buf::advance(&mut st.buf, blank);
+            st.scanned = st.scanned.saturating_sub(blank);
+        }
         // A miss leaves `scanned == buf.len()`, so this also covers "called
         // twice without an intervening read".
         if st.buf.len() <= st.scanned {
             return false;
         }
         let from = st.scanned.saturating_sub(3);
-        if parse::find_head_end(&st.buf[from..]).is_some() {
+        if let Some(end) = parse::find_head_end(&st.buf[from..]) {
+            st.head_end = Some(from + end);
             return true;
         }
         st.scanned = st.buf.len();
@@ -595,13 +857,52 @@ where
         // An unread request body means the next bytes on the wire are body
         // bytes, not a request line. Rather than guess where the body ended,
         // close.
-        let keep_alive = req_keep_alive && !upgrading;
+        let mut keep_alive = req_keep_alive && !upgrading;
 
         let Response {
-            status,
+            mut status,
             mut headers,
-            body,
+            mut body,
         } = resp;
+
+        // A final response needs a final status. Anything outside 200..=599
+        // cannot be one — `1000` is not a status line a peer can parse, and a
+        // 1xx other than 101 is an interim response the client would keep
+        // waiting past for a final one that never comes, as is a 101 the
+        // client never asked for. (A 101 it did ask for but that is not
+        // honoured — the body was left unread — is still written, then the
+        // connection closes; see `upgrading`.) The handler's fields and body
+        // went with that status, so neither is kept.
+        if !write::is_final_status(status, wants_upgrade) {
+            tracing::warn!(
+                status,
+                "handler returned a status that cannot be a final response; sending 500"
+            );
+            status = 500;
+            headers.clear();
+            body = ResponseBody::Empty;
+            keep_alive = false;
+        }
+
+        // A handler that says `Connection: close` is taken at its word. The
+        // writer states persistence itself and drops such a field, so the
+        // socket's fate and what the response says about it cannot disagree.
+        if header::all(&headers, &HeaderId::Connection).any(|v| header::value_has_token(v, "close"))
+        {
+            keep_alive = false;
+        }
+
+        // HTTP/1.0 has no chunked coding, so a streamed body there is
+        // close-delimited: written unframed, and the close marks its end.
+        // Only a body that is actually written: a HEAD, a 204/304 or a 1xx
+        // writes none, so it has nothing to delimit and no reason to close.
+        let close_delimited = version == Version::Http10
+            && matches!(body, ResponseBody::Stream(_))
+            && !is_head_request
+            && !write::forbids_body_framing(status);
+        if close_delimited {
+            keep_alive = false;
+        }
 
         if let Some(name) = &self.cfg.server_name
             && header::get(&headers, &HeaderId::Server).is_none()
@@ -615,18 +916,21 @@ where
             ResponseBody::Stream(_) => OutBody::Chunked,
         };
 
-        self.out.clear();
+        self.settle_continue().await?;
+        // Not cleared: it may hold earlier pipelined responses still owed to
+        // the peer, and this one goes out after them.
         {
             let mut date = self.date.borrow_mut();
             let now = SystemTime::now();
             let date_bytes = date.get(now);
-            write::write_head(
+            write::write_head_for(
                 &mut self.out,
                 version,
                 &ResponseHead { status, headers },
                 &out_body,
                 date_bytes,
                 keep_alive,
+                is_head_request,
             );
         }
 
@@ -637,7 +941,7 @@ where
         // framing accounts for, and a keep-alive peer reads them as the start of
         // the next response. A handler that attaches a body to a 304 should lose
         // the body, not desync the connection.
-        let body_forbidden = matches!(status, 204 | 304) || (100..200).contains(&status);
+        let body_forbidden = write::forbids_body_framing(status);
         if !is_head_request && !upgrading && !body_forbidden {
             match body {
                 ResponseBody::Empty => {}
@@ -653,6 +957,11 @@ where
                     //
                     // Flush the head first so the peer can begin processing.
                     self.flush().await?;
+                    // Earlier pipelined responses went out with it: that slow
+                    // write is `write_timeout`'s, not the request body's.
+                    if std::mem::take(&mut self.held_in_out) {
+                        self.start_body_deadline();
+                    }
                     loop {
                         // Poll once without committing to a wait. If the stream
                         // is not ready, whatever has been coalesced so far is
@@ -671,7 +980,52 @@ where
                                     if !self.out.is_empty() {
                                         self.flush().await?;
                                     }
-                                    std::future::poll_fn(|cx| s.as_mut().poll_next(cx)).await
+                                    // A stream fed by the request body is still
+                                    // waiting on the peer, and the body's
+                                    // deadline still holds: a peer that sends
+                                    // half the body and stops must not hold the
+                                    // connection forever. The head is out, so
+                                    // there is no 408 to give; the connection
+                                    // closes.
+                                    //
+                                    // Only while the body is still awaited: one
+                                    // read to its end, failed, or dropped unread
+                                    // (a download or event stream answering a
+                                    // body it ignored) has reported finished,
+                                    // and must not be cut off.
+                                    let body_awaited = |shared: &Rc<RefCell<IoState<IO>>>| {
+                                        !shared.borrow().body_finished
+                                    };
+                                    let bounded = self
+                                        .body_deadline_at
+                                        .filter(|_| body_awaited(&self.shared));
+                                    match bounded {
+                                        None => {
+                                            std::future::poll_fn(|cx| s.as_mut().poll_next(cx))
+                                                .await
+                                        }
+                                        Some(at) => {
+                                            self.deadline.arm(at.saturating_duration_since(
+                                                tokio::time::Instant::now(),
+                                            ));
+                                            let shared = &self.shared;
+                                            let deadline = &mut self.deadline;
+                                            let item = std::future::poll_fn(|cx| {
+                                                if body_awaited(shared)
+                                                    && deadline.poll_expired(cx).is_ready()
+                                                {
+                                                    return Poll::Ready(None);
+                                                }
+                                                s.as_mut().poll_next(cx).map(Some)
+                                            })
+                                            .await;
+                                            self.deadline.disarm();
+                                            let Some(item) = item else {
+                                                return Ok(Disposition::Close);
+                                            };
+                                            item
+                                        }
+                                    }
                                 }
                             };
                         match next {
@@ -688,7 +1042,11 @@ where
                                 // buffer goes out, so an idle stream never holds
                                 // a frame back regardless of how little it has
                                 // produced.
-                                write::write_chunk(&mut self.out, &chunk);
+                                if close_delimited {
+                                    self.out.extend_from_slice(&chunk);
+                                } else {
+                                    write::write_chunk(&mut self.out, &chunk);
+                                }
                                 if self.out.len() >= STREAM_FLUSH_BYTES {
                                     self.flush().await?;
                                 }
@@ -709,12 +1067,24 @@ where
                             }
                         }
                     }
-                    write::write_last_chunk(&mut self.out, &HeaderVec::new());
+                    if !close_delimited {
+                        write::write_last_chunk(&mut self.out, &HeaderVec::new());
+                    }
                 }
             }
         }
 
-        self.flush().await?;
+        // Hold a keep-alive response back while the next request is already
+        // here, so a pipelined batch goes out in one write. Whichever response
+        // finds no successor buffered flushes the batch; nothing waits on a
+        // read, since the successor needs none.
+        let coalesce = keep_alive
+            && !upgrading
+            && self.out.len() < PIPELINE_FLUSH_BYTES
+            && self.has_complete_head();
+        if !coalesce {
+            self.flush().await?;
+        }
 
         if upgrading {
             return Ok(Disposition::Upgrade);
@@ -779,12 +1149,46 @@ where
         .await
     }
 
+    /// Resolve an owed `100 Continue` before a final response goes out.
+    ///
+    /// Once a final response is on its way an interim one is no longer owed,
+    /// and writing it later would land inside that response — in the middle
+    /// of a body a streaming handler produces by reading the request. So one
+    /// not yet begun is dropped; one a short write left half-sent is finished,
+    /// because the peer is already parsing it.
+    async fn settle_continue(&mut self) -> io::Result<()> {
+        let pending = self.shared.borrow().pending_continue;
+        if pending == CONTINUE.len() {
+            self.shared.borrow_mut().pending_continue = 0;
+            return Ok(());
+        }
+        if pending == 0 {
+            return Ok(());
+        }
+        let shared = self.shared.clone();
+        self.deadline.arm(self.cfg.limits.write_timeout);
+        let deadline = &mut self.deadline;
+        let sent = std::future::poll_fn(|cx| {
+            if deadline.poll_expired(cx).is_ready() {
+                return Poll::Ready(Err(io::ErrorKind::TimedOut.into()));
+            }
+            shared.borrow_mut().poll_send_continue(cx)
+        })
+        .await;
+        self.deadline.disarm();
+        sent
+    }
+
     /// Write a bare error response and close.
     ///
     /// Always `Connection: close`: a connection whose framing we do not fully
     /// agree on is never reused.
     async fn write_error(&mut self, version: Version, status: u16) -> io::Result<()> {
-        self.out.clear();
+        if self.settle_continue().await.is_err() {
+            return Ok(());
+        }
+        // Appended rather than written alone: earlier pipelined responses may
+        // still be waiting in `out`, and they are owed first.
         {
             let mut date = self.date.borrow_mut();
             let now = SystemTime::now();
@@ -802,10 +1206,52 @@ where
             );
         }
         // Best effort: the peer may already be gone, and there is nothing
-        // further to do about it either way.
-        let _ = Self::write_all_from(&self.shared, &self.out).await;
-        self.out.clear();
+        // further to do about it either way. Deadline-guarded like every other
+        // write, so a peer that stops reading cannot hold the connection open
+        // on an error response.
+        let _ = self.flush().await;
         Ok(())
+    }
+}
+
+/// Finished pipelined responses, held while the next handler is first polled.
+///
+/// They are normally put back and written with the next response. If the
+/// handler panics instead, unwinding drops this, and the drop makes one
+/// non-blocking attempt to write them: they were complete before that handler
+/// ever ran, and the peer is owed them whatever it does.
+struct HeldOutput<IO: AsyncWrite + Unpin> {
+    shared: Rc<RefCell<IoState<IO>>>,
+    bytes: Option<BytesMut>,
+}
+
+impl<IO: AsyncWrite + Unpin> Drop for HeldOutput<IO> {
+    fn drop(&mut self) {
+        let Some(bytes) = self.bytes.take() else {
+            return;
+        };
+        let Ok(mut st) = self.shared.try_borrow_mut() else {
+            return;
+        };
+        st.write_now(&bytes);
+    }
+}
+
+impl<IO> IoState<IO> {
+    /// Write what the transport takes without waiting, then flush the same
+    /// way. Best effort: a write that would block is abandoned.
+    fn write_now(&mut self, mut bytes: &[u8])
+    where
+        IO: AsyncWrite + Unpin,
+    {
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        while !bytes.is_empty() {
+            match std::pin::Pin::new(&mut self.io).poll_write(&mut cx, bytes) {
+                Poll::Ready(Ok(n)) if n > 0 => bytes = &bytes[n..],
+                _ => return,
+            }
+        }
+        let _ = std::pin::Pin::new(&mut self.io).poll_flush(&mut cx);
     }
 }
 
@@ -1017,6 +1463,838 @@ mod tests {
             p1 < p2 && p2 < p3,
             "responses must be in request order: {out}"
         );
+    }
+
+    /// A transport that counts the writes made to it.
+    struct CountingIo {
+        inner: tokio::io::DuplexStream,
+        writes: Rc<Cell<usize>>,
+    }
+
+    impl AsyncRead for CountingIo {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
+        }
+    }
+
+    impl AsyncWrite for CountingIo {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            self.writes.set(self.writes.get() + 1);
+            std::pin::Pin::new(&mut self.inner).poll_write(cx, buf)
+        }
+
+        fn poll_flush(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<io::Result<()>> {
+            std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+        }
+
+        fn poll_shutdown(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<io::Result<()>> {
+            std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
+    }
+
+    /// A pipelined batch is answered with one write, not one per request.
+    #[tokio::test]
+    async fn pipelined_responses_go_out_in_one_write() {
+        let (mut client, server) = tokio::io::duplex(64 * 1024);
+        let writes = Rc::new(Cell::new(0));
+        let io = CountingIo {
+            inner: server,
+            writes: writes.clone(),
+        };
+        let local = tokio::task::LocalSet::new();
+        let conn = Connection::new(
+            io,
+            ok_service,
+            cfg(Limits::default()),
+            Rc::new(RefCell::new(DateCache::new())),
+        );
+        let server_task = local.spawn_local(async move { conn.serve().await });
+        let out = local
+            .run_until(async move {
+                client
+                    .write_all(
+                        b"GET / HTTP/1.1\r\nHost: a\r\n\r\nGET / HTTP/1.1\r\nHost: a\r\n\r\n\
+                          GET / HTTP/1.1\r\nHost: a\r\n\r\nGET / HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n",
+                    )
+                    .await
+                    .unwrap();
+                let mut out = Vec::new();
+                tokio::time::timeout(Duration::from_secs(2), client.read_to_end(&mut out))
+                    .await
+                    .expect("server closes after the last request")
+                    .unwrap();
+                let _ = server_task.await;
+                String::from_utf8_lossy(&out).into_owned()
+            })
+            .await;
+        assert_eq!(out.matches("HTTP/1.1 200 OK").count(), 4, "{out}");
+        assert_eq!(writes.get(), 1, "four pipelined responses, one write");
+    }
+
+    /// Held-back responses must not wait on a handler that does not finish at
+    /// once: the client gets them while the next handler is still running.
+    #[tokio::test]
+    async fn a_slow_handler_does_not_hold_back_earlier_pipelined_responses() {
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let release_rx = Rc::new(RefCell::new(Some(release_rx)));
+        let service = move |req: Request| {
+            let wait = (req.head.path() == "/slow")
+                .then(|| release_rx.borrow_mut().take())
+                .flatten();
+            async move {
+                if let Some(rx) = wait {
+                    let _ = rx.await;
+                }
+                let mut r = Response::new(200);
+                r.body = ResponseBody::Full(Bytes::from(req.head.path().to_owned()));
+                r
+            }
+        };
+        let (mut client, server) = tokio::io::duplex(64 * 1024);
+        let local = tokio::task::LocalSet::new();
+        let conn = Connection::new(
+            server,
+            service,
+            cfg(Limits::default()),
+            Rc::new(RefCell::new(DateCache::new())),
+        );
+        let server_task = local.spawn_local(async move { conn.serve().await });
+        local
+            .run_until(async move {
+                client
+                    .write_all(
+                        b"GET /fast HTTP/1.1\r\nHost: a\r\n\r\n\
+                          GET /slow HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n",
+                    )
+                    .await
+                    .unwrap();
+                let mut first = vec![0u8; 4096];
+                let n = tokio::time::timeout(Duration::from_secs(2), client.read(&mut first))
+                    .await
+                    .expect("the first response must not wait for the slow handler")
+                    .unwrap();
+                let first = String::from_utf8_lossy(&first[..n]).into_owned();
+                assert!(first.ends_with("/fast"), "{first}");
+                release_tx.send(()).unwrap();
+                let mut rest = Vec::new();
+                tokio::time::timeout(Duration::from_secs(2), client.read_to_end(&mut rest))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(String::from_utf8_lossy(&rest).ends_with("/slow"));
+                let _ = server_task.await;
+            })
+            .await;
+    }
+
+    /// A held-back response was finished before the next handler ran; that
+    /// handler panicking must not take it down with the connection.
+    #[tokio::test]
+    async fn a_panicking_handler_does_not_lose_held_back_responses() {
+        let service = |req: Request| async move {
+            assert!(req.head.path() != "/boom", "handler panic, on purpose");
+            Response::text("first")
+        };
+        let (mut client, server) = tokio::io::duplex(64 * 1024);
+        let local = tokio::task::LocalSet::new();
+        let conn = Connection::new(
+            server,
+            service,
+            cfg(Limits::default()),
+            Rc::new(RefCell::new(DateCache::new())),
+        );
+        let server_task = local.spawn_local(async move { conn.serve().await });
+        let out = local
+            .run_until(async move {
+                client
+                    .write_all(
+                        b"GET /a HTTP/1.1\r\nHost: a\r\n\r\nGET /boom HTTP/1.1\r\nHost: a\r\n\r\n",
+                    )
+                    .await
+                    .unwrap();
+                assert!(server_task.await.is_err(), "the handler panicked");
+                let mut out = Vec::new();
+                let _ = tokio::time::timeout(Duration::from_secs(2), client.read_to_end(&mut out))
+                    .await;
+                String::from_utf8_lossy(&out).into_owned()
+            })
+            .await;
+        assert!(out.starts_with("HTTP/1.1 200 OK"), "{out:?}");
+        assert!(out.ends_with("first"), "{out:?}");
+    }
+
+    /// The same when the panic is in the synchronous part of `call`, before
+    /// any future exists to poll.
+    #[tokio::test]
+    async fn a_handler_panicking_in_call_does_not_lose_held_back_responses() {
+        let service = |req: Request| {
+            assert!(
+                req.head.path() != "/boom",
+                "synchronous handler panic, on purpose"
+            );
+            async move { Response::text("first") }
+        };
+        let (mut client, server) = tokio::io::duplex(64 * 1024);
+        let local = tokio::task::LocalSet::new();
+        let conn = Connection::new(
+            server,
+            service,
+            cfg(Limits::default()),
+            Rc::new(RefCell::new(DateCache::new())),
+        );
+        let server_task = local.spawn_local(async move { conn.serve().await });
+        let out = local
+            .run_until(async move {
+                client
+                    .write_all(
+                        b"GET /a HTTP/1.1\r\nHost: a\r\n\r\nGET /boom HTTP/1.1\r\nHost: a\r\n\r\n",
+                    )
+                    .await
+                    .unwrap();
+                assert!(server_task.await.is_err(), "the handler panicked");
+                let mut out = Vec::new();
+                let _ = tokio::time::timeout(Duration::from_secs(2), client.read_to_end(&mut out))
+                    .await;
+                String::from_utf8_lossy(&out).into_owned()
+            })
+            .await;
+        assert!(out.starts_with("HTTP/1.1 200 OK"), "{out:?}");
+        assert!(out.ends_with("first"), "{out:?}");
+    }
+
+    /// A timed-out handler is dropped before its error response is written,
+    /// not kept alive — with whatever it holds — for as long as that write
+    /// takes against a slow reader.
+    #[tokio::test]
+    async fn a_timed_out_handler_is_dropped_before_the_error_is_written() {
+        struct OnDrop(Rc<Cell<bool>>);
+        impl Drop for OnDrop {
+            fn drop(&mut self) {
+                self.0.set(true);
+            }
+        }
+        let dropped = Rc::new(Cell::new(false));
+        let flag = dropped.clone();
+        let service = move |_req: Request| {
+            let guard = OnDrop(flag.clone());
+            async move {
+                let _guard = guard;
+                std::future::pending::<()>().await;
+                Response::text("never")
+            }
+        };
+        // Eight bytes of buffer: the 503 cannot be written until the client
+        // reads, so the write is in progress when the flag is checked.
+        let (mut client, server) = tokio::io::duplex(8);
+        let local = tokio::task::LocalSet::new();
+        let conn = Connection::new(
+            server,
+            service,
+            cfg(Limits {
+                handler_timeout: Some(Duration::from_millis(50)),
+                ..Default::default()
+            }),
+            Rc::new(RefCell::new(DateCache::new())),
+        );
+        let server_task = local.spawn_local(async move { conn.serve().await });
+        local
+            .run_until(async move {
+                client
+                    .write_all(b"GET / HTTP/1.1\r\nHost: a\r\n\r\n")
+                    .await
+                    .unwrap();
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                assert!(
+                    dropped.get(),
+                    "handler still alive while its 503 is written"
+                );
+                let mut out = Vec::new();
+                let _ = tokio::time::timeout(Duration::from_secs(2), client.read_to_end(&mut out))
+                    .await;
+                assert!(String::from_utf8_lossy(&out).starts_with("HTTP/1.1 503"));
+                let _ = server_task.await;
+            })
+            .await;
+    }
+
+    /// A `100 Continue` is written straight to the transport, so a response
+    /// held back for the batch must go out ahead of it.
+    #[tokio::test]
+    async fn a_held_back_response_precedes_the_next_requests_100_continue() {
+        let out = exchange(
+            b"GET / HTTP/1.1\r\nHost: a\r\n\r\n\
+              POST / HTTP/1.1\r\nHost: a\r\nExpect: 100-continue\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello",
+            echo_service,
+            Limits::default(),
+        )
+        .await;
+        let ok = out.find("HTTP/1.1 200 OK").expect("first response");
+        let cont = out.find("HTTP/1.1 100 Continue").expect("interim response");
+        let echoed = out.rfind("hello").expect("echoed body");
+        assert!(ok < cont && cont < echoed, "{out}");
+    }
+
+    /// Drive one connection over a duplex of `capacity` bytes.
+    async fn exchange_with_capacity<S>(input: &'static [u8], service: S, capacity: usize) -> String
+    where
+        S: H1Service + 'static,
+    {
+        let (mut client, server) = tokio::io::duplex(capacity);
+        let local = tokio::task::LocalSet::new();
+        let conn = Connection::new(
+            server,
+            service,
+            cfg(Limits::default()),
+            Rc::new(RefCell::new(DateCache::new())),
+        );
+        let server_task = local.spawn_local(async move { conn.serve().await });
+        local
+            .run_until(async move {
+                client.write_all(input).await.unwrap();
+                let mut out = Vec::new();
+                let _ = tokio::time::timeout(Duration::from_secs(2), client.read_to_end(&mut out))
+                    .await;
+                let _ = server_task.await;
+                String::from_utf8_lossy(&out).into_owned()
+            })
+            .await
+    }
+
+    /// A body that streams the request body back.
+    struct EchoStream(Body);
+
+    impl crate::service::futures_stream::Stream for EchoStream {
+        fn poll_next(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<Bytes, crate::BodyError>>> {
+            self.0.poll_chunk(cx)
+        }
+    }
+
+    /// A handler that streams the request body back reads it only after its
+    /// response head is out; the `100 Continue` it would trigger then is no
+    /// longer owed, and writing it would land inside the chunked body.
+    #[tokio::test]
+    async fn no_100_continue_inside_a_streamed_response() {
+        let out = exchange(
+            b"POST / HTTP/1.1\r\nHost: a\r\nExpect: 100-continue\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello",
+            |req: Request| async move {
+                Response::ok().with_body(ResponseBody::Stream(Box::pin(EchoStream(req.body))))
+            },
+            Limits::default(),
+        )
+        .await;
+        assert!(out.starts_with("HTTP/1.1 200 OK"), "{out}");
+        assert!(!out.contains("100 Continue"), "{out}");
+        assert!(out.contains("5\r\nhello\r\n"), "{out}");
+    }
+
+    /// A body stream yielding two fixed chunks.
+    struct TwoChunks(u8);
+
+    impl crate::service::futures_stream::Stream for TwoChunks {
+        fn poll_next(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<Bytes, crate::BodyError>>> {
+            self.0 += 1;
+            Poll::Ready(match self.0 {
+                1 => Some(Ok(Bytes::from_static(b"ab"))),
+                2 => Some(Ok(Bytes::from_static(b"cd"))),
+                _ => None,
+            })
+        }
+    }
+
+    /// RFC 9112 section 6.1: no chunked coding to an HTTP/1.0 client. A
+    /// streamed body there is close-delimited instead.
+    #[tokio::test]
+    async fn a_streamed_body_to_http_10_is_close_delimited() {
+        let (out, closed) = exchange_raw(
+            b"GET / HTTP/1.0\r\nConnection: keep-alive\r\n\r\n",
+            |_req: Request| async {
+                Response::ok().with_body(ResponseBody::Stream(Box::pin(TwoChunks(0))))
+            },
+            Limits::default(),
+        )
+        .await;
+        assert!(out.starts_with("HTTP/1.0 200 OK\r\n"), "{out}");
+        assert!(
+            !out.to_ascii_lowercase().contains("transfer-encoding"),
+            "{out}"
+        );
+        assert!(out.contains("connection: close\r\n"), "{out}");
+        assert!(out.ends_with("\r\n\r\nabcd"), "unframed body: {out}");
+        assert!(closed, "the close is the framing");
+    }
+
+    /// No body is written for a HEAD, so there is nothing to close-delimit:
+    /// an HTTP/1.0 keep-alive HEAD on a streaming handler stays open.
+    #[tokio::test]
+    async fn a_head_on_http_10_with_a_streamed_body_keeps_the_connection() {
+        let out = exchange(
+            b"HEAD / HTTP/1.0\r\nConnection: keep-alive\r\n\r\nGET / HTTP/1.0\r\n\r\n",
+            |_req: Request| async {
+                Response::ok().with_body(ResponseBody::Stream(Box::pin(TwoChunks(0))))
+            },
+            Limits::default(),
+        )
+        .await;
+        let first = out.split("HTTP/1.0 200").nth(1).expect("HEAD answered");
+        assert!(first.contains("connection: keep-alive\r\n"), "{out}");
+        assert!(
+            !first.to_ascii_lowercase().contains("transfer-encoding"),
+            "{out}"
+        );
+        assert_eq!(
+            out.matches("HTTP/1.0 200").count(),
+            2,
+            "the GET is served too: {out}"
+        );
+    }
+
+    /// The server decides persistence and says so; a handler's
+    /// `Connection: keep-alive` must not contradict a close it then performs.
+    #[tokio::test]
+    async fn a_handler_keep_alive_does_not_mask_the_servers_close() {
+        let (out, closed) = exchange_raw(
+            b"POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\n\r\nhello",
+            |_req: Request| async {
+                Response::text("hi").header(HeaderId::Connection, Bytes::from_static(b"keep-alive"))
+            },
+            Limits::default(),
+        )
+        .await;
+        assert!(!out.contains("keep-alive"), "{out}");
+        assert!(out.contains("connection: close\r\n"), "{out}");
+        assert!(closed);
+    }
+
+    /// And a handler's `Connection: close` is acted on, not just echoed.
+    #[tokio::test]
+    async fn a_handler_close_closes_the_connection() {
+        let (out, closed) = exchange_raw(
+            b"GET / HTTP/1.1\r\nHost: a\r\n\r\nGET / HTTP/1.1\r\nHost: a\r\n\r\n",
+            |_req: Request| async {
+                Response::text("hi").header(HeaderId::Connection, Bytes::from_static(b"close"))
+            },
+            Limits::default(),
+        )
+        .await;
+        assert_eq!(out.matches("HTTP/1.1 200").count(), 1, "{out}");
+        assert_eq!(out.matches("connection").count(), 1, "{out}");
+        assert!(closed);
+    }
+
+    /// RFC 9110 section 9.3.2: a HEAD response's length describes the GET body.
+    #[tokio::test]
+    async fn a_head_response_keeps_the_handlers_content_length() {
+        let out = exchange(
+            b"HEAD / HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n",
+            |_req: Request| async {
+                Response::ok().header(HeaderId::ContentLength, Bytes::from_static(b"1234"))
+            },
+            Limits::default(),
+        )
+        .await;
+        assert!(out.contains("content-length: 1234\r\n"), "{out}");
+        assert!(out.ends_with("\r\n\r\n"), "no body: {out}");
+    }
+
+    /// A status no final response can carry becomes a 500 and a close.
+    #[tokio::test]
+    async fn an_impossible_final_status_becomes_500() {
+        for status in [1000u16, 99, 102, 101] {
+            let (out, closed) = exchange_raw(
+                b"GET / HTTP/1.1\r\nHost: a\r\n\r\n",
+                move |_req: Request| async move { Response::new(status) },
+                Limits::default(),
+            )
+            .await;
+            assert!(
+                out.starts_with("HTTP/1.1 500 Internal Server Error\r\n"),
+                "{status}: {out}"
+            );
+            assert!(closed, "{status}");
+        }
+    }
+
+    /// A streamed response still reading the request body stays under the
+    /// body deadline: a peer that sends part of the body and stalls has its
+    /// connection closed, not held forever.
+    #[tokio::test]
+    async fn a_stalled_body_behind_a_streamed_response_is_bounded() {
+        let (out, closed) = exchange_raw(
+            b"POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 10\r\n\r\nabc",
+            |req: Request| async move {
+                Response::ok().with_body(ResponseBody::Stream(Box::pin(EchoStream(req.body))))
+            },
+            Limits {
+                body_timeout: Duration::from_millis(200),
+                ..Default::default()
+            },
+        )
+        .await;
+        assert!(out.starts_with("HTTP/1.1 200 OK"), "{out}");
+        assert!(
+            closed,
+            "the connection must close at the body deadline: {out}"
+        );
+        assert!(!out.ends_with("0\r\n\r\n"), "never a clean end: {out}");
+    }
+
+    /// Yields a chunk, waits `pause`, yields another, ends.
+    struct PausingStream {
+        pause: std::pin::Pin<Box<tokio::time::Sleep>>,
+        stage: u8,
+    }
+
+    impl crate::service::futures_stream::Stream for PausingStream {
+        fn poll_next(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<Bytes, crate::BodyError>>> {
+            match self.stage {
+                0 => {
+                    self.stage = 1;
+                    Poll::Ready(Some(Ok(Bytes::from_static(b"first"))))
+                }
+                1 => {
+                    if self.pause.as_mut().poll(cx).is_pending() {
+                        return Poll::Pending;
+                    }
+                    self.stage = 2;
+                    Poll::Ready(Some(Ok(Bytes::from_static(b"second"))))
+                }
+                _ => Poll::Ready(None),
+            }
+        }
+    }
+
+    /// A body the handler dropped unread awaits nothing, so a stream answering
+    /// it — a download, an event feed — runs past the body deadline intact.
+    #[tokio::test]
+    async fn a_stream_after_a_dropped_body_is_not_cut_off_at_the_body_deadline() {
+        let out = exchange(
+            b"POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello",
+            |_req: Request| async {
+                Response::ok().with_body(ResponseBody::Stream(Box::pin(PausingStream {
+                    pause: Box::pin(tokio::time::sleep(Duration::from_millis(500))),
+                    stage: 0,
+                })))
+            },
+            Limits {
+                body_timeout: Duration::from_millis(200),
+                ..Default::default()
+            },
+        )
+        .await;
+        assert!(out.contains("second"), "{out}");
+        assert!(out.ends_with("0\r\n\r\n"), "a clean end: {out}");
+    }
+
+    /// A `Body` a handler kept from an earlier request cannot make a later
+    /// request's body look awaited — nor, when it is finally dropped, finished.
+    #[tokio::test]
+    async fn a_body_kept_from_an_earlier_request_does_not_affect_a_later_one() {
+        let kept: Rc<RefCell<Vec<Body>>> = Rc::new(RefCell::new(Vec::new()));
+        let stash = kept.clone();
+        let service = move |mut req: Request| {
+            let stash = stash.clone();
+            async move {
+                if req.head.path() == "/keep" {
+                    let _ = req.body.collect(64).await;
+                    stash.borrow_mut().push(req.body);
+                    return Response::text("kept");
+                }
+                Response::ok().with_body(ResponseBody::Stream(Box::pin(PausingStream {
+                    pause: Box::pin(tokio::time::sleep(Duration::from_millis(500))),
+                    stage: 0,
+                })))
+            }
+        };
+        let out = exchange(
+            b"POST /keep HTTP/1.1\r\nHost: a\r\nContent-Length: 2\r\n\r\nhi\
+              POST /stream HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello",
+            service,
+            Limits {
+                body_timeout: Duration::from_millis(200),
+                ..Default::default()
+            },
+        )
+        .await;
+        assert!(out.contains("kept"), "{out}");
+        assert!(out.contains("second"), "the later stream ran intact: {out}");
+        assert!(out.ends_with("0\r\n\r\n"), "{out}");
+    }
+
+    /// Flushing earlier pipelined responses to a slow reader does not spend
+    /// the next request's body deadline: a body that arrived in time is
+    /// served, as under the hyper backend.
+    #[tokio::test]
+    async fn a_slow_flush_of_held_responses_does_not_expire_the_next_body() {
+        let service = |mut req: Request| async move {
+            if req.head.path() == "/big" {
+                let mut r = Response::new(200);
+                r.body = ResponseBody::Full(Bytes::from(vec![b'a'; 30 * 1024]));
+                return r;
+            }
+            // Pending on something else first, so held output is flushed — and
+            // for longer than that flush takes, so the handler is still waiting
+            // when the body deadline is checked after it.
+            tokio::time::sleep(Duration::from_millis(600)).await;
+            let body = req.body.collect(64).await.expect("body");
+            let mut r = Response::new(200);
+            r.body = ResponseBody::Full(body);
+            r
+        };
+        let (mut client, server) = tokio::io::duplex(1024);
+        let local = tokio::task::LocalSet::new();
+        let conn = Connection::new(
+            server,
+            service,
+            cfg(Limits {
+                body_timeout: Duration::from_millis(200),
+                ..Default::default()
+            }),
+            Rc::new(RefCell::new(DateCache::new())),
+        );
+        let server_task = local.spawn_local(async move { conn.serve().await });
+        let out = local
+            .run_until(async move {
+                client
+                    .write_all(
+                        b"GET /big HTTP/1.1\r\nHost: a\r\n\r\n\
+                          POST /x HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello",
+                    )
+                    .await
+                    .unwrap();
+                // A slow reader: the held response cannot finish flushing
+                // until well past the body deadline.
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                let mut out = Vec::new();
+                let _ = tokio::time::timeout(Duration::from_secs(3), client.read_to_end(&mut out))
+                    .await;
+                let _ = server_task.await;
+                String::from_utf8_lossy(&out).into_owned()
+            })
+            .await;
+        assert!(
+            !out.contains(" 408 "),
+            "{}",
+            &out[out.len().saturating_sub(200)..]
+        );
+        assert!(
+            out.ends_with("hello"),
+            "{}",
+            &out[out.len().saturating_sub(200)..]
+        );
+    }
+
+    /// The same when the handler answers at once with a stream over its body:
+    /// the held responses go out with the stream's head, and that flush does
+    /// not spend the body's deadline either.
+    #[tokio::test]
+    async fn a_slow_flush_before_a_streamed_echo_does_not_expire_its_body() {
+        let service = |req: Request| async move {
+            if req.head.path() == "/big" {
+                let mut r = Response::new(200);
+                r.body = ResponseBody::Full(Bytes::from(vec![b'a'; 30 * 1024]));
+                return r;
+            }
+            Response::ok().with_body(ResponseBody::Stream(Box::pin(EchoStream(req.body))))
+        };
+        let (mut client, server) = tokio::io::duplex(1024);
+        let local = tokio::task::LocalSet::new();
+        let conn = Connection::new(
+            server,
+            service,
+            cfg(Limits {
+                body_timeout: Duration::from_millis(300),
+                ..Default::default()
+            }),
+            Rc::new(RefCell::new(DateCache::new())),
+        );
+        let server_task = local.spawn_local(async move { conn.serve().await });
+        let out = local
+            .run_until(async move {
+                client
+                    .write_all(
+                        b"GET /big HTTP/1.1\r\nHost: a\r\n\r\n\
+                          POST /echo HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhe",
+                    )
+                    .await
+                    .unwrap();
+                // Slow to read: the held response finishes flushing well past
+                // a deadline counted from the handler's call.
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                let mut out = Vec::new();
+                let mut buf = vec![0u8; 4096];
+                while out.len() < 30 * 1024 {
+                    let n = client.read(&mut buf).await.unwrap();
+                    assert!(n > 0, "closed early");
+                    out.extend_from_slice(&buf[..n]);
+                }
+                // The rest of the body, inside the window restarted after it.
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                client.write_all(b"llo").await.unwrap();
+                let _ = tokio::time::timeout(Duration::from_secs(3), client.read_to_end(&mut out))
+                    .await;
+                let _ = server_task.await;
+                String::from_utf8_lossy(&out).into_owned()
+            })
+            .await;
+        assert!(
+            out.ends_with("0\r\n\r\n"),
+            "a clean end: {}",
+            &out[out.len().saturating_sub(120)..]
+        );
+        assert!(
+            out.contains("llo"),
+            "{}",
+            &out[out.len().saturating_sub(120)..]
+        );
+    }
+
+    /// A restart earned by one request's held output does not carry over to a
+    /// later request on the connection: that one's body keeps the deadline
+    /// from its own handler's call.
+    #[tokio::test]
+    async fn a_held_output_restart_does_not_carry_to_a_later_request() {
+        let service = |req: Request| async move {
+            if req.head.path() != "/echo" {
+                // Answers on its first poll, behind held output.
+                return Response::text("quick");
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            Response::ok().with_body(ResponseBody::Stream(Box::pin(EchoStream(req.body))))
+        };
+        let (mut client, server) = tokio::io::duplex(64 * 1024);
+        let local = tokio::task::LocalSet::new();
+        let conn = Connection::new(
+            server,
+            service,
+            cfg(Limits {
+                body_timeout: Duration::from_millis(300),
+                ..Default::default()
+            }),
+            Rc::new(RefCell::new(DateCache::new())),
+        );
+        let server_task = local.spawn_local(async move { conn.serve().await });
+        let out = local
+            .run_until(async move {
+                client
+                    .write_all(
+                        b"GET /a HTTP/1.1\r\nHost: a\r\n\r\nGET /b HTTP/1.1\r\nHost: a\r\n\r\n",
+                    )
+                    .await
+                    .unwrap();
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                client
+                    .write_all(
+                        b"POST /echo HTTP/1.1\r\nHost: a\r\nContent-Length: 6\r\nConnection: close\r\n\r\nabc",
+                    )
+                    .await
+                    .unwrap();
+                // Past this body's deadline, inside one a stale restart gives.
+                tokio::time::sleep(Duration::from_millis(450)).await;
+                let _ = client.write_all(b"def").await;
+                let mut out = Vec::new();
+                let _ = tokio::time::timeout(Duration::from_secs(3), client.read_to_end(&mut out))
+                    .await;
+                let _ = server_task.await;
+                String::from_utf8_lossy(&out).into_owned()
+            })
+            .await;
+        assert!(out.contains("abc"), "{out}");
+        assert!(
+            !out.ends_with("0\r\n\r\n"),
+            "cut off at its own deadline: {out}"
+        );
+    }
+
+    /// RFC 9110 sections 10.1.1 and 15.2: no 1xx to an HTTP/1.0 client.
+    #[tokio::test]
+    async fn no_100_continue_for_http_10() {
+        let out = exchange(
+            b"POST / HTTP/1.0\r\nExpect: 100-continue\r\nContent-Length: 5\r\n\r\nhello",
+            echo_service,
+            Limits::default(),
+        )
+        .await;
+        assert!(!out.contains("100 Continue"), "{out}");
+        assert!(out.ends_with("hello"), "{out}");
+    }
+
+    /// A short write of the interim response must not count as sending it.
+    #[tokio::test]
+    async fn a_short_write_of_100_continue_is_completed() {
+        let out = exchange_with_capacity(
+            b"POST / HTTP/1.1\r\nHost: a\r\nExpect: 100-continue\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello",
+            echo_service,
+            8,
+        )
+        .await;
+        assert!(
+            out.starts_with("HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\n"),
+            "{out}"
+        );
+    }
+
+    /// RFC 9112 section 2.2: empty lines before a request line are ignored,
+    /// including between pipelined requests.
+    #[tokio::test]
+    async fn empty_lines_before_a_request_line_are_ignored() {
+        let out = exchange(
+            b"\r\n\r\nGET / HTTP/1.1\r\nHost: a\r\n\r\n\r\nGET / HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n",
+            ok_service,
+            Limits::default(),
+        )
+        .await;
+        assert_eq!(out.matches("HTTP/1.1 200 OK").count(), 2, "{out}");
+    }
+
+    /// Only whole CRLFs: a bare LF before the request line is still refused,
+    /// as a bare LF anywhere in the head is.
+    #[tokio::test]
+    async fn a_bare_lf_before_a_request_line_is_still_refused() {
+        let out = exchange(
+            b"\nGET / HTTP/1.1\r\nHost: a\r\n\r\n",
+            ok_service,
+            Limits::default(),
+        )
+        .await;
+        assert!(out.starts_with("HTTP/1.1 400"), "{out}");
+    }
+
+    /// An error response for a later pipelined request is appended to the
+    /// held-back batch, not written over it.
+    #[tokio::test]
+    async fn an_error_after_a_held_back_response_keeps_both() {
+        let out = exchange(
+            b"GET / HTTP/1.1\r\nHost: a\r\n\r\nGET / HTTP/1.1\r\n\r\n",
+            ok_service,
+            Limits::default(),
+        )
+        .await;
+        let ok = out.find("HTTP/1.1 200 OK").expect("first response");
+        let bad = out.find("HTTP/1.1 400").expect("missing-Host rejection");
+        assert!(ok < bad, "{out}");
     }
 
     #[tokio::test]
@@ -1421,6 +2699,58 @@ mod tests {
             b"FIRSTFRAME",
             "bytes past the head belong to the upgraded protocol"
         );
+    }
+
+    /// A hand-written handler future that keeps its `Request` after
+    /// producing the response is dropped as soon as it has: its `Body` must
+    /// not hold the transport through the response, or the upgrade handoff
+    /// is forfeited — hyper's dispatcher drops a finished future at once.
+    #[tokio::test]
+    async fn a_finished_handler_future_is_dropped_before_the_handoff() {
+        struct KeepsRequest(Option<Request>);
+        impl Future for KeepsRequest {
+            type Output = Response;
+            fn poll(self: std::pin::Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Response> {
+                // Keeps the request — and its body's hold on the transport.
+                let _still_held = &self.0;
+                Poll::Ready(
+                    Response::new(101)
+                        .header(HeaderId::Upgrade, Bytes::from_static(b"raw"))
+                        .header(HeaderId::Connection, Bytes::from_static(b"upgrade")),
+                )
+            }
+        }
+        struct Svc;
+        impl H1Service for Svc {
+            type Future = KeepsRequest;
+            fn call(&self, req: Request) -> KeepsRequest {
+                KeepsRequest(Some(req))
+            }
+        }
+
+        let (mut client, server) = tokio::io::duplex(4096);
+        let local = tokio::task::LocalSet::new();
+        let conn = Connection::new(
+            server,
+            Svc,
+            cfg(Limits::default()),
+            Rc::new(RefCell::new(DateCache::new())),
+        );
+        let task = local.spawn_local(async move { conn.serve().await });
+        let upgraded = local
+            .run_until(async move {
+                client
+                    .write_all(
+                        b"GET / HTTP/1.1\r\nHost: a\r\nConnection: upgrade\r\nUpgrade: raw\r\n\r\n",
+                    )
+                    .await
+                    .unwrap();
+                let mut buf = [0u8; 256];
+                let _ = client.read(&mut buf).await.unwrap();
+                task.await.expect("join").expect("serve")
+            })
+            .await;
+        assert!(upgraded.is_some(), "the transport must be handed back");
     }
 
     /// A handler that keeps the request body alive past its 101 still owns a

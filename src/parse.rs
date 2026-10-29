@@ -70,6 +70,18 @@ impl ParseError {
     }
 }
 
+/// Whether `bytes` include one that can begin a request — anything but CR
+/// or LF.
+///
+/// Blank lines before a request line are not a request (RFC 9112 section
+/// 2.2), nor is a lone CR waiting for its LF: a stray CRLF can arrive split,
+/// or behind the previous request in the same read. Both backends decide with
+/// this whether a connection has moved from waiting under `idle_timeout` to
+/// reading a head under `header_timeout`, each over the bytes it just read.
+pub(crate) fn begins_request(bytes: &[u8]) -> bool {
+    bytes.iter().any(|&b| b != b'\r' && b != b'\n')
+}
+
 /// The index just past the `\r\n\r\n` terminating the head, or `None` if the
 /// head is not yet complete.
 ///
@@ -144,6 +156,21 @@ pub fn parse_head(buf: &Bytes, limits: &Limits) -> Result<Option<(Head, usize)>,
         }
         return Ok(None);
     };
+    parse_head_region(buf, head_len, limits).map(|head| Some((head, head_len)))
+}
+
+/// Parse a head whose terminator is already known to end at `head_len`.
+///
+/// For a caller that found the terminator itself — the connection does, while
+/// deciding whether to read more — so the head is not scanned for it twice.
+/// `buf[..head_len]` must end with the first CRLFCRLF in `buf`.
+pub(crate) fn parse_head_region(
+    buf: &Bytes,
+    head_len: usize,
+    limits: &Limits,
+) -> Result<Head, ParseError> {
+    debug_assert!(limits.max_headers <= MAX_HEADERS_CEILING);
+    debug_assert_eq!(find_head_end(buf), Some(head_len));
 
     if head_len > limits.max_head_bytes {
         return Err(ParseError::HeadTooLarge);
@@ -183,7 +210,7 @@ fn finish_parse_head(
     parsed: httparse::Status<usize>,
     head_len: usize,
     limits: &Limits,
-) -> Result<Option<(Head, usize)>, ParseError> {
+) -> Result<Head, ParseError> {
     let httparse::Status::Complete(consumed) = parsed else {
         // `find_head_end` located a terminator, so httparse should have
         // completed. A Partial here means the head contained something httparse
@@ -245,10 +272,7 @@ fn finish_parse_head(
         headers.push((id, buf.slice_ref(h.value)));
     }
 
-    Ok(Some((
-        Head::new(method, target, version, headers),
-        head_len,
-    )))
+    Ok(Head::new(method, target, version, headers))
 }
 
 /// Reject a request target containing characters no URI may contain.
@@ -347,12 +371,7 @@ fn validate_target_form(target: &[u8], method: &Method) -> Result<(), ParseError
 
     // absolute-form: a valid scheme, then `://`.
     if let Some(i) = target.windows(3).position(|w| w == b"://") {
-        let scheme = &target[..i];
-        let valid_scheme = scheme.first().is_some_and(|b| b.is_ascii_alphabetic())
-            && scheme
-                .iter()
-                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.'));
-        return if valid_scheme {
+        return if crate::head::valid_scheme(&target[..i]) {
             Ok(())
         } else {
             Err(ParseError::InvalidTarget)

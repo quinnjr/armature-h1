@@ -5,7 +5,7 @@
 //! `writev` rather than being built up through intermediate allocations.
 
 use crate::Version;
-use crate::header::{HeaderId, HeaderVec};
+use crate::header::{self, HeaderId, HeaderVec};
 use bytes::{BufMut, Bytes, BytesMut};
 use std::time::SystemTime;
 
@@ -48,11 +48,16 @@ impl DateCache {
             .map(|d| d.as_secs())
             .unwrap_or(0);
         if !self.valid || secs != self.secs {
-            let formatted = httpdate::fmt_http_date(now);
-            debug_assert_eq!(formatted.len(), DATE_LEN);
-            let bytes = formatted.as_bytes();
-            let n = bytes.len().min(DATE_LEN);
-            self.buf[..n].copy_from_slice(&bytes[..n]);
+            // Formatted straight into the buffer: `fmt_http_date` returns a
+            // `String`, which put one allocation on the request path every
+            // second. An IMF-fixdate is always exactly `DATE_LEN` bytes, so the
+            // write cannot run out of room.
+            let mut out = &mut self.buf[..];
+            let written = std::io::Write::write_fmt(
+                &mut out,
+                format_args!("{}", httpdate::HttpDate::from(now)),
+            );
+            debug_assert!(written.is_ok() && out.is_empty());
             self.secs = secs;
             self.valid = true;
         }
@@ -159,6 +164,95 @@ pub(crate) fn forbids_body_framing(status: u16) -> bool {
     matches!(status, 204 | 304) || (100..200).contains(&status)
 }
 
+/// The tokens of a handler `Connection` field that reach the wire: every one
+/// but `close` and `keep-alive`, which are the server's to state, and only
+/// those that are tokens (RFC 9110 section 7.6.1), so a malformed one is
+/// dropped on its own rather than sinking the field — or being written.
+///
+/// Nor a framing field's name. A compliant intermediary strips every field
+/// `Connection` names, so `Connection: content-length` would have it strip
+/// the very field that delimits this response and guess where the body ends
+/// — the desync every other framing rule in this module exists to prevent.
+///
+/// The one definition both backends write a handler's field through, so
+/// which of its tokens go out cannot differ between them.
+pub(crate) fn connection_tokens(value: &[u8]) -> impl Iterator<Item = &[u8]> {
+    value
+        .split(|&b| b == b',')
+        .map(crate::framing::trim_ows)
+        .filter(|t| {
+            !t.is_empty()
+                && t.iter().copied().all(header::is_tchar)
+                && !t.eq_ignore_ascii_case(b"close")
+                && !t.eq_ignore_ascii_case(b"keep-alive")
+                && !t.eq_ignore_ascii_case(b"content-length")
+                && !t.eq_ignore_ascii_case(b"transfer-encoding")
+        })
+}
+
+/// Write a handler `Connection` field as [`connection_tokens`] leaves it, or
+/// nothing if no token is left.
+fn write_connection_tokens(out: &mut BytesMut, value: &[u8]) {
+    let mut first = true;
+    for token in connection_tokens(value) {
+        out.put_slice(if first { b"connection: " } else { b", " });
+        out.put_slice(token);
+        first = false;
+    }
+    if !first {
+        out.put_slice(b"\r\n");
+    }
+}
+
+/// Whether a handler's `Content-Length` must be dropped rather than written.
+///
+/// The one rule both backends apply, so a handler's length reaches the wire
+/// under exactly the same conditions under either:
+///
+/// - more than one (`instances`) is never written: the response-side twin of
+///   the request ambiguity this crate refuses;
+/// - on a 304, and on a `HEAD` answered with a status that may carry one, the
+///   field describes the representation a `GET` would have had (RFC 9110
+///   sections 15.4.5 and 9.3.2), so only well-formedness matters — and never
+///   beside a `Transfer-Encoding` that will also be written
+///   (`competing_te`), since two framing fields on one message is what RFC
+///   9112 section 6.1 forbids, descriptive or not;
+/// - otherwise it must equal the length of the body actually written
+///   (`body_len`, `None` for a stream, which no length can agree with);
+/// - on a 1xx or a 204 it is never written at all, whatever its value: RFC
+///   9110 section 8.6 forbids the field there outright.
+pub(crate) fn handler_length_is_stale(
+    value: &Bytes,
+    instances: usize,
+    status: u16,
+    head_request: bool,
+    body_len: Option<u64>,
+    competing_te: bool,
+) -> bool {
+    // RFC 9110 section 8.6: never on a 1xx or a 204, whatever its value.
+    if instances > 1 || (forbids_body_framing(status) && !content_length_is_descriptive(status)) {
+        return true;
+    }
+    let descriptive =
+        content_length_is_descriptive(status) || (head_request && !forbids_body_framing(status));
+    if descriptive {
+        parse_len(value).is_none() || competing_te
+    } else {
+        body_len.is_none() || parse_len(value) != body_len
+    }
+}
+
+/// Whether `status` can stand as the final response to a request.
+///
+/// Anything outside 200..=599 cannot: `1000` is not a status line a peer can
+/// parse, and a 1xx is interim — the client keeps waiting past it for a final
+/// response that never comes. The one exception is a 101 the client asked
+/// for. Both backends degrade a handler's impossible status to a 500 with
+/// this, so the mistake looks the same under either.
+pub(crate) fn is_final_status(status: u16, upgrade_requested: bool) -> bool {
+    (200..=599).contains(&status) || (status == 101 && upgrade_requested)
+}
+
 /// Whether `Content-Length` on this status describes a representation rather
 /// than framing the body being written.
 ///
@@ -210,7 +304,7 @@ pub(crate) fn connection_field(version: Version, keep_alive: bool) -> Option<&'s
 /// check lives here, at the last point before the bytes reach the wire, rather
 /// than at each of the call sites that could produce one.
 #[inline]
-fn valid_field_value(value: &[u8]) -> bool {
+pub(crate) fn valid_field_value(value: &[u8]) -> bool {
     !value.iter().any(|b| matches!(b, b'\r' | b'\n' | 0))
 }
 
@@ -221,28 +315,8 @@ fn valid_field_value(value: &[u8]) -> bool {
 /// a name containing a colon, a space, or CRLF splits the response exactly as a
 /// value does.
 #[inline]
-fn valid_field_name(name: &str) -> bool {
-    !name.is_empty()
-        && name.bytes().all(|b| {
-            b.is_ascii_alphanumeric()
-                || matches!(
-                    b,
-                    b'!' | b'#'
-                        | b'$'
-                        | b'%'
-                        | b'&'
-                        | b'\''
-                        | b'*'
-                        | b'+'
-                        | b'-'
-                        | b'.'
-                        | b'^'
-                        | b'_'
-                        | b'`'
-                        | b'|'
-                        | b'~'
-                )
-        })
+pub(crate) fn valid_field_name(name: &str) -> bool {
+    !name.is_empty() && name.bytes().all(header::is_tchar)
 }
 
 /// Whether this field may be emitted as-is.
@@ -290,10 +364,20 @@ fn te_frames_chunked(v: &Bytes) -> bool {
 
 /// Serialize a status line and header section into `out`.
 ///
-/// Emits `Date`, `Connection`, and the body framing field itself, but never
-/// duplicates one the handler already supplied. A duplicate `Content-Length` on
-/// a response is the mirror image of the request ambiguity this crate rejects,
-/// so it must not be possible to produce one by accident.
+/// Emits `Date` and the body framing field itself, but never duplicates one
+/// the handler already supplied. A duplicate `Content-Length` on a response is
+/// the mirror image of the request ambiguity this crate rejects, so it must
+/// not be possible to produce one by accident.
+///
+/// The connection's fate is the server's to state: `keep_alive` decides the
+/// `close`/`keep-alive` token, and a handler `Connection` field naming either
+/// is not written, since it could contradict what the server then does with
+/// the socket. Other `Connection` tokens (`upgrade`) pass through.
+///
+/// An HTTP/1.0 response cannot be chunked (RFC 9112 section 6.1), so an
+/// [`OutBody::Chunked`] body on one is written close-delimited: no framing
+/// field, and `connection: close` whatever `keep_alive` says. The caller must
+/// then write the body unframed and close.
 pub fn write_head(
     out: &mut BytesMut,
     version: Version,
@@ -302,6 +386,38 @@ pub fn write_head(
     date: &[u8],
     keep_alive: bool,
 ) {
+    // A caller here cannot say whether a body follows, so a stream on 1.0 is
+    // taken to have one: close-delimited, which the connection must close.
+    let keep_alive = keep_alive
+        && !(version == Version::Http10
+            && *body == OutBody::Chunked
+            && !forbids_body_framing(resp.status));
+    write_head_for(out, version, resp, body, date, keep_alive, false);
+}
+
+/// [`write_head`], told whether the request was `HEAD`.
+///
+/// A `HEAD` response's `Content-Length` describes the body a `GET` would have
+/// had (RFC 9110 section 9.3.2), not the empty body actually sent, so a
+/// handler's well-formed value passes through as on a 304 instead of being
+/// rewritten to the length of nothing.
+///
+/// `keep_alive` is taken as decided: whether a close-delimited HTTP/1.0 body
+/// costs the connection is the caller's call, made once, where it also knows
+/// whether that body is written at all. The writer only frames: a 1.0 stream
+/// never gets a chunked field, whatever follows it.
+pub(crate) fn write_head_for(
+    out: &mut BytesMut,
+    version: Version,
+    resp: &ResponseHead,
+    body: &OutBody,
+    date: &[u8],
+    keep_alive: bool,
+    head_request: bool,
+) {
+    // HTTP/1.0 has no chunked coding: a stream there carries no framing field.
+    let close_delimited = version == Version::Http10 && *body == OutBody::Chunked;
+
     out.put_slice(version.as_bytes());
     out.put_u8(b' ');
     write_u64(out, resp.status as u64);
@@ -335,7 +451,6 @@ pub fn write_head(
     let mut field_writable: smallvec::SmallVec<[bool; 16]> =
         smallvec::SmallVec::with_capacity(resp.headers.len());
     let mut has_date = false;
-    let mut has_connection = false;
     let mut handler_len: Option<&Bytes> = None;
     let mut handler_te: Option<&Bytes> = None;
     let mut len_count = 0usize;
@@ -348,7 +463,6 @@ pub fn write_head(
         }
         match id {
             HeaderId::Date => has_date = true,
-            HeaderId::Connection => has_connection = true,
             HeaderId::ContentLength => {
                 len_count += 1;
                 if handler_len.is_none() {
@@ -364,6 +478,29 @@ pub fn write_head(
             _ => {}
         }
     }
+
+    // A handler `Transfer-Encoding` only counts as handler framing when it
+    // actually frames *this* body as chunked. Anything else is a field the
+    // writer must not defer to: `chunked` over a `Fixed` body would put raw
+    // unframed bytes behind a chunked advertisement (an undelimited response —
+    // the desync this crate exists to make impossible), `chunked` over no body
+    // leaves the peer waiting for chunks that never come, and a non-chunked
+    // coding over a chunked body advertises the wrong one. Dropping it takes the
+    // same path as a stale length: the writer emits true framing below. More
+    // than one writable instance is stale for the same reason as a duplicated
+    // length — the emit loop writes them all, and it is their *combined* final
+    // coding that delimits the message, not the first one checked.
+    // A status that forbids a body forbids its framing too: a 204 or 1xx
+    // carrying `Transfer-Encoding: chunked` has an intermediary waiting for
+    // chunks that never come (RFC 9112 section 6.1), as the length rule's twin
+    // in `handler_length_is_stale` already holds for `Content-Length`.
+    let stale_transfer_encoding = handler_te.is_some_and(|v| {
+        te_count > 1
+            || *body != OutBody::Chunked
+            || close_delimited
+            || forbids_body_framing(resp.status)
+            || !te_frames_chunked(v)
+    });
 
     // A handler `Content-Length` that disagrees with the body it framed is
     // dropped, so the writer below reclaims framing and emits the true length.
@@ -384,32 +521,19 @@ pub fn write_head(
     // malformed one. Shipping `content-length: abc` because the status is 304
     // hands the peer a field it must then guess about.
     let stale_content_length = handler_len.is_some_and(|v| {
-        len_count > 1
-            || if content_length_is_descriptive(resp.status) {
-                parse_len(v).is_none()
-            } else {
-                match body {
-                    OutBody::Fixed(b) => parse_len(v) != Some(b.len() as u64),
-                    OutBody::None => parse_len(v) != Some(0),
-                    // A chunked body carries its own framing; a length cannot agree.
-                    OutBody::Chunked => true,
-                }
-            }
+        handler_length_is_stale(
+            v,
+            len_count,
+            resp.status,
+            head_request,
+            match body {
+                OutBody::Fixed(b) => Some(b.len() as u64),
+                OutBody::None => Some(0),
+                OutBody::Chunked => None,
+            },
+            handler_te.is_some() && !stale_transfer_encoding,
+        )
     });
-
-    // A handler `Transfer-Encoding` only counts as handler framing when it
-    // actually frames *this* body as chunked. Anything else is a field the
-    // writer must not defer to: `chunked` over a `Fixed` body would put raw
-    // unframed bytes behind a chunked advertisement (an undelimited response —
-    // the desync this crate exists to make impossible), `chunked` over no body
-    // leaves the peer waiting for chunks that never come, and a non-chunked
-    // coding over a chunked body advertises the wrong one. Dropping it takes the
-    // same path as a stale length: the writer emits true framing below. More
-    // than one writable instance is stale for the same reason as a duplicated
-    // length — the emit loop writes them all, and it is their *combined* final
-    // coding that delimits the message, not the first one checked.
-    let stale_transfer_encoding = handler_te
-        .is_some_and(|v| te_count > 1 || *body != OutBody::Chunked || !te_frames_chunked(v));
 
     // Handler-supplied headers first, so the checks below can see them.
     for (i, (id, value)) in resp.headers.iter().enumerate() {
@@ -419,6 +543,14 @@ pub fn write_head(
         }
         if stale_transfer_encoding && id == &HeaderId::TransferEncoding {
             tracing::warn!("dropping response transfer-encoding that does not frame the body");
+            continue;
+        }
+        if id == &HeaderId::Connection {
+            // Persistence is the server's to state, so those two tokens go;
+            // the rest of the list stays, token by token. Dropping the whole
+            // field would take `upgrade` with it, and a 101 without
+            // `Connection: upgrade` is a handshake the client aborts.
+            write_connection_tokens(out, value);
             continue;
         }
         if !field_writable[i] {
@@ -454,6 +586,8 @@ pub fn write_head(
                 write_u64(out, b.len() as u64);
                 out.put_slice(b"\r\n");
             }
+            // Close-delimited: the end of the connection is the framing.
+            OutBody::Chunked if close_delimited => {}
             OutBody::Chunked => {
                 out.put_slice(b"transfer-encoding: chunked\r\n");
             }
@@ -463,7 +597,11 @@ pub fn write_head(
         }
     }
 
-    if !has_connection && let Some(token) = connection_field(version, keep_alive) {
+    // A 101's connection continues as another protocol; persistence tokens
+    // mean nothing there, and the handler's `Connection: upgrade` says it all.
+    if resp.status != 101
+        && let Some(token) = connection_field(version, keep_alive)
+    {
         out.put_slice(b"connection: ");
         out.put_slice(token.as_bytes());
         out.put_slice(b"\r\n");
@@ -947,6 +1085,122 @@ mod tests {
         let got = render(Version::Http10, &head_of(200, &[]), &OutBody::None, true);
         assert!(got.contains("connection: keep-alive\r\n"));
         assert!(got.starts_with("HTTP/1.0 200 OK\r\n"));
+    }
+
+    /// RFC 9110 section 8.6: no `Content-Length` on a 204 or a 1xx, not even
+    /// a truthful `0`, and not on a HEAD either.
+    #[test]
+    fn a_204_never_carries_a_handler_content_length() {
+        for head_request in [false, true] {
+            let mut out = BytesMut::new();
+            write_head_for(
+                &mut out,
+                Version::Http11,
+                &head_of(204, &[(HeaderId::ContentLength, "0")]),
+                &OutBody::None,
+                EPOCH_DATE,
+                true,
+                head_request,
+            );
+            let got = String::from_utf8(out.to_vec())
+                .unwrap()
+                .to_ascii_lowercase();
+            assert!(
+                !got.contains("content-length"),
+                "head={head_request}: {got}"
+            );
+        }
+    }
+
+    /// Nor a handler `Transfer-Encoding`: a status that forbids a body
+    /// forbids its framing.
+    #[test]
+    fn a_204_never_carries_a_handler_transfer_encoding() {
+        let got = render(
+            Version::Http11,
+            &head_of(204, &[(HeaderId::TransferEncoding, "chunked")]),
+            &OutBody::Chunked,
+            true,
+        );
+        assert!(
+            !got.to_ascii_lowercase().contains("transfer-encoding"),
+            "{got}"
+        );
+    }
+
+    /// A HEAD response may keep a descriptive length, but never beside a
+    /// handler `Transfer-Encoding` that frames it too.
+    #[test]
+    fn a_head_response_never_carries_both_framing_fields() {
+        let mut out = BytesMut::new();
+        write_head_for(
+            &mut out,
+            Version::Http11,
+            &head_of(
+                200,
+                &[
+                    (HeaderId::ContentLength, "42"),
+                    (HeaderId::TransferEncoding, "chunked"),
+                ],
+            ),
+            &OutBody::Chunked,
+            EPOCH_DATE,
+            true,
+            true,
+        );
+        let got = String::from_utf8(out.to_vec())
+            .unwrap()
+            .to_ascii_lowercase();
+        assert!(got.contains("transfer-encoding: chunked\r\n"), "{got}");
+        assert!(!got.contains("content-length"), "{got}");
+    }
+
+    /// A `Connection` field may not name the fields that frame the response.
+    #[test]
+    fn connection_never_names_a_framing_field() {
+        let got = render(
+            Version::Http11,
+            &head_of(
+                200,
+                &[(
+                    HeaderId::Connection,
+                    "Content-Length, x-hop, transfer-encoding",
+                )],
+            ),
+            &OutBody::Fixed(Bytes::from_static(b"hi")),
+            true,
+        );
+        let lower = got.to_ascii_lowercase();
+        assert!(lower.contains("connection: x-hop\r\n"), "{got}");
+        assert!(!lower.contains("connection: content-length"), "{got}");
+        assert!(!lower.contains("transfer-encoding"), "{got}");
+        assert!(lower.contains("content-length: 2\r\n"), "{got}");
+    }
+
+    /// Only the persistence tokens are the server's: `upgrade` beside them
+    /// survives, or a 101 would go out without `Connection: upgrade`.
+    #[test]
+    fn keeps_other_connection_tokens_beside_a_persistence_token() {
+        let got = render(
+            Version::Http11,
+            &head_of(101, &[(HeaderId::Connection, "keep-alive, Upgrade")]),
+            &OutBody::None,
+            false,
+        );
+        assert!(got.contains("connection: Upgrade\r\n"), "{got}");
+        assert!(!got.contains("keep-alive"), "{got}");
+
+        let got = render(
+            Version::Http11,
+            &head_of(200, &[(HeaderId::Connection, "close, x-hop")]),
+            &OutBody::None,
+            false,
+        );
+        assert!(got.contains("connection: x-hop\r\n"), "{got}");
+        assert!(
+            got.contains("connection: close\r\n"),
+            "the server's own: {got}"
+        );
     }
 
     #[test]

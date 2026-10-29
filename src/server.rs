@@ -1,9 +1,12 @@
 //! The thread-per-core server.
 //!
 //! N pinned OS threads, each running a `current_thread` runtime. On Unix each
-//! thread owns its own `SO_REUSEPORT` listener, so the kernel load-balances
-//! accepts and a connection never migrates cores — which is what makes per-core
-//! date caches and service state safe to keep non-atomic.
+//! thread owns its own `SO_REUSEPORT` listener. The kernel spreads accepts by
+//! address hash, not load, so a worker that accepts while holding at least two
+//! more open connections than the least loaded one it finds hands the socket
+//! over before serving anything on it. Once
+//! a connection is being served it never migrates cores — which is what makes
+//! per-core date caches and service state safe to keep non-atomic.
 
 use crate::Limits;
 use crate::conn::ConnConfig;
@@ -485,6 +488,9 @@ impl Server {
         // capacity it logged.
         let started = Arc::new(AtomicUsize::new(0));
 
+        let (balance, mut inboxes) = Balance::new(per_worker.len(), cfg.limits.max_connections);
+        let balance = Arc::new(balance);
+
         let mut handles = Vec::with_capacity(cfg.workers);
         for (worker, slot) in per_worker.iter_mut().enumerate() {
             let cfg = cfg.clone();
@@ -494,9 +500,14 @@ impl Server {
             let rx = base_rx.clone();
             let core = core_ids.get(worker).copied();
             let started = started.clone();
+            let balance = balance.clone();
+            let inbox = inboxes[worker].take();
             let Some(std_listener) = slot.take() else {
+                // Never started, so never a handoff target either.
+                balance.retire(worker);
                 continue;
             };
+            let Some(inbox) = inbox else { continue };
 
             let spawned = std::thread::Builder::new()
                 .name(format!("h1-{worker}"))
@@ -534,6 +545,7 @@ impl Server {
                         Startup {
                             worker,
                             started: &started,
+                            peers: Peers { balance, inbox },
                         },
                     ));
                 });
@@ -625,6 +637,210 @@ struct Startup<'a> {
     worker: usize,
     /// Incremented once, when this worker's listener is registered.
     started: &'a AtomicUsize,
+    /// This worker's share of cross-worker balancing.
+    peers: Peers,
+}
+
+/// A connection handed from the worker that accepted it to another.
+type Handoff = (std::net::TcpStream, SocketAddr);
+
+/// Connection counts and handoff channels shared by every worker.
+///
+/// `SO_REUSEPORT` spreads connections by a hash of their addresses, not by
+/// load, so a handful of long-lived keep-alive connections can land 5/5/3/3
+/// on four workers and leave two cores a third idle — measurably behind a
+/// work-stealing server at low connection counts. Every worker still accepts
+/// from its own socket, so the accept path takes no shared lock; a worker
+/// that accepts while holding at least [`HANDOFF_MARGIN`] more connections
+/// than the least loaded one it finds (see [`Balance::pick`]) passes the
+/// socket to that one instead of serving it. Counts are open connections, handoffs in
+/// flight included, which is what keeps two workers from both handing to the
+/// same idle one in a burst.
+///
+/// Every count change goes through [`reserve`](Self::reserve), which never
+/// takes a worker past `cap`: picking a worker and counting the connection
+/// against it is one compare-and-swap, so concurrent acceptors cannot all pile
+/// onto the same nearly-full worker. That keeps `Limits::max_connections` an
+/// exact per-worker bound, as it was when each worker counted only itself.
+struct Balance {
+    open: Box<[PaddedCount]>,
+    inbox: Box<[tokio::sync::mpsc::UnboundedSender<Handoff>]>,
+    /// Per worker, woken whenever a slot of that worker's is released — by
+    /// any thread, since another worker gives back a slot it reserved on this
+    /// one when a handoff fails. A worker parked at its cap waits on it.
+    freed: Box<[PaddedNotify]>,
+    cap: usize,
+}
+
+/// One worker's open-connection count, alone on its cache line.
+///
+/// Every worker writes its own count on each open and close and reads all of
+/// them on each accept; packed together, those writes would bounce one line
+/// between every core on the machine.
+#[repr(align(128))]
+struct PaddedCount(AtomicUsize);
+
+/// One worker's slot-freed signal, alone on its cache line for the same
+/// reason as [`PaddedCount`]: every connection close notifies its worker's.
+#[repr(align(128))]
+struct PaddedNotify(tokio::sync::Notify);
+
+/// How often a worker parked because every worker is at its cap looks again.
+///
+/// Its own slot-freed signal wakes it at once; a slot freed on another worker
+/// does not, so this bounds how long the room appearing elsewhere goes unused.
+/// Only reached when the whole server is full.
+const FULL_RECHECK: Duration = Duration::from_millis(50);
+
+/// What a worker uses to take part in balancing.
+struct Peers {
+    balance: Arc<Balance>,
+    inbox: tokio::sync::mpsc::UnboundedReceiver<Handoff>,
+}
+
+/// How many more connections the accepting worker must hold than the least
+/// loaded one before it hands a connection over.
+///
+/// A handoff is not free — the socket leaves this reactor and joins another,
+/// with a channel send and a cross-thread wake between, and leaves the core
+/// that took its interrupt. Under churn, counts jitter by one constantly, and
+/// a margin of one would pay that on most accepts for a balance
+/// `SO_REUSEPORT` already roughly gives. Two keeps every worker within two of
+/// the least loaded, which is what the skew this exists for (5/5/3/3, or
+/// worse) needs, and leaves the fast path local.
+const HANDOFF_MARGIN: usize = 2;
+
+/// How many other workers `pick` looks at on a machine with more than
+/// `PICK_SAMPLES + 1` of them; with that many or fewer it looks at all.
+const PICK_SAMPLES: usize = 3;
+
+/// xorshift64: the per-worker sampler for `pick`. Not for anything that needs
+/// unpredictability — only for spreading probes across workers.
+fn next_random(state: &std::cell::Cell<u64>) -> u64 {
+    let mut x = state.get();
+    x ^= x << 13;
+    x ^= x >> 7;
+    x ^= x << 17;
+    state.set(x);
+    x
+}
+
+/// A count no live worker reaches, so a retired worker is never the least
+/// loaded. Not `usize::MAX`: in-flight decrements must not wrap it.
+const RETIRED: usize = usize::MAX / 2;
+
+/// One worker's handoff receivers, taken by the worker as it starts.
+type Inboxes = Vec<Option<tokio::sync::mpsc::UnboundedReceiver<Handoff>>>;
+
+impl Balance {
+    fn new(workers: usize, cap: usize) -> (Self, Inboxes) {
+        let (senders, receivers): (Vec<_>, Vec<_>) = (0..workers)
+            .map(|_| {
+                let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+                (tx, Some(rx))
+            })
+            .unzip();
+        let open = (0..workers)
+            .map(|_| PaddedCount(AtomicUsize::new(0)))
+            .collect();
+        (
+            Self {
+                open,
+                inbox: senders.into_boxed_slice(),
+                freed: (0..workers)
+                    .map(|_| PaddedNotify(tokio::sync::Notify::new()))
+                    .collect(),
+                cap: cap.max(1),
+            },
+            receivers,
+        )
+    }
+
+    /// Whether any worker is below its cap.
+    fn has_room(&self) -> bool {
+        (0..self.open.len()).any(|i| self.count(i) < self.cap)
+    }
+
+    fn count(&self, worker: usize) -> usize {
+        self.open[worker].0.load(Ordering::Relaxed)
+    }
+
+    /// Count one more connection against `worker`, unless that would take it
+    /// past the cap (a retired worker is always past it).
+    fn reserve(&self, worker: usize) -> bool {
+        let count = &self.open[worker].0;
+        let mut n = count.load(Ordering::Relaxed);
+        while n < self.cap {
+            match count.compare_exchange_weak(n, n + 1, Ordering::Relaxed, Ordering::Relaxed) {
+                Ok(_) => return true,
+                Err(seen) => n = seen,
+            }
+        }
+        false
+    }
+
+    /// Give back a slot taken with [`reserve`](Self::reserve).
+    fn release(&self, worker: usize) {
+        self.open[worker].0.fetch_sub(1, Ordering::Relaxed);
+        self.freed[worker].0.notify_one();
+    }
+
+    /// Find a slot for a connection `me` just accepted: the worker
+    /// [`pick`](Self::pick) chooses, else `me`, else anyone with room. `None`
+    /// when every worker is at its cap.
+    fn place(&self, me: usize, rng: &std::cell::Cell<u64>) -> Option<usize> {
+        let target = self.pick(me, rng);
+        if target != me && self.reserve(target) {
+            return Some(target);
+        }
+        if self.reserve(me) {
+            return Some(me);
+        }
+        (0..self.open.len()).find(|&i| self.reserve(i))
+    }
+
+    /// The worker that should serve a connection `me` just accepted: the
+    /// least-loaded one, if `me` holds at least [`HANDOFF_MARGIN`] more
+    /// connections than it; otherwise `me`.
+    fn pick(&self, me: usize, rng: &std::cell::Cell<u64>) -> usize {
+        let mine = self.count(me);
+        // No worker can be `HANDOFF_MARGIN` below this one: the answer is
+        // known without touching anyone else's cache line — which on a lightly
+        // loaded server is most accepts.
+        if mine < HANDOFF_MARGIN {
+            return me;
+        }
+        let mut best = me;
+        let mut best_open = mine;
+        let mut consider = |i: usize| {
+            let n = self.count(i);
+            if n < best_open {
+                best = i;
+                best_open = n;
+            }
+        };
+        let workers = self.open.len();
+        if workers <= PICK_SAMPLES + 1 {
+            (0..workers).for_each(&mut consider);
+        } else {
+            // Each count sits on a line its owner dirties on every open and
+            // close; reading all of them would cost an accept one cache miss
+            // per core. A few random others find a much less loaded worker
+            // about as reliably (the power of d choices) at a fixed cost.
+            for _ in 0..PICK_SAMPLES {
+                consider((next_random(rng) % workers as u64) as usize);
+            }
+        }
+        if mine.saturating_sub(best_open) >= HANDOFF_MARGIN {
+            best
+        } else {
+            me
+        }
+    }
+    /// Take `worker` out of the running for handoffs, for good.
+    fn retire(&self, worker: usize) {
+        self.open[worker].0.store(RETIRED, Ordering::Relaxed);
+    }
 }
 
 /// One worker's accept loop.
@@ -644,7 +860,11 @@ async fn worker_loop<F, S, G, H, U, C>(
     U: Fn() -> C,
     C: UpgradeConsumer + 'static,
 {
-    let Startup { worker, started } = startup;
+    let Startup {
+        worker,
+        started,
+        peers: Peers { balance, mut inbox },
+    } = startup;
     std_listener.set_nonblocking(true).ok();
     let listener = match TcpListener::from_std(std_listener) {
         Ok(l) => l,
@@ -688,12 +908,65 @@ async fn worker_loop<F, S, G, H, U, C>(
 
     let local = tokio::task::LocalSet::new();
 
-    // Per-worker connection cap. Thread-local state, so a `Cell` and a
-    // `Notify` suffice: each connection task decrements on exit and wakes the
-    // accept loop if it was parked at the cap.
+    // Per-worker connection cap, counted in `balance`: each connection's slot
+    // is released when its task ends, which wakes this loop through
+    // `balance.freed` if it was parked at the cap.
     let max_connections = cfg.limits.max_connections.max(1);
-    let open = Rc::new(std::cell::Cell::new(0usize));
-    let slot_freed = Rc::new(tokio::sync::Notify::new());
+    // Seeded per worker so their samples differ; never zero, which xorshift
+    // would never leave.
+    let rng = std::cell::Cell::new(0x9E37_79B9_7F4A_7C15 ^ (worker as u64 + 1));
+    // Serve one connection on this worker. Its slot was already counted —
+    // by this worker on accept, or by the one that handed it over.
+    let serve = |stream: tokio::net::TcpStream, peer: SocketAddr| {
+        let ctx = ctx.clone();
+        let slot = ConnSlot {
+            balance: balance.clone(),
+            worker,
+        };
+        tokio::task::spawn_local(async move {
+            // Held for the task's life; released on drop,
+            // including when the drain timeout cancels it.
+            let _slot = slot;
+            dispatch(stream, ctx, peer).await;
+        });
+    };
+    // Adopt a connection another worker handed over.
+    let adopt = |(std_stream, peer): Handoff| match tokio::net::TcpStream::from_std(std_stream) {
+        Ok(stream) => serve(stream, peer),
+        Err(e) => {
+            // Counted by the sender; uncount it, or this worker looks busier
+            // than it is for the rest of its life.
+            balance.release(worker);
+            tracing::debug!(error = %e, worker, "could not register a handed-off connection");
+        }
+    };
+    // A connection accepted with nowhere to put it, at most one per worker:
+    // with it held, this worker accepts nothing more until it is placed.
+    let mut pending: Option<Handoff> = None;
+    // Place a detached connection: on this worker, on another, or — with
+    // every worker at its cap — nowhere yet, handing it back to be held. A
+    // send fails only when the target has exited, which retires it for good,
+    // so this ends.
+    let route = |mut handoff: Handoff| -> Option<Handoff> {
+        loop {
+            // Not `?`: `None` from this closure means "placed", and the
+            // connection must come back to be held, not be dropped.
+            let Some(target) = balance.place(worker, &rng) else {
+                return Some(handoff);
+            };
+            if target == worker {
+                adopt(handoff);
+                return None;
+            }
+            match balance.inbox[target].send(handoff) {
+                Ok(()) => return None,
+                Err(back) => {
+                    balance.retire(target);
+                    handoff = back.0;
+                }
+            }
+        }
+    };
 
     local
         .run_until(async {
@@ -708,16 +981,30 @@ async fn worker_loop<F, S, G, H, U, C>(
                 if *rx.borrow() {
                     break;
                 }
-                if open.get() >= max_connections {
-                    // At the cap: do not accept until a connection closes (or
-                    // shutdown). New connections wait in the listen backlog.
+                // A connection accepted when every worker turned out to be full
+                // is held, not closed, and placed first once there is room.
+                if let Some(held) = pending.take() {
+                    pending = route(held);
+                }
+                // At its own cap, a worker still accepts while any other has
+                // room: `place` hands the connection over. Only with every
+                // worker full — or one connection already held for want of
+                // room — does it stop, and new connections wait in the listen
+                // backlog instead of on a core that cannot serve them.
+                if pending.is_some()
+                    || (balance.count(worker) >= max_connections && !balance.has_room())
+                {
                     tokio::select! {
                         changed = rx.changed() => {
                             if changed.is_err() || *rx.borrow() {
                                 break;
                             }
                         }
-                        _ = slot_freed.notified() => {}
+                        _ = balance.freed[worker].0.notified() => {}
+                        // A handoff reserved its slot before it was sent, so
+                        // serving it never takes this worker past the cap.
+                        Some(handoff) = inbox.recv() => adopt(handoff),
+                        () = tokio::time::sleep(FULL_RECHECK) => {}
                     }
                     continue;
                 }
@@ -731,6 +1018,14 @@ async fn worker_loop<F, S, G, H, U, C>(
                             break;
                         }
                     }
+                    Some(handoff) = inbox.recv() => adopt(handoff),
+                    // Accepting at its own cap only because another worker had
+                    // room: look again now and then, so that once every worker
+                    // fills up this one parks above — leaving new connections
+                    // in its backlog — rather than accepting them only to
+                    // close them.
+                    () = tokio::time::sleep(FULL_RECHECK),
+                        if balance.count(worker) >= max_connections => {}
                     accepted = listener.accept() => {
                         let (stream, peer) = match accepted {
                             Ok(pair) => pair,
@@ -777,38 +1072,86 @@ async fn worker_loop<F, S, G, H, U, C>(
                         if cfg.tcp.nodelay {
                             let _ = stream.set_nodelay(true);
                         }
-                        let ctx = ctx.clone();
-                        open.set(open.get() + 1);
-                        let slot = ConnSlot {
-                            open: open.clone(),
-                            freed: slot_freed.clone(),
-                        };
-                        tokio::task::spawn_local(async move {
-                            // Held for the task's life; released on drop,
-                            // including when the drain timeout cancels it.
-                            let _slot = slot;
-                            dispatch(stream, ctx, peer).await;
-                        });
+                        match balance.place(worker, &rng) {
+                            // The fast path: served here, never leaving this
+                            // reactor.
+                            Some(target) if target == worker => serve(stream, peer),
+                            Some(target) => match stream.into_std() {
+                                // Out of this runtime's reactor and into the
+                                // target's. Socket options set above stay with
+                                // the socket.
+                                Ok(std_stream) => {
+                                    if let Err(back) =
+                                        balance.inbox[target].send((std_stream, peer))
+                                    {
+                                        // The target has exited.
+                                        balance.retire(target);
+                                        pending = route(back.0);
+                                    }
+                                }
+                                Err(e) => {
+                                    balance.release(target);
+                                    tracing::debug!(error = %e, worker, "could not detach a connection to hand off");
+                                }
+                            },
+                            // Every worker filled up between this one's check
+                            // and the accept. Hold it rather than close it or
+                            // exceed a cap.
+                            None => match stream.into_std() {
+                                Ok(std_stream) => pending = Some((std_stream, peer)),
+                                Err(e) => tracing::debug!(error = %e, worker, "could not hold an accepted connection"),
+                            },
+                        }
                     }
                 }
             }
         })
         .await;
 
+    // No new connections for this worker from here on, its own or handed over:
+    // retired, it is never picked, and a sender racing the close gets its
+    // connection back and serves it itself. Connections already queued were
+    // accepted before shutdown like any other, so they are served within the
+    // grace window rather than reset.
+    //
+    // Inside the `LocalSet`: serving one spawns its task there, and outside of
+    // `run_until` there is no `LocalSet` to spawn on.
+    balance.retire(worker);
+    inbox.close();
+    local
+        .run_until(async {
+            // `recv`, not `try_recv`: a send that already passed the open
+            // check can still be landing, and `try_recv` would report the
+            // channel empty under it. After `close`, `recv` returns every
+            // message that made it in and only then `None`.
+            // One held for want of room was accepted before shutdown too.
+            if let Some(held) = pending.take() {
+                balance.open[worker].0.fetch_add(1, Ordering::Relaxed);
+                adopt(held);
+            }
+            while let Some(handoff) = inbox.recv().await {
+                // Retiring overwrote the count; recount so the slot's release
+                // on close has something to release. RETIRED is far enough
+                // from overflow.
+                balance.open[worker].0.fetch_add(1, Ordering::Relaxed);
+                adopt(handoff);
+            }
+        })
+        .await;
     // Drain: give in-flight connections a bounded window to finish.
     let _ = tokio::time::timeout(cfg.shutdown_grace, local).await;
 }
 
 /// One open connection's claim on its worker's [`Limits::max_connections`].
 struct ConnSlot {
-    open: Rc<std::cell::Cell<usize>>,
-    freed: Rc<tokio::sync::Notify>,
+    balance: Arc<Balance>,
+    worker: usize,
 }
 
 impl Drop for ConnSlot {
     fn drop(&mut self) {
-        self.open.set(self.open.get().saturating_sub(1));
-        self.freed.notify_one();
+        // Wakes this worker if it is parked at its cap.
+        self.balance.release(self.worker);
     }
 }
 
@@ -922,13 +1265,23 @@ async fn peek_preface(
     cfg: &Config,
 ) -> Option<(tokio::net::TcpStream, Bytes, Preface)> {
     let mut buf = BytesMut::with_capacity(crate::tls::H2C_PREFACE.len());
+    // One deadline for the whole preface, not one per read: re-arming per read
+    // let a peer dribble a matching byte every `header_timeout` and hold the
+    // connection slot for 24 of them.
+    //
+    // Checked, as `tokio::time::timeout` is: `Duration::MAX` is how an embedder
+    // switches the deadline off, and a plain `+` would panic on it.
+    let now = tokio::time::Instant::now();
+    let deadline = now
+        .checked_add(cfg.limits.header_timeout)
+        .unwrap_or_else(|| now + Duration::from_secs(86_400 * 365 * 30));
     loop {
         match is_h2c_preface(&buf) {
             Preface::NeedMore => {}
             decided => return Some((stream, buf.freeze(), decided)),
         }
-        let deadline = tokio::time::timeout(cfg.limits.header_timeout, stream.read_buf(&mut buf));
-        match deadline.await {
+        let read = tokio::time::timeout_at(deadline, stream.read_buf(&mut buf));
+        match read.await {
             Ok(Ok(0)) => {
                 // EOF mid-prefix: let the HTTP/1 path deal with it.
                 return Some((stream, buf.freeze(), Preface::Http1));
@@ -1555,5 +1908,367 @@ mod tests {
                 assert_eq!(l.local_addr().unwrap().port(), addr.port());
             }
         }
+    }
+
+    /// The preface sniff has one deadline for all of it. A peer that keeps
+    /// sending matching bytes just inside a per-read timeout must still be cut
+    /// off once `header_timeout` has passed in total.
+    #[tokio::test]
+    async fn a_dribbled_preface_is_bounded_by_one_header_timeout() {
+        let listener = tokio::net::TcpListener::bind(loopback()).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let dribble = tokio::spawn(async move {
+            let mut c = tokio::net::TcpStream::connect(addr).await.unwrap();
+            for b in crate::tls::H2C_PREFACE {
+                if c.write_all(&[*b]).await.is_err() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(60)).await;
+            }
+        });
+        let (stream, _) = listener.accept().await.unwrap();
+        let cfg = Config::new(loopback()).limits(Limits {
+            header_timeout: Duration::from_millis(200),
+            ..Default::default()
+        });
+        let started = std::time::Instant::now();
+        let got = peek_preface(stream, &cfg).await;
+        assert!(
+            got.is_none(),
+            "an undecided preface past the deadline is dropped"
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(600),
+            "took {:?}: the deadline was re-armed per read",
+            started.elapsed()
+        );
+        dribble.abort();
+    }
+
+    /// Connections spread by load, not by `SO_REUSEPORT`'s address hash:
+    /// sixteen long-lived connections on four workers land within
+    /// `HANDOFF_MARGIN` of four apiece.
+    #[test]
+    fn long_lived_connections_spread_evenly_across_workers() {
+        let cfg = test_config(4).limits(Limits {
+            idle_timeout: Duration::from_secs(10),
+            header_timeout: Duration::from_secs(10),
+            ..Default::default()
+        });
+        let server = Server::bind(cfg).expect("bind");
+        let addr = server.local_addr();
+        let handle = server.handle();
+
+        let client = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let workers = rt.block_on(async move {
+                // Each stays open until the end, so every one counts against
+                // its worker while the next is placed.
+                let mut open = Vec::new();
+                let mut workers = Vec::new();
+                for _ in 0..16 {
+                    let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+                    s.write_all(b"GET / HTTP/1.1\r\nHost: a\r\n\r\n")
+                        .await
+                        .unwrap();
+                    let mut buf = vec![0u8; 1024];
+                    let n = s.read(&mut buf).await.unwrap();
+                    let reply = String::from_utf8_lossy(&buf[..n]).into_owned();
+                    workers.push(reply.rsplit("\r\n\r\n").next().unwrap().to_owned());
+                    open.push(s);
+                }
+                workers
+            });
+            handle.shutdown();
+            workers
+        });
+
+        server
+            .serve(|| {
+                |_req: Request| async {
+                    let mut r = Response::new(200);
+                    r.body = crate::ResponseBody::Full(Bytes::from(
+                        std::thread::current().name().unwrap_or("?").to_owned(),
+                    ));
+                    r
+                }
+            })
+            .expect("serve");
+        let workers = client.join().expect("client thread");
+
+        let mut per_worker = std::collections::BTreeMap::new();
+        for w in &workers {
+            *per_worker.entry(w.as_str()).or_insert(0) += 1;
+        }
+        // Within `HANDOFF_MARGIN` of perfectly even, and every worker used.
+        assert_eq!(per_worker.len(), 4, "{per_worker:?}");
+        let (min, max) = (
+            per_worker.values().min().copied().unwrap_or(0),
+            per_worker.values().max().copied().unwrap_or(0),
+        );
+        assert!(max - min <= HANDOFF_MARGIN, "{per_worker:?}");
+    }
+
+    #[test]
+    fn pick_stays_local_within_the_margin_and_hands_off_beyond_it() {
+        let (b, _inboxes) = Balance::new(3, 100);
+        let rng = std::cell::Cell::new(1);
+        assert_eq!(b.pick(1, &rng), 1, "all equal: stay");
+        b.open[1].0.store(1, Ordering::Relaxed);
+        assert_eq!(b.pick(1, &rng), 1, "one more than the least: stay");
+        b.open[1].0.store(2, Ordering::Relaxed);
+        b.open[2].0.store(1, Ordering::Relaxed);
+        assert_eq!(
+            b.pick(1, &rng),
+            0,
+            "two more than the least: hand off to it"
+        );
+        b.retire(0);
+        b.open[2].0.store(5, Ordering::Relaxed);
+        assert_eq!(b.pick(2, &rng), 1, "a retired worker is never picked");
+    }
+
+    /// The cap holds under the pick: a worker at `cap` is never reserved,
+    /// whoever is asking.
+    #[test]
+    fn place_never_exceeds_the_cap() {
+        let (b, _inboxes) = Balance::new(3, 2);
+        let rng = std::cell::Cell::new(1);
+        let mut placed = Vec::new();
+        for i in 0..6 {
+            placed.push(b.place(i % 3, &rng).expect("room left"));
+        }
+        assert!(b.place(0, &rng).is_none(), "every worker is full");
+        assert!((0..3).all(|w| b.count(w) == 2), "{placed:?}");
+        b.release(1);
+        assert_eq!(b.place(0, &rng), Some(1));
+    }
+
+    /// A handoff still queued when a worker shuts down is served within the
+    /// grace window — from inside the worker's `LocalSet`, where its task can
+    /// be spawned. A worker that has already been told to stop when it starts
+    /// reaches that drain straight away.
+    #[test]
+    fn a_handoff_queued_at_shutdown_is_served() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let listener = std::net::TcpListener::bind(loopback()).unwrap();
+        let (balance, mut inboxes) = Balance::new(1, 10);
+        let balance = Arc::new(balance);
+        let inbox = inboxes[0].take().unwrap();
+
+        // A connected socket pair, the server side queued as a handoff.
+        let side = std::net::TcpListener::bind(loopback()).unwrap();
+        let mut client = std::net::TcpStream::connect(side.local_addr().unwrap()).unwrap();
+        let (server_side, peer) = side.accept().unwrap();
+        server_side.set_nonblocking(true).unwrap();
+        assert!(balance.reserve(0));
+        balance.inbox[0].send((server_side, peer)).unwrap();
+        use std::io::{Read, Write};
+        client
+            .write_all(b"GET / HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n")
+            .unwrap();
+
+        let (_tx, rx) = watch::channel(true);
+        let started = AtomicUsize::new(0);
+        let cfg = test_config(1).limits(Limits {
+            ..Default::default()
+        });
+        rt.block_on(worker_loop(
+            listener,
+            || hello,
+            || CloseH2,
+            || CloseUpgrade,
+            cfg,
+            rx,
+            Startup {
+                worker: 0,
+                started: &started,
+                peers: Peers { balance, inbox },
+            },
+        ));
+
+        let mut out = String::new();
+        client.read_to_string(&mut out).unwrap();
+        assert!(out.starts_with("HTTP/1.1 200 OK"), "{out:?}");
+    }
+
+    /// A slot released from another thread wakes the worker it belongs to,
+    /// which may be parked at its cap waiting for exactly that.
+    #[tokio::test]
+    async fn a_release_from_another_thread_wakes_the_owning_worker() {
+        let (b, _inboxes) = Balance::new(2, 1);
+        let b = Arc::new(b);
+        assert!(b.reserve(0));
+        let waiting = b.clone();
+        let parked = tokio::spawn(async move { waiting.freed[0].0.notified().await });
+        let releaser = b.clone();
+        std::thread::spawn(move || releaser.release(0))
+            .join()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), parked)
+            .await
+            .expect("woken")
+            .unwrap();
+    }
+
+    /// Past `PICK_SAMPLES + 1` workers, `pick` samples instead of scanning,
+    /// and still finds a far less loaded worker.
+    #[test]
+    fn pick_samples_on_a_large_machine_and_still_finds_room() {
+        let (b, _inboxes) = Balance::new(64, 1000);
+        let rng = std::cell::Cell::new(7);
+        for w in 0..64 {
+            b.open[w].0.store(50, Ordering::Relaxed);
+        }
+        // Half the workers idle: three samples miss them all one time in 8.
+        for w in (0..64).step_by(2) {
+            b.open[w].0.store(0, Ordering::Relaxed);
+        }
+        let handed = (0..1000).filter(|_| b.pick(1, &rng) != 1).count();
+        assert!(handed > 800, "{handed} of 1000");
+    }
+
+    /// `Duration::MAX` switches the preface deadline off rather than
+    /// overflowing it.
+    #[tokio::test]
+    async fn an_unbounded_header_timeout_does_not_overflow_the_preface_deadline() {
+        let listener = tokio::net::TcpListener::bind(loopback()).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = tokio::spawn(async move {
+            let mut c = tokio::net::TcpStream::connect(addr).await.unwrap();
+            c.write_all(b"GET / HTTP/1.1\r\n").await.unwrap();
+            c
+        });
+        let (stream, _) = listener.accept().await.unwrap();
+        let cfg = Config::new(loopback()).limits(Limits {
+            header_timeout: Duration::MAX,
+            ..Default::default()
+        });
+        let got = peek_preface(stream, &cfg).await;
+        assert!(matches!(got, Some((_, _, Preface::Http1))));
+        drop(client.await);
+    }
+
+    /// A worker at its own cap keeps accepting while another has room, and
+    /// hands the connection over: with a cap of one per worker, two held-open
+    /// connections are both served however the kernel hashes them.
+    #[test]
+    fn a_full_worker_hands_off_while_another_has_room() {
+        let cfg = test_config(2).limits(Limits {
+            idle_timeout: Duration::from_secs(10),
+            header_timeout: Duration::from_secs(10),
+            max_connections: 1,
+            ..Default::default()
+        });
+        let server = Server::bind(cfg).expect("bind");
+        let addr = server.local_addr();
+        let handle = server.handle();
+        let client = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let served = rt.block_on(async move {
+                let mut open = Vec::new();
+                let mut served = 0;
+                for _ in 0..2 {
+                    let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+                    s.write_all(b"GET / HTTP/1.1\r\nHost: a\r\n\r\n")
+                        .await
+                        .unwrap();
+                    let mut buf = vec![0u8; 512];
+                    if let Ok(Ok(n)) =
+                        tokio::time::timeout(Duration::from_secs(2), s.read(&mut buf)).await
+                        && buf[..n].starts_with(b"HTTP/1.1 200")
+                    {
+                        served += 1;
+                    }
+                    open.push(s);
+                }
+                served
+            });
+            handle.shutdown();
+            served
+        });
+        server.serve(|| hello).expect("serve");
+        assert_eq!(client.join().unwrap(), 2);
+    }
+
+    /// With every worker at its cap, a new connection waits in the backlog —
+    /// it is neither served nor closed — and is served once a slot frees. A
+    /// worker that started accepting at its cap because another had room must
+    /// not go on accepting and closing once that room is gone.
+    #[test]
+    fn a_full_server_queues_new_connections_instead_of_closing_them() {
+        let cfg = test_config(2).limits(Limits {
+            idle_timeout: Duration::from_secs(10),
+            header_timeout: Duration::from_secs(10),
+            max_connections: 1,
+            ..Default::default()
+        });
+        let server = Server::bind(cfg).expect("bind");
+        let addr = server.local_addr();
+        let handle = server.handle();
+        let client = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let outcome = rt.block_on(async move {
+                let mut held = Vec::new();
+                for _ in 0..2 {
+                    let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+                    s.write_all(b"GET / HTTP/1.1\r\nHost: a\r\n\r\n")
+                        .await
+                        .unwrap();
+                    let mut buf = vec![0u8; 512];
+                    let n = s.read(&mut buf).await.unwrap();
+                    assert!(buf[..n].starts_with(b"HTTP/1.1 200"));
+                    held.push(s);
+                }
+                // Long enough for any worker to have noticed it is full.
+                tokio::time::sleep(FULL_RECHECK * 4).await;
+                let mut extra = Vec::new();
+                for _ in 0..4 {
+                    let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+                    s.write_all(b"GET / HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n")
+                        .await
+                        .unwrap();
+                    extra.push(s);
+                }
+                let mut buf = vec![0u8; 512];
+                for s in &mut extra {
+                    match tokio::time::timeout(Duration::from_millis(200), s.read(&mut buf)).await {
+                        Err(_) => {}
+                        Ok(r) => return format!("queued connection was answered or closed: {r:?}"),
+                    }
+                }
+                // Free every slot; each queued connection is then served.
+                drop(held);
+                for s in &mut extra {
+                    let mut out = Vec::new();
+                    let _ =
+                        tokio::time::timeout(Duration::from_secs(3), s.read_to_end(&mut out)).await;
+                    if !out.starts_with(b"HTTP/1.1 200") {
+                        return format!(
+                            "not served once room freed: {:?}",
+                            String::from_utf8_lossy(&out)
+                        );
+                    }
+                }
+                String::new()
+            });
+            handle.shutdown();
+            outcome
+        });
+        server.serve(|| hello).expect("serve");
+        let outcome = client.join().unwrap();
+        assert!(outcome.is_empty(), "{outcome}");
     }
 }

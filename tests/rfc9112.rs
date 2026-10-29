@@ -815,3 +815,696 @@ fn a_wrong_handler_content_length_is_replaced_with_the_true_one() {
         e.body
     );
 }
+
+/// RFC 9110 section 9.3.2: a HEAD response's `Content-Length` describes the
+/// body a GET would have had, so a handler's value survives the empty body.
+#[test]
+fn head_response_keeps_the_handlers_content_length() {
+    let ex = raw_exchange_with_service(
+        quick_limits(),
+        || {
+            |_req: Request| async {
+                Response::ok().header(
+                    armature_h1::HeaderId::ContentLength,
+                    bytes::Bytes::from_static(b"1234"),
+                )
+            }
+        },
+        vec![b"HEAD / HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n".to_vec()],
+        Duration::ZERO,
+    );
+    assert!(
+        ex.body
+            .to_ascii_lowercase()
+            .contains("content-length: 1234\r\n"),
+        "{:?}",
+        ex.body
+    );
+    assert!(ex.body.ends_with("\r\n\r\n"), "no body: {:?}", ex.body);
+}
+
+/// A status no final response can carry is degraded to a 500 and a close,
+/// identically under either backend.
+#[test]
+fn impossible_final_status_becomes_500_and_closes() {
+    for status in [1000u16, 102, 101] {
+        let ex = raw_exchange_with_service(
+            quick_limits(),
+            move || move |_req: Request| async move { Response::new(status) },
+            vec![b"GET / HTTP/1.1\r\nHost: a\r\n\r\n".to_vec()],
+            Duration::ZERO,
+        );
+        assert_eq!(ex.status(), Some(500), "{status}: {:?}", ex.body);
+        assert!(ex.closed, "{status}");
+    }
+}
+
+/// `body_timeout` bounds the body's arrival, not the handler: a request with
+/// no body is served however long its handler takes.
+#[test]
+fn a_slow_handler_without_a_body_is_not_cut_off_by_body_timeout() {
+    let ex = raw_exchange_with_service(
+        quick_limits(),
+        || {
+            |_req: Request| async {
+                tokio::time::sleep(Duration::from_millis(1000)).await;
+                Response::text("slow")
+            }
+        },
+        vec![b"GET / HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n".to_vec()],
+        Duration::ZERO,
+    );
+    assert_eq!(ex.status(), Some(200), "{:?}", ex.body);
+    assert!(ex.body.ends_with("slow"), "{:?}", ex.body);
+}
+
+/// Nor once the body has been read: the deadline stops mattering the moment
+/// the body is complete.
+#[test]
+fn a_slow_handler_after_reading_its_body_is_not_cut_off() {
+    let ex = raw_exchange_with_service(
+        quick_limits(),
+        || {
+            |mut req: Request| async move {
+                let body = req.body.collect(1024).await.expect("body");
+                tokio::time::sleep(Duration::from_millis(1000)).await;
+                let mut r = Response::new(200);
+                r.body = armature_h1::ResponseBody::Full(body);
+                r
+            }
+        },
+        vec![
+            b"POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello"
+                .to_vec(),
+        ],
+        Duration::ZERO,
+    );
+    assert_eq!(ex.status(), Some(200), "{:?}", ex.body);
+    assert!(ex.body.ends_with("hello"), "{:?}", ex.body);
+}
+
+/// A handler that holds its body without reading it still answers to the
+/// deadline: the body is still awaited, and has not arrived, from the
+/// server's point of view.
+#[test]
+fn a_handler_sitting_on_an_unread_body_still_gets_408() {
+    let ex = raw_exchange_with_service(
+        quick_limits(),
+        || {
+            |req: Request| async move {
+                let _held = req.body;
+                tokio::time::sleep(Duration::from_millis(1500)).await;
+                Response::text("late")
+            }
+        },
+        vec![b"POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\n\r\nhello".to_vec()],
+        Duration::ZERO,
+    );
+    ex.assert_rejected_and_closed(408);
+}
+
+/// Echo what the handler saw as the path and authority.
+fn route_echo()
+-> impl Fn() -> fn(Request) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response>>>
++ Send
++ Clone
++ 'static {
+    || {
+        fn handle(req: Request) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response>>> {
+            let seen = format!(
+                "{} {}",
+                req.head.path(),
+                req.head.authority().unwrap_or("-")
+            );
+            Box::pin(async move {
+                let mut r = Response::new(200);
+                r.body = armature_h1::ResponseBody::Full(seen.into());
+                r
+            })
+        }
+        handle
+    }
+}
+
+/// RFC 9112 section 3.2.2: an absolute-form target routes on its path, and
+/// its authority is the request's.
+#[test]
+fn absolute_form_routes_on_its_path_component() {
+    let ex = raw_exchange_with_service(
+        quick_limits(),
+        route_echo(),
+        vec![b"GET http://a.example/admin?x=1 HTTP/1.1\r\nHost: a.example\r\nConnection: close\r\n\r\n".to_vec()],
+        Duration::ZERO,
+    );
+    assert_eq!(ex.status(), Some(200), "{:?}", ex.body);
+    assert!(ex.body.ends_with("/admin a.example"), "{:?}", ex.body);
+}
+
+/// A `Host` that names another authority than the target is refused, not
+/// resolved silently in favor of either.
+#[test]
+fn absolute_form_with_a_disagreeing_host_400_close() {
+    raw_exchange(b"GET http://a.example/ HTTP/1.1\r\nHost: b.example\r\n\r\n")
+        .assert_rejected_and_closed(400);
+}
+
+#[test]
+fn absolute_form_with_userinfo_400_close() {
+    raw_exchange(b"GET http://trusted@evil.example/ HTTP/1.1\r\nHost: evil.example\r\n\r\n")
+        .assert_rejected_and_closed(400);
+}
+
+#[test]
+fn absolute_form_with_a_non_http_scheme_400_close() {
+    raw_exchange(b"GET ftp://a.example/ HTTP/1.1\r\nHost: a.example\r\n\r\n")
+        .assert_rejected_and_closed(400);
+}
+
+#[test]
+fn malformed_host_400_close() {
+    raw_exchange(b"GET / HTTP/1.1\r\nHost: user@a.example\r\n\r\n").assert_rejected_and_closed(400);
+}
+
+/// RFC 9112 section 2.2: empty lines before the request line are ignored.
+#[test]
+fn empty_lines_before_the_request_line_are_ignored() {
+    let ex = raw_exchange(b"\r\n\r\nGET / HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n");
+    assert_eq!(ex.status(), Some(200), "{:?}", ex.body);
+}
+
+/// RFC 9112 section 7.1.1: a chunk extension outside its grammar is refused.
+#[test]
+#[cfg_attr(
+    feature = "hyper-backend",
+    ignore = "see BACKENDS.md: chunk extensions outside their grammar \
+              (hyper skips an extension's bytes up to the CRLF unread)"
+)]
+fn chunk_extension_outside_its_grammar_400_close() {
+    raw_exchange(
+        b"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n5;\xe9\r\nhello\r\n0\r\n\r\n",
+    )
+    .assert_rejected_and_closed(400);
+}
+
+/// Positive twin: hyper serves it. Fails the build, rather than passing an
+/// ignored test silently, if hyper starts refusing it.
+#[test]
+#[cfg(feature = "hyper-backend")]
+fn hyper_chunk_extension_outside_its_grammar_is_served() {
+    let ex = raw_exchange(
+        b"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n5;\xe9\r\nhello\r\n0\r\n\r\n",
+    );
+    assert_eq!(ex.status(), Some(200), "{:?}", ex.body);
+}
+
+/// A handler's `Connection: keep-alive, Upgrade` keeps `Upgrade` once the
+/// persistence token is dropped, under either backend.
+#[test]
+fn a_handler_connection_field_keeps_its_other_tokens() {
+    let ex = raw_exchange_with_service(
+        quick_limits(),
+        || {
+            |_req: Request| async {
+                Response::text("hi").header(
+                    armature_h1::HeaderId::Connection,
+                    bytes::Bytes::from_static(b"keep-alive, x-hop"),
+                )
+            }
+        },
+        vec![b"GET / HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n".to_vec()],
+        Duration::ZERO,
+    );
+    // One field or several is the same list (RFC 9110 section 5.3); hyper
+    // folds them into one line.
+    let lower = ex.body.to_ascii_lowercase();
+    let tokens: Vec<&str> = lower
+        .split("\r\n")
+        .filter_map(|l| l.strip_prefix("connection:"))
+        .flat_map(|v| v.split(','))
+        .map(str::trim)
+        .collect();
+    assert!(tokens.contains(&"x-hop"), "{:?}", ex.body);
+    assert!(tokens.contains(&"close"), "{:?}", ex.body);
+    assert!(!tokens.contains(&"keep-alive"), "{:?}", ex.body);
+}
+
+/// An empty `Host` (RFC 9112 section 3.2) is served.
+#[test]
+fn empty_host_is_served() {
+    let ex = raw_exchange(b"GET / HTTP/1.1\r\nHost:\r\nConnection: close\r\n\r\n");
+    assert_eq!(ex.status(), Some(200), "{:?}", ex.body);
+}
+
+/// `handler_timeout` bounds the handler itself: a 503 and a close, under
+/// either backend.
+#[test]
+fn handler_timeout_503_close() {
+    let ex = raw_exchange_with_service(
+        Limits {
+            handler_timeout: Some(Duration::from_millis(300)),
+            ..quick_limits()
+        },
+        || {
+            |_req: Request| async {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                Response::text("late")
+            }
+        },
+        vec![b"GET / HTTP/1.1\r\nHost: a\r\n\r\n".to_vec()],
+        Duration::ZERO,
+    );
+    ex.assert_rejected_and_closed(503);
+}
+
+/// Unset, it bounds nothing (see `a_slow_handler_without_a_body_...`), and set
+/// generously, a handler inside it is served normally.
+#[test]
+fn a_handler_inside_its_handler_timeout_is_served() {
+    let ex = raw_exchange_with_service(
+        Limits {
+            handler_timeout: Some(Duration::from_secs(5)),
+            ..quick_limits()
+        },
+        || {
+            |_req: Request| async {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                Response::text("ok")
+            }
+        },
+        vec![b"GET / HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n".to_vec()],
+        Duration::ZERO,
+    );
+    assert_eq!(ex.status(), Some(200), "{:?}", ex.body);
+}
+
+/// A stray CRLF after a response (RFC 9112 section 2.2's legacy trailing
+/// line) is not the start of a request: the connection stays idle and closes
+/// silently on the idle deadline, without a 408 for a request never sent.
+#[test]
+fn a_stray_crlf_on_an_idle_connection_is_not_a_request() {
+    let ex = raw_exchange_slow(
+        Limits {
+            header_timeout: Duration::from_millis(200),
+            idle_timeout: Duration::from_millis(900),
+            ..quick_limits()
+        },
+        vec![
+            b"GET / HTTP/1.1\r\nHost: a\r\n\r\n".to_vec(),
+            b"\r\n".to_vec(),
+        ],
+        Duration::from_millis(50),
+    );
+    assert_eq!(ex.responses(), 1, "{:?}", ex.body);
+    assert!(!ex.body.contains("408"), "{:?}", ex.body);
+    assert!(ex.closed);
+}
+
+/// RFC 9110 sections 7.8 and 15.2: `Upgrade` from an HTTP/1.0 client is
+/// ignored, so a handler's 101 for one cannot stand as its final response.
+#[test]
+fn a_101_to_an_http_10_upgrade_request_becomes_500() {
+    let ex = raw_exchange_with_service(
+        quick_limits(),
+        || {
+            |_req: Request| async {
+                Response::new(101)
+                    .header(
+                        armature_h1::HeaderId::Connection,
+                        bytes::Bytes::from_static(b"upgrade"),
+                    )
+                    .header(
+                        armature_h1::HeaderId::Upgrade,
+                        bytes::Bytes::from_static(b"websocket"),
+                    )
+            }
+        },
+        vec![b"GET / HTTP/1.0\r\nConnection: upgrade\r\nUpgrade: websocket\r\n\r\n".to_vec()],
+        Duration::ZERO,
+    );
+    assert_eq!(ex.status(), Some(500), "{:?}", ex.body);
+    assert!(ex.closed);
+}
+
+/// The handler-timeout 503 is the bare rejection under either backend: no
+/// configured `Server` field, as with every other error response.
+#[test]
+fn the_handler_timeout_503_is_a_bare_rejection() {
+    let server = Server::bind(
+        config(Limits {
+            handler_timeout: Some(Duration::from_millis(200)),
+            ..quick_limits()
+        })
+        .server_name(bytes::Bytes::from_static(b"armature-test")),
+    )
+    .expect("bind");
+    let addr = server.local_addr();
+    let handle = server.handle();
+    let client = std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let out = rt.block_on(async move {
+            let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+            s.write_all(b"GET / HTTP/1.1\r\nHost: a\r\n\r\n")
+                .await
+                .unwrap();
+            let mut out = Vec::new();
+            let _ = tokio::time::timeout(Duration::from_secs(3), s.read_to_end(&mut out)).await;
+            String::from_utf8_lossy(&out).into_owned()
+        });
+        handle.shutdown();
+        out
+    });
+    server
+        .serve(|| {
+            |_req: Request| async {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                Response::text("late")
+            }
+        })
+        .expect("serve");
+    let out = client.join().unwrap();
+    assert!(out.starts_with("HTTP/1.1 503"), "{out:?}");
+    assert!(!out.to_ascii_lowercase().contains("server:"), "{out:?}");
+}
+
+/// The same with the stray CRLF split across two reads: a lone CR is not the
+/// start of a request either.
+#[test]
+fn a_stray_crlf_split_across_reads_is_not_a_request() {
+    let ex = raw_exchange_slow(
+        Limits {
+            header_timeout: Duration::from_millis(200),
+            idle_timeout: Duration::from_millis(900),
+            ..quick_limits()
+        },
+        vec![
+            b"GET / HTTP/1.1\r\nHost: a\r\n\r\n".to_vec(),
+            b"\r".to_vec(),
+            b"\n".to_vec(),
+        ],
+        Duration::from_millis(50),
+    );
+    assert_eq!(ex.responses(), 1, "{:?}", ex.body);
+    assert!(!ex.body.contains("408"), "{:?}", ex.body);
+    assert!(ex.closed);
+}
+
+/// And when the stray CR arrives in the same read as the request before it,
+/// so it is already buffered when the connection goes back to waiting.
+#[test]
+fn a_stray_cr_behind_a_request_is_not_a_request() {
+    let ex = raw_exchange_slow(
+        Limits {
+            header_timeout: Duration::from_millis(200),
+            idle_timeout: Duration::from_millis(900),
+            ..quick_limits()
+        },
+        vec![
+            b"GET / HTTP/1.1\r\nHost: a\r\n\r\n\r".to_vec(),
+            b"\n".to_vec(),
+        ],
+        Duration::from_millis(400),
+    );
+    assert_eq!(ex.responses(), 1, "{:?}", ex.body);
+    assert!(!ex.body.contains("408"), "{:?}", ex.body);
+    assert!(ex.closed);
+}
+
+/// A body that failed awaits no more bytes, so `body_timeout` has nothing to
+/// bound: a handler taking its time over the error response is not cut off
+/// with a 408.
+#[test]
+fn a_failed_body_does_not_put_the_handler_under_body_timeout() {
+    let ex = raw_exchange_with_service(
+        quick_limits(),
+        || {
+            |mut req: Request| async move {
+                let err = req.body.collect(1024).await.expect_err("malformed chunk");
+                tokio::time::sleep(Duration::from_millis(900)).await;
+                Response::status_only(err.status())
+            }
+        },
+        vec![b"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\n".to_vec()],
+        Duration::ZERO,
+    );
+    assert_eq!(ex.status(), Some(400), "{:?}", ex.body);
+}
+
+/// The same when the handler's own `collect` cap is what stopped the body:
+/// it is finished, and the 413 the handler takes its time over goes out.
+#[test]
+fn a_body_over_the_handlers_collect_cap_does_not_put_it_under_body_timeout() {
+    let ex = raw_exchange_with_service(
+        quick_limits(),
+        || {
+            |mut req: Request| async move {
+                let err = req.body.collect(4).await.expect_err("over the cap");
+                tokio::time::sleep(Duration::from_millis(900)).await;
+                Response::status_only(err.status())
+            }
+        },
+        vec![b"POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 64\r\n\r\n0123456789abcdef".to_vec()],
+        Duration::ZERO,
+    );
+    assert_eq!(ex.status(), Some(413), "{:?}", ex.body);
+}
+
+/// A handler that takes exactly the declared `Content-Length` and then works
+/// past `body_timeout` has read its body, under either backend.
+#[test]
+fn a_body_read_to_its_declared_length_is_finished_without_eof() {
+    let ex = raw_exchange_with_service(
+        quick_limits(),
+        || {
+            |mut req: Request| async move {
+                let mut got = 0;
+                while got < 5 {
+                    got += req.body.chunk().await.expect("a chunk").expect("ok").len();
+                }
+                tokio::time::sleep(Duration::from_millis(900)).await;
+                Response::text("done")
+            }
+        },
+        vec![
+            b"POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello"
+                .to_vec(),
+        ],
+        Duration::ZERO,
+    );
+    assert_eq!(ex.status(), Some(200), "{:?}", ex.body);
+}
+
+/// A body that ended in the same chunk that crossed `collect`'s cap was read:
+/// the 413 goes out and the pipelined request behind it is still served.
+#[test]
+fn collect_over_its_cap_on_a_complete_body_keeps_the_connection() {
+    let ex = raw_exchange_with_service(
+        quick_limits(),
+        || {
+            |mut req: Request| async move {
+                if req.head.path() == "/b" {
+                    return Response::text("b");
+                }
+                let err = req.body.collect(4).await.expect_err("over the cap");
+                Response::status_only(err.status())
+            }
+        },
+        vec![
+            b"POST /a HTTP/1.1\r\nHost: a\r\nContent-Length: 16\r\n\r\n0123456789abcdef\
+              GET /b HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n"
+                .to_vec(),
+        ],
+        Duration::ZERO,
+    );
+    assert_eq!(ex.status(), Some(413), "{:?}", ex.body);
+    assert_eq!(ex.responses(), 2, "/b was served too: {:?}", ex.body);
+    assert!(ex.body.ends_with("b"), "{:?}", ex.body);
+}
+
+/// A body the handler dropped unread is awaited by nothing, so the deadline
+/// has nothing to bound: the slow handler's answer goes out, and the
+/// connection closes over the unread bytes.
+#[test]
+fn a_handler_that_dropped_its_body_is_not_cut_off_by_body_timeout() {
+    let ex = raw_exchange_with_service(
+        quick_limits(),
+        || {
+            |req: Request| async move {
+                drop(req.body);
+                tokio::time::sleep(Duration::from_millis(900)).await;
+                Response::text("late")
+            }
+        },
+        vec![b"POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\n\r\nhel".to_vec()],
+        Duration::ZERO,
+    );
+    assert_eq!(ex.status(), Some(200), "{:?}", ex.body);
+    assert!(ex.closed, "the unread body forces a close");
+}
+
+/// RFC 9112 section 6.1: an HTTP/1.0 streamed body is close-delimited, and
+/// both backends say so rather than promise a persistence they do not keep.
+#[test]
+fn an_http_10_streamed_response_says_close() {
+    struct One(bool);
+    impl armature_h1::service::futures_stream::Stream for One {
+        fn poll_next(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Result<bytes::Bytes, armature_h1::BodyError>>> {
+            let first = !self.0;
+            self.0 = true;
+            std::task::Poll::Ready(first.then(|| Ok(bytes::Bytes::from_static(b"streamed"))))
+        }
+    }
+    let ex = raw_exchange_with_service(
+        quick_limits(),
+        || {
+            |_req: Request| async {
+                Response::ok().with_body(armature_h1::ResponseBody::Stream(Box::pin(One(false))))
+            }
+        },
+        vec![b"GET / HTTP/1.0\r\nConnection: keep-alive\r\n\r\n".to_vec()],
+        Duration::ZERO,
+    );
+    let lower = ex.body.to_ascii_lowercase();
+    assert!(lower.contains("connection: close\r\n"), "{:?}", ex.body);
+    assert!(!lower.contains("keep-alive"), "{:?}", ex.body);
+    assert!(ex.body.ends_with("streamed"), "{:?}", ex.body);
+    assert!(ex.closed);
+}
+
+/// A malformed `Connection` token is dropped on its own, and exactly the same
+/// tokens reach the wire under either backend.
+#[test]
+fn a_malformed_connection_token_is_dropped_alone() {
+    let ex = raw_exchange_with_service(
+        quick_limits(),
+        || {
+            |_req: Request| async {
+                Response::text("hi").header(
+                    armature_h1::HeaderId::Connection,
+                    bytes::Bytes::from_static(b"x\x01y, x-hop"),
+                )
+            }
+        },
+        vec![b"GET / HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n".to_vec()],
+        Duration::ZERO,
+    );
+    let lower = ex.body.to_ascii_lowercase();
+    let mut tokens: Vec<&str> = lower
+        .split("\r\n")
+        .filter_map(|l| l.strip_prefix("connection:"))
+        .flat_map(|v| v.split(','))
+        .map(str::trim)
+        .collect();
+    tokens.sort_unstable();
+    assert_eq!(tokens, ["close", "x-hop"], "{:?}", ex.body);
+}
+
+/// A streamed response still reading a request body that stalls is bounded
+/// by the body deadline under either backend — not by `write_timeout`, which
+/// a stream that keeps writing would never run out.
+#[test]
+fn a_stalled_body_behind_a_streamed_response_closes_at_the_body_deadline() {
+    struct Echo(armature_h1::Body);
+    impl armature_h1::service::futures_stream::Stream for Echo {
+        fn poll_next(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Result<bytes::Bytes, armature_h1::BodyError>>> {
+            self.0.poll_chunk(cx)
+        }
+    }
+    let started = std::time::Instant::now();
+    let ex = raw_exchange_with_service(
+        quick_limits(),
+        || {
+            |req: Request| async move {
+                Response::ok()
+                    .with_body(armature_h1::ResponseBody::Stream(Box::pin(Echo(req.body))))
+            }
+        },
+        vec![b"POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 10\r\n\r\nabc".to_vec()],
+        Duration::ZERO,
+    );
+    assert!(ex.closed, "{:?}", ex.body);
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "closed at the body deadline, not write_timeout: {:?}",
+        started.elapsed()
+    );
+}
+
+thread_local! {
+    /// Bodies a test handler keeps alive past its own return.
+    static KEPT_BODIES: std::cell::RefCell<Vec<armature_h1::Body>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Only a streamed response is still reading the request body, so only it is
+/// held to the body deadline: a large fixed response is written under
+/// `write_timeout` alone, even while an unfinished body is kept alive
+/// elsewhere and the peer is slow to read.
+#[test]
+fn a_fixed_response_is_not_cut_off_at_the_body_deadline() {
+    const LEN: usize = 4 << 20;
+    let ex = raw_exchange_with_service(
+        quick_limits(),
+        || {
+            |req: Request| async move {
+                KEPT_BODIES.with(|k| k.borrow_mut().push(req.body));
+                Response::ok().with_body(armature_h1::ResponseBody::Full(bytes::Bytes::from(
+                    vec![b'a'; LEN],
+                )))
+            }
+        },
+        vec![
+            b"POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\n\r\nhel".to_vec(),
+            b"lo".to_vec(),
+        ],
+        Duration::from_millis(700),
+    );
+    let body_at = ex.body.find("\r\n\r\n").map_or(0, |i| i + 4);
+    assert_eq!(ex.body.len() - body_at, LEN, "the whole response arrived");
+}
+
+/// A held pipelined response is written in full before the next request's
+/// handler phase begins: a body deadline on that next request can never cut
+/// it short, nor splice a 408 into its tail.
+#[test]
+fn a_held_response_is_never_cut_short_by_the_next_requests_body_deadline() {
+    const LEN: usize = 4 << 20;
+    let ex = raw_exchange_with_service(
+        quick_limits(),
+        || {
+            |mut req: Request| async move {
+                if req.head.path() == "/big" {
+                    return Response::ok().with_body(armature_h1::ResponseBody::Full(
+                        bytes::Bytes::from(vec![b'a'; LEN]),
+                    ));
+                }
+                let _ = req.body.collect(64).await;
+                Response::text("second")
+            }
+        },
+        vec![
+            b"GET /big HTTP/1.1\r\nHost: a\r\n\r\n\
+              POST /x HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhel"
+                .to_vec(),
+            b"lo".to_vec(),
+        ],
+        Duration::from_millis(1200),
+    );
+    let first_body = ex.body.find("\r\n\r\n").map_or(0, |i| i + 4);
+    let rest = &ex.body[first_body..];
+    let run = rest.bytes().take_while(|&b| b == b'a').count();
+    assert_eq!(run, LEN, "the first response arrived whole");
+    assert!(
+        rest[run..].starts_with("HTTP/1.1 "),
+        "and the next response follows it, not spliced into it: {:?}",
+        &rest[run..run.saturating_add(60).min(rest.len())]
+    );
+}

@@ -7,6 +7,84 @@ and this crate adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.h
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-10-29
+
+### Performance
+
+Measured against `axum` 0.8 (hyper `http1`) on identical in-process and
+loopback harnesses. Userspace cost per keep-alive request is below axum's on
+every case measured (GET: 30.3k → 11.3k instructions, axum 12.0k; pipelined:
+11.4k → 8.7k, axum 9.1k), syscalls per request match it (4 → 2), and a
+pipelined batch is served at roughly 4.5× the rate.
+
+- The once-per-second `Date` reformat writes straight into its cache instead of
+  through `httpdate::fmt_http_date`'s `String`, so the steady-state path is
+  allocation-free across second boundaries too. This was also the source of an
+  occasional `alloc_regression` failure.
+- Reads fill the buffer's spare capacity through tokio's `read_buf` instead of
+  zero-filling 8 KiB on every read poll, the `Pending` one included.
+- `ConnDeadline` arms lazily: it records the deadline and touches the timer
+  only to move it earlier, instead of re-registering it on every phase. This
+  also removes two eventfd wakeup writes per request.
+- The handler future is raced against the body deadline in place rather than
+  moved through `select!`, and each head's terminator is found once instead
+  of three times.
+- A request body no longer carries two inline header arrays it almost never
+  uses: chunked trailers are allocated on the first trailer field. A `Body`
+  shrinks from about 2.5 KB to 168 bytes, and every move of a request with it.
+- A keep-alive response whose successor is already buffered is held back, up
+  to 32 KiB, so a pipelined batch goes out in one write. Nothing held back can
+  wait on the peer or on a slow handler.
+- Connections are balanced across workers by load. `SO_REUSEPORT` spreads
+  them by address hash, which left one core as low as 45% busy with 16
+  keep-alive connections on 4; a worker that accepts while holding at least
+  two more connections than the least loaded one it finds now hands the
+  socket over before serving it.
+
+### Changed
+
+- **Breaking:** `FramingError` is `#[non_exhaustive]` and gains `InvalidHost`,
+  `InvalidAuthority`, `UnsupportedScheme` and `HostMismatch`.
+- **Breaking:** `Limits` gains the public field `handler_timeout`, so a
+  `Limits { .. }` literal that names every field without `..Default::default()`
+  no longer compiles.
+- `Head::path()` returns only the path component of an absolute-form target
+  (`/` when empty). New `Head::authority()` and `Head::absolute_scheme()`.
+- `Limits::body_timeout` bounds the body's arrival, not the handler: a handler
+  runs unbounded once its body is read, or when there is none. A streamed
+  response that is still reading the request body stays under it, and closes
+  the connection if the peer stalls; one whose body was dropped unread does
+  not.
+- The `tls` feature requires `rustls-webpki` 0.103.16 (RUSTSEC-2026-0382).
+- `Limits::handler_timeout` (default `None`) bounds a handler's own runtime,
+  answering `503` and closing.
+
+### Fixed
+
+- A `Host` that is malformed, or that disagrees with an absolute-form target's
+  authority, is refused with `400`, as is a target with userinfo or a scheme
+  other than `http`/`https`.
+- Empty lines before a request line are ignored (RFC 9112 section 2.2), chunk
+  sizes may carry any number of leading zeros, and chunk extensions are held to
+  their grammar (bytes at or above `0x80` only inside a quoted value).
+
+- `100 Continue` is no longer written inside a streamed response whose handler
+  reads the body after its head goes out, no longer sent to HTTP/1.0 clients,
+  and no longer counted as sent after a short write.
+- A streamed body to an HTTP/1.0 client is close-delimited instead of chunked.
+- The server states connection persistence itself: a handler `Connection`
+  field naming `close` or `keep-alive` is not written, and a handler `close` is
+  acted on.
+- A `HEAD` response keeps the handler's `Content-Length` instead of having it
+  rewritten to `0`.
+- A handler status that cannot be final (outside 200–599, or a 1xx other than
+  a requested 101) is sent as `500` and closes, under both backends.
+- Trailers must have token names, no control bytes other than HTAB in values,
+  and at most `Limits::max_headers` fields, as head fields must.
+- The h2c preface sniff is bounded by one `header_timeout` in total rather
+  than one per read.
+- Error responses are written under `write_timeout` like every other write.
+
 ## [0.4.0] - 2026-10-17
 
 ### Security

@@ -9,7 +9,7 @@
 //! unit-tested and differentially fuzzed against another implementation.
 
 use crate::header::HeaderId;
-use crate::{Head, Limits, Version};
+use crate::{Head, Limits, Method, Version};
 
 /// How to read the request body.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -25,6 +25,7 @@ pub enum BodyKind {
 
 /// An unresolvable or unacceptable framing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
 pub enum FramingError {
     /// Both `Content-Length` and `Transfer-Encoding` were present.
     #[error("both Content-Length and Transfer-Encoding present")]
@@ -50,6 +51,22 @@ pub enum FramingError {
     /// More than one `Host` is ambiguous at any version.
     #[error("multiple Host fields")]
     MultipleHost,
+    /// `Host` was not a `uri-host [ ":" port ]` (RFC 9112 section 3.2). An empty
+    /// `Host` is valid: it is how a client says the target has no authority.
+    #[error("invalid Host")]
+    InvalidHost,
+    /// An absolute-form target's authority was empty, carried userinfo, or was
+    /// not a `uri-host [ ":" port ]`; or a CONNECT target was not exactly
+    /// `uri-host ":" port`.
+    #[error("invalid authority in the request target")]
+    InvalidAuthority,
+    /// An absolute-form target named a scheme other than `http` or `https`.
+    #[error("unsupported scheme in the request target")]
+    UnsupportedScheme,
+    /// `Host` named a different authority than an absolute-form or CONNECT
+    /// target.
+    #[error("Host disagrees with the request target's authority")]
+    HostMismatch,
     /// The declared body exceeded `Limits::max_body_bytes`.
     #[error("declared body too large")]
     BodyTooLarge,
@@ -67,11 +84,174 @@ impl FramingError {
     }
 }
 
+/// Validate `Host` and, for an absolute-form target, the target's authority.
+///
+/// RFC 9112 section 3.2.2 has the target's authority win over `Host`, which
+/// leaves two names for one request. Anything that reads `Host` instead of
+/// [`Head::authority`] — a virtual-host router, an allowlist, a log line, the
+/// next hop — would act on the losing one, so a disagreement is refused here
+/// rather than resolved silently, the same answer this module gives every
+/// other pair of fields that could be read two ways.
+fn check_authority(head: &Head) -> Result<(), FramingError> {
+    // An empty `Host` is what RFC 9112 section 3.2 requires of a client whose
+    // target URI has no authority, so it is well-formed — it just names
+    // nothing, and there is nothing for it to disagree with.
+    let host = match head.get(&HeaderId::Host) {
+        Some(v) if !v.is_empty() => Some(parse_authority(v).ok_or(FramingError::InvalidHost)?),
+        _ => None,
+    };
+    // CONNECT's authority-form target (RFC 9112 section 3.2.3) is the
+    // request's authority just as an absolute-form one is, and is held to the
+    // same rules: a real `uri-host ":" port`, no userinfo, and no `Host`
+    // naming somewhere else.
+    if head.method == Method::Connect {
+        let (target_host, target_port) = parse_authority(head.target().as_bytes())
+            .filter(|(_, port)| port.is_some())
+            .ok_or(FramingError::InvalidAuthority)?;
+        if let Some((host, port)) = host {
+            // CONNECT has no default port of its own. A port-less `Host` reads
+            // as 80 or 443 to anything that routes it as http(s) — RFC 9110's
+            // own CONNECT example pairs `:80` with a bare `Host` — so it
+            // matches only a target on one of those. `Host: internal` against
+            // `internal:22` would let a `Host` reader and the tunnel disagree.
+            let same_port = match port {
+                Some(p) => target_port == Some(p),
+                None => matches!(target_port, Some(80 | 443)),
+            };
+            if !host.eq_ignore_ascii_case(target_host) || !same_port {
+                return Err(FramingError::HostMismatch);
+            }
+        }
+        return Ok(());
+    }
+    let Some(scheme) = head.absolute_scheme() else {
+        return Ok(());
+    };
+    let default_port = if scheme.eq_ignore_ascii_case("http") {
+        80
+    } else if scheme.eq_ignore_ascii_case("https") {
+        443
+    } else {
+        return Err(FramingError::UnsupportedScheme);
+    };
+    let authority = head.authority().unwrap_or_default();
+    let (target_host, target_port) =
+        parse_authority(authority.as_bytes()).ok_or(FramingError::InvalidAuthority)?;
+    if let Some((host, port)) = host {
+        let same = host.eq_ignore_ascii_case(target_host)
+            && port.unwrap_or(default_port) == target_port.unwrap_or(default_port);
+        if !same {
+            return Err(FramingError::HostMismatch);
+        }
+    }
+    Ok(())
+}
+
+/// Split an authority into its host and port, or `None` unless it is exactly
+/// `uri-host [ ":" port ]` (RFC 3986 section 3.2).
+///
+/// No userinfo (`@` is not a host character, so it fails here): RFC 9110
+/// section 4.2.4 deprecates it in `http` URIs, and `http://trusted@evil/` is
+/// the classic way to make one reader see a different host than another. An
+/// empty port (`host:`) is allowed and means the default.
+fn parse_authority(a: &[u8]) -> Option<(&[u8], Option<u16>)> {
+    let (host, rest) = if a.first() == Some(&b'[') {
+        let close = a.iter().position(|&b| b == b']')?;
+        let inner = &a[1..close];
+        if inner.is_empty()
+            || !inner
+                .iter()
+                .all(|b| b.is_ascii_hexdigit() || matches!(b, b':' | b'.'))
+        {
+            return None;
+        }
+        (&a[..=close], &a[close + 1..])
+    } else {
+        let end = a.iter().position(|&b| b == b':').unwrap_or(a.len());
+        let host = &a[..end];
+        if host.is_empty() || !valid_reg_name(host) {
+            return None;
+        }
+        (host, &a[end..])
+    };
+    let port = match rest {
+        [] | [b':'] => None,
+        [b':', digits @ ..] => {
+            if digits.len() > 5 || !digits.iter().all(u8::is_ascii_digit) {
+                return None;
+            }
+            let n = digits
+                .iter()
+                .fold(0u32, |n, d| n * 10 + u32::from(d - b'0'));
+            Some(u16::try_from(n).ok()?)
+        }
+        _ => return None,
+    };
+    Some((host, port))
+}
+
+/// `reg-name` (RFC 3986 section 3.2.2), which also covers an IPv4 address:
+/// unreserved characters, sub-delims, and well-formed percent-encodings.
+fn valid_reg_name(host: &[u8]) -> bool {
+    // A table rather than a chain of comparisons: this runs over every
+    // request's `Host`, on the keep-alive path.
+    const REG_NAME: [bool; 256] = {
+        let mut t = [false; 256];
+        let mut b = 0;
+        while b < 256 {
+            let c = b as u8;
+            t[b] = c.is_ascii_alphanumeric()
+                || matches!(
+                    c,
+                    b'-' | b'.'
+                        | b'_'
+                        | b'~'
+                        | b'!'
+                        | b'$'
+                        | b'&'
+                        | b'\''
+                        | b'('
+                        | b')'
+                        | b'*'
+                        | b'+'
+                        | b','
+                        | b';'
+                        | b'='
+                );
+            b += 1;
+        }
+        t
+    };
+    // The common case — no percent-encoding — in one pass.
+    if host.iter().all(|&b| REG_NAME[b as usize]) {
+        return true;
+    }
+    let mut i = 0;
+    while i < host.len() {
+        match host[i] {
+            b'%' => {
+                if !host
+                    .get(i + 1..i + 3)
+                    .is_some_and(|h| h.iter().all(u8::is_ascii_hexdigit))
+                {
+                    return false;
+                }
+                i += 3;
+                continue;
+            }
+            b if REG_NAME[b as usize] => {}
+            _ => return false,
+        }
+        i += 1;
+    }
+    true
+}
+
 /// Decide how to frame the request body.
 ///
 /// Rule order is fixed and load-bearing:
 ///
-/// 1. `Host` validity
+/// 1. `Host` validity, and its agreement with an absolute-form target
 /// 2. `Content-Length`-with-`Transfer-Encoding` conflict
 /// 3. `Transfer-Encoding` analysis
 /// 4. `Content-Length` analysis
@@ -105,6 +285,7 @@ pub fn decide(head: &Head, limits: &Limits) -> Result<BodyKind, FramingError> {
         n if n > 1 => return Err(FramingError::MultipleHost),
         _ => {}
     }
+    check_authority(head)?;
 
     // 2. Conflict. Checked before either field is analyzed.
     if has_len && has_te {
@@ -252,6 +433,136 @@ mod tests {
 
     fn decide_raw(raw: &'static [u8]) -> Result<BodyKind, FramingError> {
         decide(&head(raw), &Limits::default())
+    }
+
+    // ---- Host and absolute-form authority ----
+
+    #[test]
+    fn absolute_form_with_a_matching_host_is_accepted() {
+        for raw in [
+            &b"GET http://a.example/x HTTP/1.1\r\nHost: a.example\r\n\r\n"[..],
+            b"GET http://a.example/x HTTP/1.1\r\nHost: A.EXAMPLE:80\r\n\r\n",
+            b"GET https://a.example:443/ HTTP/1.1\r\nHost: a.example\r\n\r\n",
+            b"GET HTTP://[::1]:8080/ HTTP/1.1\r\nHost: [::1]:8080\r\n\r\n",
+            b"GET http://a.example/ HTTP/1.0\r\n\r\n",
+        ] {
+            assert_eq!(
+                decide(&head(raw), &Limits::default()),
+                Ok(BodyKind::None),
+                "{raw:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn host_disagreeing_with_the_target_authority_is_rejected() {
+        for raw in [
+            &b"GET http://a.example/ HTTP/1.1\r\nHost: b.example\r\n\r\n"[..],
+            b"GET http://a.example/ HTTP/1.1\r\nHost: a.example:8080\r\n\r\n",
+            b"GET https://a.example/ HTTP/1.1\r\nHost: a.example:80\r\n\r\n",
+        ] {
+            assert_eq!(
+                decide(&head(raw), &Limits::default()),
+                Err(FramingError::HostMismatch),
+                "{raw:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn target_userinfo_or_a_bad_authority_is_rejected() {
+        for raw in [
+            &b"GET http://trusted@evil.example/ HTTP/1.1\r\nHost: evil.example\r\n\r\n"[..],
+            b"GET http:///x HTTP/1.1\r\nHost: a\r\n\r\n",
+            b"GET http://a.example:99999/ HTTP/1.1\r\nHost: a.example\r\n\r\n",
+            b"GET http://a%zz/ HTTP/1.1\r\nHost: a\r\n\r\n",
+        ] {
+            assert_eq!(
+                decide(&head(raw), &Limits::default()),
+                Err(FramingError::InvalidAuthority),
+                "{raw:?}"
+            );
+        }
+    }
+
+    /// CONNECT's target is its authority, held to the same rules.
+    #[test]
+    fn connect_targets_are_validated_and_reconciled_with_host() {
+        let ok = |raw: &'static [u8]| decide(&head(raw), &Limits::default());
+        assert_eq!(
+            ok(b"CONNECT a.example:443 HTTP/1.1\r\nHost: a.example:443\r\n\r\n"),
+            Ok(BodyKind::None)
+        );
+        assert_eq!(
+            ok(b"CONNECT a.example:443 HTTP/1.1\r\nHost: A.example\r\n\r\n"),
+            Ok(BodyKind::None)
+        );
+        assert_eq!(
+            ok(b"CONNECT trusted@evil.example:443 HTTP/1.1\r\nHost: good.example\r\n\r\n"),
+            Err(FramingError::InvalidAuthority)
+        );
+        assert_eq!(
+            ok(b"CONNECT a.example:443 HTTP/1.1\r\nHost: good.example\r\n\r\n"),
+            Err(FramingError::HostMismatch)
+        );
+        assert_eq!(
+            ok(b"CONNECT a.example:443 HTTP/1.1\r\nHost: a.example:8443\r\n\r\n"),
+            Err(FramingError::HostMismatch)
+        );
+        // A port-less Host stands for 80/443 only, never another port.
+        assert_eq!(
+            ok(b"CONNECT a.example:80 HTTP/1.1\r\nHost: a.example\r\n\r\n"),
+            Ok(BodyKind::None)
+        );
+        assert_eq!(
+            ok(b"CONNECT internal.example:22 HTTP/1.1\r\nHost: internal.example\r\n\r\n"),
+            Err(FramingError::HostMismatch)
+        );
+    }
+
+    #[test]
+    fn a_scheme_other_than_http_is_rejected() {
+        assert_eq!(
+            decide_raw(b"GET ftp://a.example/ HTTP/1.1\r\nHost: a.example\r\n\r\n"),
+            Err(FramingError::UnsupportedScheme)
+        );
+    }
+
+    #[test]
+    fn a_malformed_host_is_rejected() {
+        for raw in [
+            &b"GET / HTTP/1.1\r\nHost: user@a\r\n\r\n"[..],
+            b"GET / HTTP/1.1\r\nHost: a/b\r\n\r\n",
+            b"GET / HTTP/1.1\r\nHost: a:port\r\n\r\n",
+            b"GET / HTTP/1.1\r\nHost: [zz]\r\n\r\n",
+            b"GET / HTTP/1.1\r\nHost: a b\r\n\r\n",
+        ] {
+            assert_eq!(
+                decide(&head(raw), &Limits::default()),
+                Err(FramingError::InvalidHost),
+                "{raw:?}"
+            );
+        }
+        assert_eq!(
+            decide_raw(b"GET / HTTP/1.1\r\nHost: a:\r\n\r\n"),
+            Ok(BodyKind::None)
+        );
+    }
+
+    /// RFC 9112 section 3.2: an empty `Host` is how a client says the target
+    /// URI has no authority. It is accepted, and names nothing to compare.
+    #[test]
+    fn an_empty_host_is_accepted() {
+        for raw in [
+            &b"OPTIONS * HTTP/1.1\r\nHost:\r\n\r\n"[..],
+            b"GET / HTTP/1.1\r\nHost: \r\n\r\n",
+        ] {
+            assert_eq!(
+                decide(&head(raw), &Limits::default()),
+                Ok(BodyKind::None),
+                "{raw:?}"
+            );
+        }
     }
 
     // ---- positive cases ----

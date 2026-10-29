@@ -129,6 +129,27 @@ pub trait BodyIo {
     /// Used after a chunked body's terminating chunk, where the decoder may have
     /// been handed bytes belonging to the next request.
     fn push_back(&mut self, bytes: Bytes);
+
+    /// A new request's [`Body`] is being created; returns its generation.
+    ///
+    /// The generation ties [`body_finished`](Self::body_finished) to the body
+    /// it came from: a `Body` from an earlier request that a handler kept
+    /// alive must not, when it is finally dropped, report a later request's
+    /// body as finished. The default returns `0`.
+    fn body_started(&mut self) -> u64 {
+        0
+    }
+
+    /// The body of `generation` awaits no more bytes: read to its end, failed,
+    /// or dropped unread.
+    ///
+    /// Either way nothing can read more of it, so its deadline has nothing
+    /// left to bound. The default does nothing; the connection uses it to stop
+    /// racing `Limits::body_timeout` against a handler that is now only
+    /// working on its response.
+    fn body_finished(&mut self, generation: u64) {
+        let _ = generation;
+    }
 }
 
 /// Shared body-reading state.
@@ -139,8 +160,17 @@ struct BodyState {
     /// Bytes still expected, for a `Content-Length` body.
     remaining: u64,
     decoder: Option<ChunkedDecoder>,
-    trailers: Option<HeaderVec>,
+    /// The trailer fields, when there were any: boxed, since nearly every body
+    /// has none and an inline array made the body over a kilobyte to move.
+    trailers: Option<Box<HeaderVec>>,
+    /// Whether the trailer section is final — the body ended cleanly —
+    /// whether or not it had any fields.
+    trailers_ready: bool,
     io: Option<Rc<RefCell<dyn BodyIo>>>,
+    /// This body's generation on its transport; see [`BodyIo::body_started`].
+    generation: u64,
+    /// Whether the transport has been told this body is finished.
+    notified: bool,
     continue_sent: bool,
     needs_continue: bool,
     done: bool,
@@ -172,6 +202,7 @@ impl BodyState {
     fn finish(&mut self) {
         self.done = true;
         self.fully_read.set(true);
+        self.notify_finished();
     }
 
     /// Mark the body finished *without* claiming it was fully read.
@@ -185,7 +216,56 @@ impl BodyState {
     fn fail(&mut self) {
         self.done = true;
         self.fully_read.set(false);
+        self.notify_finished();
     }
+
+    /// Tell the transport the body needs nothing more from it.
+    ///
+    /// `try_borrow_mut`, though nothing holds the transport when `finish` and
+    /// `fail` run: a missed call only leaves the body deadline armed, as it
+    /// was before this signal existed, where a panic would take the
+    /// connection down.
+    fn notify_finished(&mut self) {
+        if self.notified {
+            return;
+        }
+        if let Some(io) = &self.io
+            && let Ok(mut io) = io.try_borrow_mut()
+        {
+            io.body_finished(self.generation);
+            self.notified = true;
+        }
+    }
+}
+
+impl Drop for BodyState {
+    /// A body dropped before it finished awaits nothing either: whatever is
+    /// left of it on the wire, nothing will read it, and the connection closes
+    /// over it (`fully_read` stays false). Its deadline has nothing to bound.
+    fn drop(&mut self) {
+        self.notify_finished();
+    }
+}
+
+/// Register a new request body with its transport, before the body is built;
+/// both constructors call it. Returns the body's generation, and whether its
+/// finish has already been reported.
+///
+/// Before, not after: the body is then built straight into its return slot,
+/// rather than built in a local and copied out once registered.
+///
+/// A body that is finished before it is read — none, or an explicit zero
+/// length — says so through the same `BodyIo::body_finished` signal a read one
+/// does, so the connection has one flag to time the body by.
+fn register(io: &Rc<RefCell<dyn BodyIo>>, done: bool) -> (u64, bool) {
+    let Ok(mut io) = io.try_borrow_mut() else {
+        return (0, false);
+    };
+    let generation = io.body_started();
+    if done {
+        io.body_finished(generation);
+    }
+    (generation, done)
 }
 
 /// A request body.
@@ -214,8 +294,11 @@ impl Body {
                 buffered: Bytes::new(),
                 remaining: 0,
                 decoder: None,
-                trailers: Some(HeaderVec::new()),
+                trailers: None,
+                trailers_ready: true,
                 io: None,
+                generation: 0,
+                notified: false,
                 continue_sent: true,
                 needs_continue: false,
                 done: true,
@@ -245,20 +328,24 @@ impl Body {
         limits: &crate::Limits,
         fully_read: Rc<Cell<bool>>,
     ) -> Self {
-        let (remaining, decoder, done) = match kind {
-            BodyKind::None => (0, None, true),
-            BodyKind::Length(n) => (n, None, n == 0),
-            BodyKind::Chunked => (0, Some(ChunkedDecoder::new(limits)), false),
+        let (remaining, done) = match kind {
+            BodyKind::None => (0, true),
+            BodyKind::Length(n) => (n, n == 0),
+            BodyKind::Chunked => (0, false),
         };
         fully_read.set(done);
+        let (generation, notified) = register(&io, done);
         Self {
             state: BodyState {
                 kind,
                 buffered: Bytes::new(),
                 remaining,
-                decoder,
-                trailers: if done { Some(HeaderVec::new()) } else { None },
+                decoder: matches!(kind, BodyKind::Chunked).then(|| ChunkedDecoder::new(limits)),
+                trailers: None,
+                trailers_ready: done,
                 io: Some(io),
+                generation,
+                notified,
                 continue_sent: !needs_continue,
                 needs_continue,
                 done,
@@ -296,14 +383,18 @@ impl Body {
         // the native loop reuses the connection.
         let done = matches!(kind, BodyKind::None | BodyKind::Length(0));
         fully_read.set(done);
+        let (generation, notified) = register(&io, done);
         Self {
             state: BodyState {
                 kind,
                 buffered: Bytes::new(),
                 remaining: 0,
                 decoder: None,
-                trailers: if done { Some(HeaderVec::new()) } else { None },
+                trailers: None,
+                trailers_ready: done,
                 io: Some(io),
+                generation,
+                notified,
                 continue_sent: !needs_continue,
                 needs_continue,
                 done,
@@ -325,8 +416,11 @@ impl Body {
                 buffered: data,
                 remaining: len,
                 decoder: None,
-                trailers: Some(HeaderVec::new()),
+                trailers: None,
+                trailers_ready: true,
                 io: None,
+                generation: 0,
+                notified: false,
                 continue_sent: true,
                 needs_continue: false,
                 done: len == 0,
@@ -373,7 +467,13 @@ impl Body {
     /// The trailer section, once the body is fully read.
     #[inline]
     pub fn trailers(&self) -> Option<&HeaderVec> {
-        self.state.trailers.as_ref()
+        static NONE: std::sync::OnceLock<HeaderVec> = std::sync::OnceLock::new();
+        self.state.trailers_ready.then(|| {
+            self.state
+                .trailers
+                .as_deref()
+                .unwrap_or_else(|| NONE.get_or_init(HeaderVec::new))
+        })
     }
 
     /// Poll for the next body chunk.
@@ -432,7 +532,7 @@ impl Body {
                         s.remaining -= take as u64;
                         if s.remaining == 0 {
                             s.finish();
-                            s.trailers = Some(HeaderVec::new());
+                            s.trailers_ready = true;
                             // `take_buffered` is bounded by what this body is
                             // owed, but `fill` is not: it hands over the whole
                             // read, which can carry the front of the next
@@ -451,7 +551,7 @@ impl Body {
                     }
                     if s.remaining == 0 {
                         s.finish();
-                        s.trailers = Some(HeaderVec::new());
+                        s.trailers_ready = true;
                         return Poll::Ready(None);
                     }
                     match Self::fill(s, cx) {
@@ -487,14 +587,12 @@ impl Body {
                         }
                         Ok(Some(ChunkEvent::Data(d))) => return Poll::Ready(Some(Ok(d))),
                         Ok(Some(ChunkEvent::Trailers(t))) => {
-                            s.trailers = Some(*t);
+                            s.trailers = Some(t);
                             continue;
                         }
                         Ok(Some(ChunkEvent::End)) => {
                             s.finish();
-                            if s.trailers.is_none() {
-                                s.trailers = Some(HeaderVec::new());
-                            }
+                            s.trailers_ready = true;
                             // Anything left belongs to the next pipelined
                             // request; give it back rather than dropping it.
                             if !s.buffered.is_empty() {
@@ -545,6 +643,16 @@ impl Body {
                     s.fail();
                     return Poll::Ready(Some(Err(BodyError::TooLarge)));
                 }
+                // A `Content-Length` body is complete the moment its declared
+                // length is in, as natively — hyper has already held the peer
+                // to that length — not only once a later poll sees EOF. A
+                // handler that takes exactly the bytes it was promised has read
+                // the body: no body deadline left, and the connection may be
+                // reused.
+                if matches!(s.kind, BodyKind::Length(n) if s.consumed == n) {
+                    s.finish();
+                    s.trailers_ready = true;
+                }
                 return Poll::Ready(Some(Ok(chunk)));
             }
             match Self::fill(s, cx) {
@@ -556,12 +664,13 @@ impl Body {
                 Poll::Ready(Ok(false)) => {
                     // Clean EOF: hyper delivered the whole body.
                     s.finish();
-                    s.trailers = Some(
-                        s.trailers_slot
-                            .as_ref()
-                            .and_then(|slot| slot.borrow_mut().take())
-                            .unwrap_or_default(),
-                    );
+                    s.trailers = s
+                        .trailers_slot
+                        .as_ref()
+                        .and_then(|slot| slot.borrow_mut().take())
+                        .filter(|t| !t.is_empty())
+                        .map(Box::new);
+                    s.trailers_ready = true;
                     return Poll::Ready(None);
                 }
                 Poll::Ready(Ok(true)) => continue,
@@ -613,6 +722,14 @@ impl Body {
             let chunk = chunk?;
             total += chunk.len() as u64;
             if total > cap {
+                // Finished, if not read: the handler stops here, and the body
+                // deadline has nothing left to bound while it answers 413.
+                // Unless the body already ended in this very chunk — then it
+                // *was* read, the next pipelined request is already pushed
+                // back, and failing it would close the connection under it.
+                if !self.state.done {
+                    self.state.fail();
+                }
                 return Err(BodyError::TooLarge);
             }
             match (&mut acc, &first) {

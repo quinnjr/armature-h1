@@ -110,8 +110,13 @@ pub struct ChunkedDecoder {
     decoded: u64,
     max_body: u64,
     max_trailer: usize,
+    /// Trailer fields allowed, as `Limits::max_headers` bounds head fields.
+    max_trailers: usize,
     trailer_bytes: usize,
-    trailers: HeaderVec,
+    /// Allocated on the first trailer field, which almost no body has: held
+    /// inline, the array made every decoder — and every request body, which
+    /// carries one — over a kilobyte to move.
+    trailers: Option<Box<HeaderVec>>,
 }
 
 impl ChunkedDecoder {
@@ -123,8 +128,9 @@ impl ChunkedDecoder {
             decoded: 0,
             max_body: limits.max_body_bytes,
             max_trailer: limits.max_head_bytes,
+            max_trailers: limits.max_headers,
             trailer_bytes: 0,
-            trailers: HeaderVec::new(),
+            trailers: None,
         }
     }
 
@@ -227,14 +233,11 @@ impl ChunkedDecoder {
                         // Empty line ends the trailer section.
                         buf.advance(consumed);
                         self.state = State::Ending;
-                        if self.trailers.is_empty() {
-                            // Nothing to report: skip the event rather than
-                            // allocating a box to say so.
+                        let Some(trailers) = self.trailers.take() else {
+                            // Nothing to report: skip the event.
                             continue;
-                        }
-                        return Ok(Some(ChunkEvent::Trailers(Box::new(std::mem::take(
-                            &mut self.trailers,
-                        )))));
+                        };
+                        return Ok(Some(ChunkEvent::Trailers(trailers)));
                     }
 
                     let line = buf.slice(..content_len);
@@ -252,6 +255,14 @@ impl ChunkedDecoder {
             return Err(ChunkedError::BadTrailer);
         }
 
+        // A trailer section is a field section like the head's, and is held to
+        // the same rules: a bounded count, token names, and no control bytes
+        // in values. Fields that would fail the head parser must not reach a
+        // handler just because they arrived after the body.
+        if self.trailers.as_ref().map_or(0, |t| t.len()) >= self.max_trailers {
+            return Err(ChunkedError::BadTrailer);
+        }
+
         let colon = memchr::memchr(b':', line).ok_or(ChunkedError::BadTrailer)?;
         let name = &line[..colon];
         if name.is_empty() {
@@ -260,6 +271,10 @@ impl ChunkedDecoder {
         // Whitespace between the field name and the colon is rejected in a
         // trailer for the same reason as in a header (RFC 9112 section 5.1).
         if name.last().is_some_and(|b| b.is_ascii_whitespace()) {
+            return Err(ChunkedError::BadTrailer);
+        }
+
+        if !std::str::from_utf8(name).is_ok_and(crate::write::valid_field_name) {
             return Err(ChunkedError::BadTrailer);
         }
 
@@ -291,7 +306,17 @@ impl ChunkedDecoder {
             end -= 1;
         }
 
-        self.trailers.push((id, line.slice(start..end)));
+        // RFC 9110 section 5.5: CTLs other than HTAB are not field content.
+        if line[start..end]
+            .iter()
+            .any(|&b| (b < 0x20 && b != b'\t') || b == 0x7f)
+        {
+            return Err(ChunkedError::BadTrailer);
+        }
+
+        self.trailers
+            .get_or_insert_with(|| Box::new(HeaderVec::new()))
+            .push((id, line.slice(start..end)));
         Ok(())
     }
 }
@@ -340,32 +365,46 @@ fn find_line(
     }
 }
 
-/// Parse a chunk-size line: hex digits, optionally followed by `;extensions`.
+/// Parse a chunk-size line: hex digits, optionally followed by extensions.
+///
+/// `chunk-size [ chunk-ext ]` (RFC 9112 section 7.1.1). Extensions are not
+/// interpreted, but they are held to their grammar — a byte that fits no part
+/// of it means the framing is not what we think it is.
 fn parse_chunk_size(line: &[u8]) -> Result<u64, ChunkedError> {
-    let digits = match memchr::memchr(b';', line) {
-        Some(i) => {
-            // Extensions are not interpreted, but they must be printable ASCII;
-            // control bytes here mean the framing is not what we think it is.
-            if line[i + 1..]
-                .iter()
-                .any(|&b| b < 0x20 && b != b'\t' || b == 0x7f)
-            {
-                return Err(ChunkedError::BadExtension);
-            }
-            &line[..i]
-        }
-        None => line,
-    };
-
-    if digits.is_empty() {
+    let digits_end = line
+        .iter()
+        .position(|b| !b.is_ascii_hexdigit())
+        .unwrap_or(line.len());
+    let (digits, ext) = line.split_at(digits_end);
+    // Anything but an extension's start right after the digits is a bad size,
+    // not a bad extension: `5x` is a size that is not hex.
+    if digits.is_empty()
+        || ext
+            .first()
+            .is_some_and(|b| !matches!(b, b';' | b' ' | b'\t'))
+    {
         return Err(ChunkedError::BadSize);
     }
-    if digits.len() > MAX_SIZE_DIGITS {
+    if !ext.is_empty() {
+        check_chunk_ext(ext)?;
+    }
+    // Leading zeros carry no value, so they do not count against the digit
+    // limit: `00000000000000000005` is five, not an overflow. The size line as
+    // a whole is still bounded, so this cannot be stretched indefinitely.
+    //
+    // Accepting them does not open a parser differential with a conforming
+    // peer: RFC 9112 section 7.1 gives `chunk-size = 1*HEXDIG` with no length
+    // limit, and hyper — the other backend, and a common front end — reads the
+    // same value. The only peer that disagrees is one that truncates a size
+    // to a fixed number of digits, which already misreads every RFC-conforming
+    // sender; refusing here would not make it safe.
+    let significant = &digits[digits.iter().take_while(|&&b| b == b'0').count()..];
+    if significant.len() > MAX_SIZE_DIGITS {
         return Err(ChunkedError::SizeOverflow);
     }
 
     let mut size: u64 = 0;
-    for &b in digits {
+    for &b in significant {
         let d = match b {
             b'0'..=b'9' => b - b'0',
             b'a'..=b'f' => b - b'a' + 10,
@@ -378,6 +417,77 @@ fn parse_chunk_size(line: &[u8]) -> Result<u64, ChunkedError> {
             .ok_or(ChunkedError::SizeOverflow)?;
     }
     Ok(size)
+}
+
+/// Validate `chunk-ext`:
+///
+/// ```text
+/// chunk-ext      = *( BWS ";" BWS chunk-ext-name [ BWS "=" BWS chunk-ext-val ] )
+/// chunk-ext-name = token
+/// chunk-ext-val  = token / quoted-string
+/// ```
+///
+/// Anything after the size digits must parse as this, plus optional trailing
+/// whitespace; a byte at or above `0x80` is accepted only inside a quoted
+/// string, where `obs-text` allows it.
+fn check_chunk_ext(mut ext: &[u8]) -> Result<(), ChunkedError> {
+    fn bws(s: &[u8]) -> &[u8] {
+        let n = s.iter().take_while(|&&b| b == b' ' || b == b'\t').count();
+        &s[n..]
+    }
+    fn token(s: &[u8]) -> Result<&[u8], ChunkedError> {
+        let n = s
+            .iter()
+            .take_while(|&&b| crate::header::is_tchar(b))
+            .count();
+        if n == 0 {
+            return Err(ChunkedError::BadExtension);
+        }
+        Ok(&s[n..])
+    }
+    fn quoted(s: &[u8]) -> Result<&[u8], ChunkedError> {
+        let mut i = 1; // past the opening DQUOTE
+        loop {
+            match s.get(i) {
+                None => return Err(ChunkedError::BadExtension),
+                Some(b'"') => return Ok(&s[i + 1..]),
+                Some(b'\\') => match s.get(i + 1) {
+                    Some(&b)
+                        if b == b'\t' || b == b' ' || (0x21..=0x7e).contains(&b) || b >= 0x80 =>
+                    {
+                        i += 2
+                    }
+                    _ => return Err(ChunkedError::BadExtension),
+                },
+                Some(&b) if b == b'\t' || b == b' ' || (0x21..=0x7e).contains(&b) || b >= 0x80 => {
+                    i += 1
+                }
+                Some(_) => return Err(ChunkedError::BadExtension),
+            }
+        }
+    }
+
+    loop {
+        // Trailing whitespace before the CRLF is tolerated, as hyper — the
+        // other backend — tolerates it: it cannot change where the line ends,
+        // so refusing it would only split the backends for nothing.
+        ext = bws(ext);
+        if ext.is_empty() {
+            break;
+        }
+        ext = ext.strip_prefix(b";").ok_or(ChunkedError::BadExtension)?;
+        ext = token(bws(ext))?;
+        let rest = bws(ext);
+        if let Some(after_eq) = rest.strip_prefix(b"=") {
+            let v = bws(after_eq);
+            ext = if v.first() == Some(&b'"') {
+                quoted(v)?
+            } else {
+                token(v)?
+            };
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -475,6 +585,53 @@ mod tests {
             b"1f\r\n0123456789012345678901234567890\r\n0\r\n\r\n",
         );
         assert_eq!(upper.unwrap(), lower.unwrap());
+    }
+
+    #[test]
+    fn leading_zeros_do_not_count_against_the_size_digit_limit() {
+        let events = drain(&mut dec(), b"00000000000000000005\r\nhello\r\n0\r\n\r\n").unwrap();
+        assert_eq!(events[0], data("hello"));
+        assert_eq!(
+            drain(&mut dec(), b"00011111111111111111\r\n"),
+            Err(ChunkedError::SizeOverflow)
+        );
+    }
+
+    /// RFC 9112 section 7.1.1: extensions follow their grammar, with BWS
+    /// around the separators and obs-text only inside a quoted value.
+    #[test]
+    fn accepts_extensions_that_follow_the_grammar() {
+        for raw in [
+            &b"5;a\r\nhello\r\n0\r\n\r\n"[..],
+            b"5 ; a = b ;c\r\nhello\r\n0\r\n\r\n",
+            b"5;a=\"q \\\" \xe9\"\r\nhello\r\n0\r\n\r\n",
+            b"5\t;a=b\r\nhello\r\n0\r\n\r\n",
+            b"5 \r\nhello\r\n0\r\n\r\n",
+            b"5;a=b \t\r\nhello\r\n0\r\n\r\n",
+        ] {
+            let events = drain(&mut dec(), raw).unwrap_or_else(|e| panic!("{raw:?}: {e:?}"));
+            assert_eq!(events[0], data("hello"), "{raw:?}");
+        }
+    }
+
+    #[test]
+    fn rejects_extensions_outside_the_grammar() {
+        for raw in [
+            &b"5;\xe9\r\nhello\r\n0\r\n\r\n"[..],
+            b"5;a=\xe9\r\nhello\r\n0\r\n\r\n",
+            b"5;\r\nhello\r\n0\r\n\r\n",
+            b"5;a=\r\nhello\r\n0\r\n\r\n",
+            b"5;a=\"open\r\nhello\r\n0\r\n\r\n",
+            b"5;a b\r\nhello\r\n0\r\n\r\n",
+            b"5;a=\"\x01\"\r\nhello\r\n0\r\n\r\n",
+            b"5 x\r\nhello\r\n0\r\n\r\n",
+        ] {
+            assert_eq!(
+                drain(&mut dec(), raw),
+                Err(ChunkedError::BadExtension),
+                "{raw:?}"
+            );
+        }
     }
 
     #[test]
@@ -656,6 +813,62 @@ mod tests {
     fn rejects_trailer_without_colon() {
         assert_eq!(
             drain(&mut dec(), b"0\r\nnonsense\r\n\r\n"),
+            Err(ChunkedError::BadTrailer)
+        );
+    }
+
+    /// Trailer names are tokens, as head field names are.
+    #[test]
+    fn rejects_a_non_token_trailer_name() {
+        for raw in [
+            &b"0\r\nx y: a\r\n\r\n"[..],
+            b"0\r\nx\x0b: a\r\n\r\n",
+            b"0\r\nx\"q: a\r\n\r\n",
+        ] {
+            assert_eq!(
+                drain(&mut dec(), raw),
+                Err(ChunkedError::BadTrailer),
+                "{raw:?}"
+            );
+        }
+    }
+
+    /// No control bytes but HTAB in a trailer value.
+    #[test]
+    fn rejects_control_bytes_in_a_trailer_value() {
+        for raw in [
+            &b"0\r\nEtag: a\rb\r\n\r\n"[..],
+            b"0\r\nEtag: a\0b\r\n\r\n",
+            b"0\r\nEtag: a\x7fb\r\n\r\n",
+        ] {
+            assert_eq!(
+                drain(&mut dec(), raw),
+                Err(ChunkedError::BadTrailer),
+                "{raw:?}"
+            );
+        }
+        assert!(drain(&mut dec(), b"0\r\nEtag: a\tb\r\n\r\n").is_ok());
+    }
+
+    /// The trailer count is bounded by `max_headers`, not only by bytes.
+    #[test]
+    fn enforces_the_trailer_count_limit() {
+        let limits = Limits {
+            max_headers: 2,
+            ..Default::default()
+        };
+        assert!(
+            drain(
+                &mut ChunkedDecoder::new(&limits),
+                b"0\r\na: 1\r\nb: 2\r\n\r\n"
+            )
+            .is_ok()
+        );
+        assert_eq!(
+            drain(
+                &mut ChunkedDecoder::new(&limits),
+                b"0\r\na: 1\r\nb: 2\r\nc: 3\r\n\r\n"
+            ),
             Err(ChunkedError::BadTrailer)
         );
     }

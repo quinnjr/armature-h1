@@ -106,6 +106,26 @@ pub(crate) struct PhaseClock {
     /// `note_flush`. Detaching makes both no-ops rather than pointless
     /// `notify_waiters()` calls and phase flips on a dead clock.
     detached: Cell<bool>,
+    /// Whether the current request's body is finished — read to its end,
+    /// failed, or empty from the start. `body_timeout` bounds the body's
+    /// arrival, not the handler, so an expiry in [`Phase::Handler`] only
+    /// counts while this is still `false`.
+    ///
+    /// A fresh flag per request: a `Body` from an earlier request that a
+    /// handler kept alive holds the old one, so its eventual drop cannot mark
+    /// a later request's body finished.
+    request_body_finished: RefCell<Rc<Cell<bool>>>,
+    /// When the current request's body must have arrived by, set by the
+    /// bridge as the handler is called; `None` when switched off. Holds in
+    /// [`Phase::Write`] too, for a streamed response still reading the body.
+    body_deadline_at: Cell<Option<tokio::time::Instant>>,
+    /// Whether the current response's body is a stream, the only response
+    /// the request body's deadline still bounds in [`Phase::Write`] — as
+    /// natively, where only a streamed response can still be reading it.
+    response_streams: Cell<bool>,
+    /// When the phase last moved (or a write re-armed it), so the watchdog,
+    /// woken for anything else, arms only what is left of the phase's time.
+    phase_since: Cell<tokio::time::Instant>,
     notify: tokio::sync::Notify,
 }
 
@@ -117,6 +137,10 @@ impl PhaseClock {
             wrote_bytes: Cell::new(false),
             body_done: Cell::new(false),
             detached: Cell::new(false),
+            request_body_finished: RefCell::new(Rc::new(Cell::new(false))),
+            body_deadline_at: Cell::new(None),
+            response_streams: Cell::new(false),
+            phase_since: Cell::new(tokio::time::Instant::now()),
             notify: tokio::sync::Notify::new(),
         }
     }
@@ -153,6 +177,10 @@ impl PhaseClock {
             self.wrote_bytes.set(false);
             self.body_done.set(false);
         }
+        if p == Phase::Handler {
+            *self.request_body_finished.borrow_mut() = Rc::new(Cell::new(false));
+            self.response_streams.set(false);
+        }
         self.phase.set(p);
         self.bump();
     }
@@ -188,6 +216,32 @@ impl PhaseClock {
         }
     }
 
+    /// The flag the current request's body reports finishing through,
+    /// whether it was read to its end, failed, or never had any bytes.
+    pub(crate) fn request_body_finished(&self) -> Rc<Cell<bool>> {
+        self.request_body_finished.borrow().clone()
+    }
+
+    /// Wait until the clock is out of [`Phase::Write`]: the previous
+    /// response fully written.
+    ///
+    /// The notification is taken before each check, so a move landing in
+    /// between still wakes it.
+    pub(crate) async fn leave_write(&self) {
+        loop {
+            let moved = self.notify.notified();
+            if self.phase.get() != Phase::Write {
+                return;
+            }
+            moved.await;
+        }
+    }
+
+    /// Set the current request body's deadline; see `body_deadline_at`.
+    pub(crate) fn set_body_deadline(&self, at: Option<tokio::time::Instant>) {
+        self.body_deadline_at.set(at);
+    }
+
     /// Record that the response body has no more frames to give.
     pub(crate) fn note_body_end(&self) {
         self.body_done.set(true);
@@ -210,7 +264,26 @@ impl PhaseClock {
 
     fn bump(&self) {
         self.generation.set(self.generation.get().wrapping_add(1));
+        self.phase_since.set(tokio::time::Instant::now());
         self.notify.notify_waiters();
+    }
+
+    /// The request body behind `flag` is finished — read, failed or dropped.
+    ///
+    /// Wakes the watchdog, so a deadline armed for the body gives way to the
+    /// phase's own the moment the body no longer needs bounding, rather than
+    /// whenever the body's would have fired. A flag that is no longer the
+    /// current request's — a `Body` kept from an earlier one — is ignored.
+    pub(crate) fn note_request_body_finished(&self, flag: &Rc<Cell<bool>>) {
+        flag.set(true);
+        if Rc::ptr_eq(flag, &self.request_body_finished.borrow()) {
+            self.notify.notify_waiters();
+        }
+    }
+
+    /// Record whether the response being handed to hyper streams its body.
+    pub(crate) fn set_response_streams(&self, streams: bool) {
+        self.response_streams.set(streams);
     }
 }
 
@@ -231,7 +304,27 @@ async fn watchdog(clock: &PhaseClock, limits: &Limits, deadline: &mut ConnDeadli
     loop {
         let generation = clock.generation.get();
         let phase = clock.phase.get();
-        deadline.arm(phase_timeout(phase, limits));
+        // The request body's deadline, while the body is still awaited. It
+        // bounds the handler, and — as natively — a streamed response still
+        // reading the body: `write_timeout` alone would let a stream that
+        // writes heartbeats wait on a stalled body forever.
+        let body_at = clock
+            .body_deadline_at
+            .get()
+            .filter(|_| !clock.request_body_finished.borrow().get());
+        let now = tokio::time::Instant::now();
+        // What is left of the phase's own time: woken for a body finishing, the
+        // watchdog must not hand a stalled write a fresh `write_timeout`.
+        let remaining = phase_timeout(phase, limits)
+            .saturating_sub(now.saturating_duration_since(clock.phase_since.get()));
+        let arm_for = match (phase, body_at) {
+            (Phase::Handler, Some(at)) => at.saturating_duration_since(now),
+            (Phase::Write, Some(at)) if clock.response_streams.get() => {
+                remaining.min(at.saturating_duration_since(now))
+            }
+            _ => remaining,
+        };
+        deadline.arm(arm_for);
         tokio::select! {
             biased;
             () = clock.notify.notified() => continue,
@@ -239,6 +332,22 @@ async fn watchdog(clock: &PhaseClock, limits: &Limits, deadline: &mut ConnDeadli
                 // A change that landed between the snapshot and the expiry
                 // means this deadline was armed for a phase already over.
                 if clock.generation.get() != generation {
+                    continue;
+                }
+                // The body is finished — arrived in time, or failed, which
+                // awaits no more bytes either — and the handler's own runtime
+                // is not bounded, as natively. Nothing to time until the phase
+                // moves.
+                let body_done = clock.request_body_finished.borrow().get();
+                if phase == Phase::Handler && body_done {
+                    deadline.disarm();
+                    clock.notify.notified().await;
+                    continue;
+                }
+                // Armed for a body that finished just as it fired, before the
+                // wake-up could land: re-arm for what is left of the write's
+                // own time.
+                if phase == Phase::Write && body_at.is_some() && body_done {
                     continue;
                 }
                 return phase;
@@ -1589,5 +1698,42 @@ mod tests {
             assert!(!c.wrote_bytes());
             assert_eq!(c.generation.get(), generation, "a detached clock is quiet");
         }
+    }
+
+    /// The bridge waits out a previous response still being written before
+    /// it enters `Handler`: `leave_write` stays pending in `Write`, through a
+    /// write that only re-arms it, and completes once the response is out.
+    #[tokio::test]
+    async fn leave_write_waits_until_the_previous_response_is_out() {
+        let clock = Rc::new(PhaseClock::new(Phase::Write));
+        let waiting = clock.clone();
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async move {
+                let task = tokio::task::spawn_local(async move { waiting.leave_write().await });
+                tokio::task::yield_now().await;
+                assert!(!task.is_finished(), "pending while the response is written");
+                clock.note_write();
+                tokio::task::yield_now().await;
+                assert!(
+                    !task.is_finished(),
+                    "a write is not the end of the response"
+                );
+                clock.note_body_end();
+                clock.note_flush();
+                tokio::time::timeout(std::time::Duration::from_secs(1), task)
+                    .await
+                    .expect("done once the response is out")
+                    .unwrap();
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn leave_write_is_immediate_outside_write() {
+        let clock = PhaseClock::new(Phase::Idle);
+        tokio::time::timeout(std::time::Duration::from_secs(1), clock.leave_write())
+            .await
+            .expect("not in Write: nothing to wait for");
     }
 }
