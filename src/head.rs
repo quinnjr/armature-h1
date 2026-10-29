@@ -34,6 +34,11 @@ pub struct Head {
     /// stay consistent with comparing the observable fields alone: two `Head`s
     /// with equal targets necessarily have equal `query_at`.
     query_at: Option<usize>,
+    /// Byte range of the authority in an absolute-form target
+    /// (`http://authority/path`), `None` for every other form.
+    ///
+    /// Also a pure function of `target`, cached for the same reason.
+    authority_at: Option<(usize, usize)>,
 }
 
 /// Byte index of the first `?` in `target`.
@@ -46,6 +51,39 @@ fn find_query(target: &ByteStr) -> Option<usize> {
     target.as_bytes().iter().position(|&b| b == b'?')
 }
 
+/// `scheme = ALPHA *( ALPHA / DIGIT / "+" / "-" / "." )` (RFC 3986
+/// section 3.1).
+///
+/// Shared with the parser's absolute-form check, so a target the parser
+/// accepts as absolute-form is the one `Head` splits as such.
+pub(crate) fn valid_scheme(scheme: &[u8]) -> bool {
+    scheme.first().is_some_and(u8::is_ascii_alphabetic)
+        && scheme
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.'))
+}
+
+/// The authority's byte range when `target` is in absolute form: a scheme,
+/// `://`, then everything up to the first `/`, `?` or `#`.
+///
+/// Origin-form (`/...`) and asterisk-form (`*`) are never absolute, and
+/// neither is a CONNECT authority-form target, which has no `://`.
+fn find_absolute_authority(target: &[u8]) -> Option<(usize, usize)> {
+    if matches!(target.first(), Some(b'/' | b'*') | None) {
+        return None;
+    }
+    let i = target.windows(3).position(|w| w == b"://")?;
+    if !valid_scheme(&target[..i]) {
+        return None;
+    }
+    let start = i + 3;
+    let end = target[start..]
+        .iter()
+        .position(|b| matches!(b, b'/' | b'?' | b'#'))
+        .map_or(target.len(), |n| start + n);
+    Some((start, end))
+}
+
 impl Head {
     /// Assembles a `Head` from its parts, caching the target's query split.
     ///
@@ -53,12 +91,14 @@ impl Head {
     /// `?` index is private, so literal struct construction is not available.
     pub fn new(method: Method, target: ByteStr, version: Version, headers: HeaderVec) -> Head {
         let query_at = find_query(&target);
+        let authority_at = find_absolute_authority(target.as_bytes());
         Head {
             method,
             target,
             version,
             headers,
             query_at,
+            authority_at,
         }
     }
 
@@ -76,6 +116,7 @@ impl Head {
     #[inline]
     pub fn set_target(&mut self, target: ByteStr) {
         self.query_at = find_query(&target);
+        self.authority_at = find_absolute_authority(target.as_bytes());
         self.target = target;
     }
 
@@ -110,12 +151,79 @@ impl Head {
     /// [`ByteStr::as_str`], which stays because the crate forbids `unsafe` and
     /// so cannot skip the check.
     #[inline]
+    ///
+    /// For an absolute-form target (`GET http://a.example/x`), the path
+    /// component alone: `/x`, or `/` when the URI's path is empty (RFC 9112
+    /// section 3.2.1). The scheme and authority are not part of the path, and
+    /// a router or an auth check matching on a leading `/` must not see them;
+    /// read the authority with [`authority`](Self::authority).
     pub fn path(&self) -> &str {
         let t = self.target.as_str();
-        match self.query_at {
-            Some(i) => &t[..i],
-            None => t,
+        let end = self.query_at.unwrap_or(t.len());
+        match self.authority_at {
+            Some((_, path_start)) if path_start < end => &t[path_start..end],
+            Some(_) => "/",
+            None => &t[..end],
         }
+    }
+
+    /// The authority the request is for: the target's own for an
+    /// absolute-form or CONNECT authority-form target, the `Host` field's
+    /// otherwise.
+    ///
+    /// `None` when there is none: no `Host`, or an empty one.
+    ///
+    /// RFC 9112 section 3.2.2 makes the target's authority win over `Host`.
+    /// [`framing::decide`](crate::framing::decide) also rejects a request
+    /// whose `Host` disagrees with it, so after that check the two never
+    /// differ; this is the one accessor to route or authorize on regardless.
+    ///
+    /// ```
+    /// use armature_h1::{Limits, framing, parse_head};
+    /// use bytes::Bytes;
+    ///
+    /// let raw = Bytes::from_static(
+    ///     b"GET http://a.example:8080/admin?x=1 HTTP/1.1\r\nHost: a.example:8080\r\n\r\n",
+    /// );
+    /// let (head, _) = parse_head(&raw, &Limits::default()).unwrap().unwrap();
+    /// assert!(framing::decide(&head, &Limits::default()).is_ok());
+    /// assert_eq!(head.authority(), Some("a.example:8080"));
+    /// assert_eq!(head.path(), "/admin");
+    ///
+    /// let raw = Bytes::from_static(b"GET /x HTTP/1.1\r\nHost: b.example\r\n\r\n");
+    /// let (head, _) = parse_head(&raw, &Limits::default()).unwrap().unwrap();
+    /// assert_eq!(head.authority(), Some("b.example"));
+    /// ```
+    pub fn authority(&self) -> Option<&str> {
+        if let Some((start, end)) = self.authority_at {
+            return Some(&self.target.as_str()[start..end]);
+        }
+        if self.method == Method::Connect {
+            return Some(self.target.as_str());
+        }
+        // An empty `Host` says the target has no authority (RFC 9112 section
+        // 3.2), so it names none.
+        self.get_str(&HeaderId::Host).filter(|h| !h.is_empty())
+    }
+
+    /// The scheme of an absolute-form target, as received; `None` for every
+    /// other form.
+    ///
+    /// ```
+    /// use armature_h1::{Limits, parse_head};
+    /// use bytes::Bytes;
+    ///
+    /// let raw = Bytes::from_static(b"GET HTTPS://a.example/ HTTP/1.1\r\nHost: a.example\r\n\r\n");
+    /// let (head, _) = parse_head(&raw, &Limits::default()).unwrap().unwrap();
+    /// assert_eq!(head.absolute_scheme(), Some("HTTPS"));
+    ///
+    /// let raw = Bytes::from_static(b"GET / HTTP/1.1\r\nHost: a.example\r\n\r\n");
+    /// let (head, _) = parse_head(&raw, &Limits::default()).unwrap().unwrap();
+    /// assert_eq!(head.absolute_scheme(), None);
+    /// ```
+    pub fn absolute_scheme(&self) -> Option<&str> {
+        self.authority_at
+            .map(|(start, _)| &self.target.as_str()[..start - 3])
     }
 
     /// The target after the first `?`, or `None` when there is no `?`.
@@ -138,10 +246,8 @@ impl Head {
         // Byte-level, OWS-only trimming: `str::trim` would also strip Unicode
         // whitespace and read `close\xC2\xA0` as `close`, disagreeing with
         // every other hop on the connection's fate.
-        self.all(&HeaderId::Connection).any(|v| {
-            v.split(|&b| b == b',')
-                .any(|t| crate::framing::trim_ows(t).eq_ignore_ascii_case(token.as_bytes()))
-        })
+        self.all(&HeaderId::Connection)
+            .any(|v| crate::header::value_has_token(v, token))
     }
 
     /// Whether the connection should persist after this request.
@@ -190,6 +296,46 @@ mod tests {
         assert!(!with_connection(b"close\xC2\xA0").connection_has_token("close"));
         assert!(!with_connection(b"\xC2\x85close").connection_has_token("close"));
         assert!(!with_connection(b"close\xE3\x80\x80").connection_has_token("close"));
+    }
+
+    /// An absolute-form target's path excludes the scheme and authority.
+    #[test]
+    fn absolute_form_path_is_the_path_component() {
+        let h = get("http://a.example:8080/admin/x?y=1");
+        assert_eq!(h.path(), "/admin/x");
+        assert_eq!(h.query(), Some("y=1"));
+        assert_eq!(h.authority(), Some("a.example:8080"));
+        assert_eq!(h.absolute_scheme(), Some("http"));
+    }
+
+    /// RFC 9112 section 3.2.1: an empty path is `/`.
+    #[test]
+    fn absolute_form_with_an_empty_path_is_root() {
+        assert_eq!(get("http://a.example").path(), "/");
+        let h = get("http://a.example?q");
+        assert_eq!(h.path(), "/");
+        assert_eq!(h.query(), Some("q"));
+    }
+
+    #[test]
+    fn origin_form_authority_is_the_host_field() {
+        let mut v = HeaderVec::new();
+        v.push((
+            crate::header::HeaderId::Host,
+            bytes::Bytes::from_static(b"a.example"),
+        ));
+        let h = Head::new(Method::Get, ByteStr::from_static("/x"), Version::Http11, v);
+        assert_eq!(h.path(), "/x");
+        assert_eq!(h.authority(), Some("a.example"));
+        assert_eq!(h.absolute_scheme(), None);
+    }
+
+    #[test]
+    fn set_target_recomputes_the_absolute_split() {
+        let mut h = get("http://a.example/x");
+        h.set_target(ByteStr::from_static("/y"));
+        assert_eq!(h.path(), "/y");
+        assert_eq!(h.absolute_scheme(), None);
     }
 
     #[test]

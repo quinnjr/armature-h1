@@ -144,7 +144,18 @@ impl<S: H1Service + 'static>
         Box::pin(async move {
             // The head is parsed by the time hyper calls us: everything from
             // here to the response is the native loop's handler/body window.
+            // hyper calls the service for an already-buffered pipelined
+            // request once the previous response is *buffered*, not written.
+            // Entering `Handler` now would drop that response's write
+            // deadline and let a body-phase 408 be spliced into its unwritten
+            // tail. So wait, as natively, until it is out: hyper keeps
+            // flushing while it polls this future, and `write_timeout` still
+            // bounds the wait.
+            phase.leave_write().await;
             phase.set(Phase::Handler);
+            phase.set_body_deadline(
+                tokio::time::Instant::now().checked_add(cfg.limits.body_timeout),
+            );
             // Recorded before anything can fail so a 408 raised anywhere in
             // this window carries the request's version, as native's does.
             req_version.set(from_wire(req.version()).unwrap_or(Version::Http11));
@@ -170,11 +181,17 @@ impl<S: H1Service + 'static>
                 }
             };
 
-            let wants_upgrade =
-                head.count(&HeaderId::Upgrade) > 0 && head.connection_has_token("upgrade");
-            let expects_continue = head
-                .get_str(&HeaderId::Expect)
-                .is_some_and(|v| v.eq_ignore_ascii_case("100-continue"));
+            // HTTP/1.1 only, as natively (RFC 9110 sections 7.8, 15.2).
+            let wants_upgrade = head.version == Version::Http11
+                && head.count(&HeaderId::Upgrade) > 0
+                && head.connection_has_token("upgrade");
+            // HTTP/1.1 only, as natively: hyper itself sends no interim
+            // response to a 1.0 client, and `Body::continue_pending` must not
+            // say one is owed when it never will be.
+            let expects_continue = head.version == Version::Http11
+                && head
+                    .get_str(&HeaderId::Expect)
+                    .is_some_and(|v| v.eq_ignore_ascii_case("100-continue"));
 
             // Captured before `head` moves into the `Request`: hyper writes the
             // status line from the response's own version, so a 1.0 request
@@ -193,7 +210,7 @@ impl<S: H1Service + 'static>
             let fully_read = Rc::new(Cell::new(false));
             let trailers_slot = Rc::new(RefCell::new(None));
             let body_io: Rc<RefCell<dyn crate::service::BodyIo>> = Rc::new(RefCell::new(
-                HyperBodyIo::new(incoming, trailers_slot.clone()),
+                HyperBodyIo::new(incoming, trailers_slot.clone()).with_clock(phase.clone()),
             ));
             let body = Body::from_backend(
                 kind,
@@ -204,7 +221,31 @@ impl<S: H1Service + 'static>
                 trailers_slot,
             );
 
-            let resp = service.call(Request { head, body, peer }).await;
+            let call = service.call(Request { head, body, peer });
+            // Parity with `conn::Connection::serve`: `handler_timeout` bounds
+            // the handler and answers a bare 503 — the same `reject` shape
+            // native's `write_error` produces — then the connection closes.
+            let mut resp = match cfg.limits.handler_timeout {
+                Some(after) => match tokio::time::timeout(after, call).await {
+                    Ok(resp) => resp,
+                    Err(_) => {
+                        phase.set(Phase::Write);
+                        return Ok(reject(503, version, phase));
+                    }
+                },
+                None => call.await,
+            };
+            // Parity with `conn::write_response`: a status no final response
+            // can carry becomes a 500, without the fields and body that went
+            // with it, and the connection closes.
+            let impossible_status = !crate::write::is_final_status(resp.status, wants_upgrade);
+            if impossible_status {
+                tracing::warn!(
+                    status = resp.status,
+                    "handler returned a status that cannot be a final response; sending 500"
+                );
+                resp = crate::service::Response::new(500);
+            }
 
             // `fully_read` gates the handoff for the same reason it gates reuse
             // below, and on exactly the signal `conn::write_response` calls
@@ -226,7 +267,7 @@ impl<S: H1Service + 'static>
             // wire under the bespoke stack; the observable contract is that
             // the connection is not reused. hyper *can* drain, but strict
             // parity wins: force close.
-            let force_close = !upgrading && !fully_read.get();
+            let force_close = !upgrading && (!fully_read.get() || impossible_status);
 
             // The handler window is over. Response writing is hyper's, under
             // `write_timeout` (see BACKENDS.md on write_timeout granularity).
@@ -243,12 +284,28 @@ impl<S: H1Service + 'static>
             if is_head_request {
                 phase.note_body_end();
             }
+            // An HTTP/1.0 streamed body that is actually written has no framing
+            // but the close (hyper delimits it so, and closes): say `close`,
+            // as native does, rather than promise a persistence hyper will not
+            // keep.
+            let close_delimited = version == Version::Http10
+                && matches!(resp.body, crate::service::ResponseBody::Stream(_))
+                && !is_head_request
+                && !crate::write::forbids_body_framing(resp.status);
+            // Only a stream hyper will actually poll: none for a HEAD, nor
+            // for a status whose body is dropped.
+            phase.set_response_streams(
+                matches!(resp.body, crate::service::ResponseBody::Stream(_))
+                    && !is_head_request
+                    && !crate::write::forbids_body_framing(resp.status),
+            );
             Ok(convert_response(
                 resp,
                 &cfg,
                 version,
                 phase,
-                keep_alive && !force_close,
+                keep_alive && !force_close && !close_delimited,
+                is_head_request,
             ))
         })
     }
@@ -309,6 +366,9 @@ fn convert_response(
     // `keep_alive`: the request asked for it *and* nothing (an unread body, a
     // rejection) forces a close.
     keep_alive: bool,
+    // A `HEAD` response's `Content-Length` describes the `GET` body, as the
+    // native writer treats it.
+    head_request: bool,
 ) -> BridgeResponse {
     let crate::service::Response {
         status,
@@ -363,7 +423,15 @@ fn convert_response(
     // `Content-Length: 1234` under hyper that the native writer strips, and an
     // intermediary that honours the field then waits for a body that never
     // comes: a keep-alive desync reached through a backend divergence.
-    let check_content_length = !crate::write::content_length_is_descriptive(status.as_u16());
+    //
+    // The rule itself is `write::handler_length_is_stale`, shared with the
+    // native writer so the two cannot drift. The bridge always drops a
+    // handler `Transfer-Encoding` (below), so no length here ever competes
+    // with one.
+    let length_instances = headers
+        .iter()
+        .filter(|(id, v)| *id == HeaderId::ContentLength && crate::write::valid_field_value(v))
+        .count();
 
     // hyper writes the status line — and picks its framing — from the
     // response's version, so it has to carry the request's.
@@ -371,7 +439,14 @@ fn convert_response(
         .status(status)
         .version(wire_version(version));
     let mut has_server = false;
-    let mut has_connection = false;
+    // A handler's `Connection` tokens other than the persistence ones.
+    let mut connection_tokens: Vec<Vec<u8>> = Vec::new();
+    // Parity with `conn::write_response`: a handler `Connection: close` is
+    // acted on, not just echoed.
+    let keep_alive = keep_alive
+        && !headers.iter().any(|(id, v)| {
+            *id == HeaderId::Connection && crate::header::value_has_token(v, "close")
+        });
     for (id, value) in headers.into_iter() {
         // `expected_len.is_none()` is tested first and on its own: a `Stream`
         // has no length any field could agree with, and an *unparseable* value
@@ -379,9 +454,15 @@ fn convert_response(
         // `content-length: abc` through on a stream body — the one combination
         // where hyper has neither a length of its own to fall back on nor a
         // reason to trust the field.
-        if check_content_length
-            && id == HeaderId::ContentLength
-            && (expected_len.is_none() || crate::write::parse_len(&value) != expected_len)
+        if id == HeaderId::ContentLength
+            && crate::write::handler_length_is_stale(
+                &value,
+                length_instances,
+                status.as_u16(),
+                head_request,
+                expected_len,
+                false,
+            )
         {
             tracing::warn!("dropping response content-length that disagrees with the body length");
             continue;
@@ -402,7 +483,22 @@ fn convert_response(
         // closes unconditionally (it closes on `body_consumed` regardless of
         // what the handler wrote). Dropping the handler's value is the only
         // lever the bridge has over hyper's accounting.
-        if id == HeaderId::Connection && !keep_alive {
+        //
+        // As natively, only the persistence tokens are dropped: `upgrade` and
+        // any other token beside them stays, or a 101 loses the
+        // `Connection: upgrade` its handshake needs.
+        // The filter is `write`'s, so the backends cannot disagree on which
+        // tokens are the server's; a field with none of them passes as is.
+        //
+        // Gathered rather than written: hyper 1.11 decides keep-alive from
+        // the *first* `Connection` value alone, so a handler's `x-hop`
+        // followed by the server's `keep-alive` would close a connection the
+        // response says stays open. Everything goes out as one value below.
+        if id == HeaderId::Connection {
+            // Through `write`'s filter, token by token, so exactly the
+            // tokens the native writer sends go out here too, and one
+            // malformed token cannot sink the combined value.
+            connection_tokens.extend(crate::write::connection_tokens(&value).map(<[u8]>::to_vec));
             continue;
         }
         // Dropped rather than written, for the reason the native writer gives:
@@ -431,9 +527,6 @@ fn convert_response(
         if id == HeaderId::Server {
             has_server = true;
         }
-        if id == HeaderId::Connection {
-            has_connection = true;
-        }
         builder = builder.header(name, value);
     }
     if !has_server
@@ -443,17 +536,35 @@ fn convert_response(
         builder = builder.header(::hyper::http::header::SERVER, v);
     }
     // The same decision the native writer emits from, taken from the same
-    // function rather than restated here, so the two backends cannot drift: a
-    // handler that set `Connection` itself owns the field; HTTP/1.1
+    // function rather than restated here, so the two backends cannot drift:
+    // HTTP/1.1
     // persistence is the default and saying so would be noise; HTTP/1.0
     // persistence has to be stated, because hyper closes a 1.0 connection
     // whose response does not; and a connection that will not persist says so,
     // which hyper leaves implicit on 1.0.
-    if !has_connection && let Some(field) = crate::write::connection_field(version, keep_alive) {
-        builder = builder.header(
-            ::hyper::http::header::CONNECTION,
-            ::hyper::http::HeaderValue::from_static(field),
-        );
+    // The persistence token is always the server's own, and a 101's
+    // connection continues as another protocol, where it means nothing.
+    //
+    // One `Connection` value carrying the handler's other tokens and the
+    // server's own, so every hyper version reads the persistence decision —
+    // 1.11 looks at the first value only.
+    let server_token = (status != ::hyper::http::StatusCode::SWITCHING_PROTOCOLS)
+        .then(|| crate::write::connection_field(version, keep_alive))
+        .flatten();
+    if connection_tokens.is_empty() {
+        if let Some(field) = server_token {
+            builder = builder.header(
+                ::hyper::http::header::CONNECTION,
+                ::hyper::http::HeaderValue::from_static(field),
+            );
+        }
+    } else {
+        if let Some(field) = server_token {
+            connection_tokens.push(field.as_bytes().to_vec());
+        }
+        if let Ok(v) = ::hyper::http::HeaderValue::from_bytes(&connection_tokens.join(&b", "[..])) {
+            builder = builder.header(::hyper::http::header::CONNECTION, v);
+        }
     }
 
     builder
@@ -595,7 +706,7 @@ mod tests {
             server_name,
         };
         let clock = Rc::new(PhaseClock::new(Phase::Write));
-        convert_response(resp, &cfg, version, clock, keep_alive)
+        convert_response(resp, &cfg, version, clock, keep_alive, false)
     }
 
     fn header_of(r: &BridgeResponse, name: &str) -> Option<String> {
@@ -744,6 +855,41 @@ mod tests {
     /// HTTP/1.0 persistence has to be stated: hyper closes a 1.0 connection
     /// whose response does not say otherwise, and the native writer emits
     /// exactly this field for the same case.
+    /// A malformed handler token is dropped on its own; the server's
+    /// persistence token still goes out.
+    #[test]
+    fn a_malformed_connection_token_does_not_sink_the_servers() {
+        let out = conv_full(
+            crate::service::Response::new(200)
+                .header(HeaderId::Connection, Bytes::from_static(b"x\x01y, x-hop")),
+            Version::Http11,
+            false,
+            None,
+        );
+        let values: Vec<_> = out.headers().get_all("connection").iter().collect();
+        assert_eq!(values.len(), 1, "{values:?}");
+        assert_eq!(values[0].as_bytes(), b"x-hop, close");
+    }
+
+    /// One `Connection` value carrying both the handler's other tokens and
+    /// the server's persistence token: hyper 1.11 reads the first value only,
+    /// and would close a connection the response says stays open.
+    #[test]
+    fn connection_tokens_go_out_as_one_value() {
+        let out = conv_full(
+            crate::service::Response::new(200).header(
+                HeaderId::Connection,
+                Bytes::from_static(b"keep-alive, x-hop"),
+            ),
+            Version::Http10,
+            true,
+            None,
+        );
+        let values: Vec<_> = out.headers().get_all("connection").iter().collect();
+        assert_eq!(values.len(), 1, "{values:?}");
+        assert_eq!(values[0].as_bytes(), b"x-hop, keep-alive");
+    }
+
     #[test]
     fn http10_keep_alive_is_stated_and_http11_is_not() {
         let out = conv_full(

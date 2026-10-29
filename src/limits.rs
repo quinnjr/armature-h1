@@ -27,7 +27,7 @@ pub struct Limits {
     /// Maximum header field count. Exceeding this yields 431 and closes.
     ///
     /// Values above [`MAX_HEADERS_CEILING`] are clamped to it, with a
-    /// `tracing::warn!`, by [`Limits::clamp_max_headers`] — called from both
+    /// `tracing::warn!`, by `Limits::clamp_max_headers` (crate-internal) — called from both
     /// [`Config::limits`](crate::server::Config::limits) and the worker setup
     /// in `server::worker_loop`, since `Config`'s fields are public and so
     /// `cfg.limits` can also be set directly, bypassing the former — the
@@ -38,8 +38,39 @@ pub struct Limits {
     pub max_body_bytes: u64,
     /// Deadline for the complete head to arrive once the first byte does.
     pub header_timeout: Duration,
-    /// Deadline for the complete body to arrive once the head is parsed.
+    /// Deadline for the complete body to arrive, counted from when its
+    /// handler is called — after any earlier pipelined responses have been
+    /// written, which is `write_timeout`'s to bound, not the body's.
+    ///
+    /// It bounds the body, not the handler: once the body has been read to
+    /// its end, or when the request has none, the handler may run as long as
+    /// it needs. A body still incomplete at the deadline — the peer stalled,
+    /// or the handler is not reading it — gets a `408` and a close.
     pub body_timeout: Duration,
+    /// Deadline for a handler to produce its response, counted from when it is
+    /// called — less any time spent first writing earlier pipelined responses
+    /// to a slow reader, which is `write_timeout`'s to bound. `None` (the
+    /// default) leaves handlers unbounded.
+    ///
+    /// Separate from [`body_timeout`](Self::body_timeout), which bounds the
+    /// peer: this bounds the server's own work, so a handler waiting on a
+    /// downstream that never answers cannot hold its connection — and its
+    /// `max_connections` slot — forever. Expiry answers `503 Service
+    /// Unavailable` and closes. Off by default because long-polling and
+    /// streaming-setup handlers legitimately run for as long as they like.
+    ///
+    /// ```
+    /// use armature_h1::Limits;
+    /// use std::time::Duration;
+    ///
+    /// let limits = Limits {
+    ///     handler_timeout: Some(Duration::from_secs(5)),
+    ///     ..Default::default()
+    /// };
+    /// assert_eq!(Limits::default().handler_timeout, None, "off unless asked for");
+    /// assert_eq!(limits.handler_timeout, Some(Duration::from_secs(5)));
+    /// ```
+    pub handler_timeout: Option<Duration>,
     /// Deadline for the next request to begin on an idle keep-alive connection.
     pub idle_timeout: Duration,
     /// Deadline for a response write to complete.
@@ -83,6 +114,7 @@ impl Default for Limits {
             idle_timeout: Duration::from_secs(75),
             write_timeout: Duration::from_secs(30),
             max_connections: DEFAULT_MAX_CONNECTIONS_PER_WORKER,
+            handler_timeout: None,
         }
     }
 }

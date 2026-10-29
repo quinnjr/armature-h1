@@ -71,9 +71,14 @@ Run it: `cargo run -p armature-h1 --release --example hello`
 ## The thread-per-core model, and its cost
 
 N pinned OS threads, each running a `current_thread` runtime. On Unix each thread
-owns its own `SO_REUSEPORT` listener, so the kernel load-balances accepts and a
-connection never migrates cores. Windows, Solaris, and illumos fall back to
-duplicated handles on one shared listener.
+owns its own `SO_REUSEPORT` listener. The kernel spreads accepts by a hash of
+the connection's addresses rather than by load, which with a few long-lived
+keep-alive connections can leave one core with twice another's share; so a
+worker that accepts while holding at least two more open connections than the
+least loaded one it finds hands the socket to that one before serving
+anything. Once a connection is being served it never
+migrates cores. Windows, Solaris, and illumos fall back to duplicated handles on
+one shared listener, balanced the same way.
 
 Because nothing migrates, per-core state needs no synchronization: the `Date`
 cache, route caches, and your own service state are all plain
