@@ -284,8 +284,13 @@ impl<S: H1Service + 'static>
                 && matches!(resp.body, crate::service::ResponseBody::Stream(_))
                 && !is_head_request
                 && !crate::write::forbids_body_framing(resp.status);
-            phase
-                .set_response_streams(matches!(resp.body, crate::service::ResponseBody::Stream(_)));
+            // Only a stream hyper will actually poll: none for a HEAD, nor
+            // for a status whose body is dropped.
+            phase.set_response_streams(
+                matches!(resp.body, crate::service::ResponseBody::Stream(_))
+                    && !is_head_request
+                    && !crate::write::forbids_body_framing(resp.status),
+            );
             Ok(convert_response(
                 resp,
                 &cfg,

@@ -470,14 +470,12 @@ where
             // exists before the handler is even called, so a handler that
             // panics — in `call` itself or in its first poll — does not take
             // finished responses down with it.
-            // `None` when it cannot be represented: `Duration::MAX` is how the
-            // deadline is switched off.
-            self.body_deadline_at =
-                tokio::time::Instant::now().checked_add(self.cfg.limits.body_timeout);
+            self.start_body_deadline();
             let mut held = None;
             if !self.out.is_empty() {
                 if expects_continue {
                     self.flush().await?;
+                    self.start_body_deadline();
                 } else {
                     held = Some(HeldOutput {
                         shared: self.shared.clone(),
@@ -506,7 +504,10 @@ where
                     self.out = bytes;
                     match polled {
                         Poll::Ready(resp) => early = Some(resp),
-                        Poll::Pending => self.flush().await?,
+                        Poll::Pending => {
+                            self.flush().await?;
+                            self.start_body_deadline();
+                        }
                     }
                 }
 
@@ -739,6 +740,18 @@ where
                 }
             }
         }
+    }
+
+    /// Start the current request body's deadline from now.
+    ///
+    /// Restarted after earlier pipelined responses are flushed: writing them to
+    /// a slow reader is `write_timeout`'s to bound, and must not spend a body
+    /// that arrived in time — the hyper backend starts the same clock at the
+    /// service call, after the previous response is out. `None` when it cannot
+    /// be represented: `Duration::MAX` is how the deadline is switched off.
+    fn start_body_deadline(&mut self) {
+        self.body_deadline_at =
+            tokio::time::Instant::now().checked_add(self.cfg.limits.body_timeout);
     }
 
     /// Whether what is already buffered has begun a request; see
@@ -1995,6 +2008,69 @@ mod tests {
         assert!(out.contains("kept"), "{out}");
         assert!(out.contains("second"), "the later stream ran intact: {out}");
         assert!(out.ends_with("0\r\n\r\n"), "{out}");
+    }
+
+    /// Flushing earlier pipelined responses to a slow reader does not spend
+    /// the next request's body deadline: a body that arrived in time is
+    /// served, as under the hyper backend.
+    #[tokio::test]
+    async fn a_slow_flush_of_held_responses_does_not_expire_the_next_body() {
+        let service = |mut req: Request| async move {
+            if req.head.path() == "/big" {
+                let mut r = Response::new(200);
+                r.body = ResponseBody::Full(Bytes::from(vec![b'a'; 30 * 1024]));
+                return r;
+            }
+            // Pending on something else first, so held output is flushed — and
+            // for longer than that flush takes, so the handler is still waiting
+            // when the body deadline is checked after it.
+            tokio::time::sleep(Duration::from_millis(600)).await;
+            let body = req.body.collect(64).await.expect("body");
+            let mut r = Response::new(200);
+            r.body = ResponseBody::Full(body);
+            r
+        };
+        let (mut client, server) = tokio::io::duplex(1024);
+        let local = tokio::task::LocalSet::new();
+        let conn = Connection::new(
+            server,
+            service,
+            cfg(Limits {
+                body_timeout: Duration::from_millis(200),
+                ..Default::default()
+            }),
+            Rc::new(RefCell::new(DateCache::new())),
+        );
+        let server_task = local.spawn_local(async move { conn.serve().await });
+        let out = local
+            .run_until(async move {
+                client
+                    .write_all(
+                        b"GET /big HTTP/1.1\r\nHost: a\r\n\r\n\
+                          POST /x HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello",
+                    )
+                    .await
+                    .unwrap();
+                // A slow reader: the held response cannot finish flushing
+                // until well past the body deadline.
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                let mut out = Vec::new();
+                let _ = tokio::time::timeout(Duration::from_secs(3), client.read_to_end(&mut out))
+                    .await;
+                let _ = server_task.await;
+                String::from_utf8_lossy(&out).into_owned()
+            })
+            .await;
+        assert!(
+            !out.contains(" 408 "),
+            "{}",
+            &out[out.len().saturating_sub(200)..]
+        );
+        assert!(
+            out.ends_with("hello"),
+            "{}",
+            &out[out.len().saturating_sub(200)..]
+        );
     }
 
     /// RFC 9110 sections 10.1.1 and 15.2: no 1xx to an HTTP/1.0 client.
