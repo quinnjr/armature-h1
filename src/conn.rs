@@ -925,9 +925,21 @@ where
                                     // connection forever. The head is out, so
                                     // there is no 408 to give; the connection
                                     // closes.
+                                    //
+                                    // Only while the request's `Body` is still
+                                    // alive: it holds the one reference to the
+                                    // transport besides this connection's, so a
+                                    // count above one says something can still
+                                    // read it. A body the handler dropped unread
+                                    // awaits nothing, and a download or event
+                                    // stream answering it must not be cut off.
+                                    let body_awaited = |shared: &Rc<RefCell<IoState<IO>>>| {
+                                        Rc::strong_count(shared) > 1
+                                            && !shared.borrow().body_finished
+                                    };
                                     let bounded = self
                                         .body_deadline_at
-                                        .filter(|_| !self.shared.borrow().body_finished);
+                                        .filter(|_| body_awaited(&self.shared));
                                     match bounded {
                                         None => {
                                             std::future::poll_fn(|cx| s.as_mut().poll_next(cx))
@@ -937,10 +949,12 @@ where
                                             self.deadline.arm(at.saturating_duration_since(
                                                 tokio::time::Instant::now(),
                                             ));
-                                            let shared = self.shared.clone();
+                                            // Borrowed, not cloned: a clone
+                                            // would itself count as a reader.
+                                            let shared = &self.shared;
                                             let deadline = &mut self.deadline;
                                             let item = std::future::poll_fn(|cx| {
-                                                if !shared.borrow().body_finished
+                                                if body_awaited(shared)
                                                     && deadline.poll_expired(cx).is_ready()
                                                 {
                                                     return Poll::Ready(None);
@@ -1880,8 +1894,61 @@ mod tests {
         )
         .await;
         assert!(out.starts_with("HTTP/1.1 200 OK"), "{out}");
-        assert!(closed, "the connection must close at the body deadline: {out}");
+        assert!(
+            closed,
+            "the connection must close at the body deadline: {out}"
+        );
         assert!(!out.ends_with("0\r\n\r\n"), "never a clean end: {out}");
+    }
+
+    /// Yields a chunk, waits `pause`, yields another, ends.
+    struct PausingStream {
+        pause: std::pin::Pin<Box<tokio::time::Sleep>>,
+        stage: u8,
+    }
+
+    impl crate::service::futures_stream::Stream for PausingStream {
+        fn poll_next(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<Bytes, crate::BodyError>>> {
+            match self.stage {
+                0 => {
+                    self.stage = 1;
+                    Poll::Ready(Some(Ok(Bytes::from_static(b"first"))))
+                }
+                1 => {
+                    if self.pause.as_mut().poll(cx).is_pending() {
+                        return Poll::Pending;
+                    }
+                    self.stage = 2;
+                    Poll::Ready(Some(Ok(Bytes::from_static(b"second"))))
+                }
+                _ => Poll::Ready(None),
+            }
+        }
+    }
+
+    /// A body the handler dropped unread awaits nothing, so a stream answering
+    /// it — a download, an event feed — runs past the body deadline intact.
+    #[tokio::test]
+    async fn a_stream_after_a_dropped_body_is_not_cut_off_at_the_body_deadline() {
+        let out = exchange(
+            b"POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello",
+            |_req: Request| async {
+                Response::ok().with_body(ResponseBody::Stream(Box::pin(PausingStream {
+                    pause: Box::pin(tokio::time::sleep(Duration::from_millis(500))),
+                    stage: 0,
+                })))
+            },
+            Limits {
+                body_timeout: Duration::from_millis(200),
+                ..Default::default()
+            },
+        )
+        .await;
+        assert!(out.contains("second"), "{out}");
+        assert!(out.ends_with("0\r\n\r\n"), "a clean end: {out}");
     }
 
     /// RFC 9110 sections 10.1.1 and 15.2: no 1xx to an HTTP/1.0 client.

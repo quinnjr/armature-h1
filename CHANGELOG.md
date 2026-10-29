@@ -41,7 +41,10 @@ match it (4 → 2), and a pipelined batch is served at roughly 4.5× the rate.
 - `Head::path()` returns only the path component of an absolute-form target
   (`/` when empty). New `Head::authority()` and `Head::absolute_scheme()`.
 - `Limits::body_timeout` bounds the body's arrival, not the handler: a handler
-  runs unbounded once its body is read, or when there is none.
+  runs unbounded once its body is read, or when there is none. A streamed
+  response that is still reading the request body stays under it, and closes
+  the connection if the peer stalls; one whose body was dropped unread does
+  not.
 - The `tls` feature requires `rustls-webpki` 0.103.16 (RUSTSEC-2026-0382).
 - `Limits::handler_timeout` (default `None`) bounds a handler's own runtime,
   answering `503` and closing.

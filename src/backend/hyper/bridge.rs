@@ -470,10 +470,14 @@ fn convert_response(
         // followed by the server's `keep-alive` would close a connection the
         // response says stays open. Everything goes out as one value below.
         if id == HeaderId::Connection {
-            if crate::write::valid_field_value(&value) {
-                connection_tokens
-                    .extend(crate::write::non_persistence_tokens(&value).map(<[u8]>::to_vec));
-            }
+            // Token by token, each held to hyper's own rule: one malformed
+            // token must not sink the combined value, and the server's
+            // persistence token with it.
+            connection_tokens.extend(
+                crate::write::non_persistence_tokens(&value)
+                    .filter(|t| ::hyper::http::HeaderValue::from_bytes(t).is_ok())
+                    .map(<[u8]>::to_vec),
+            );
             continue;
         }
         // Dropped rather than written, for the reason the native writer gives:
@@ -830,6 +834,22 @@ mod tests {
     /// HTTP/1.0 persistence has to be stated: hyper closes a 1.0 connection
     /// whose response does not say otherwise, and the native writer emits
     /// exactly this field for the same case.
+    /// A malformed handler token is dropped on its own; the server's
+    /// persistence token still goes out.
+    #[test]
+    fn a_malformed_connection_token_does_not_sink_the_servers() {
+        let out = conv_full(
+            crate::service::Response::new(200)
+                .header(HeaderId::Connection, Bytes::from_static(b"x\x01y, x-hop")),
+            Version::Http11,
+            false,
+            None,
+        );
+        let values: Vec<_> = out.headers().get_all("connection").iter().collect();
+        assert_eq!(values.len(), 1, "{values:?}");
+        assert_eq!(values[0].as_bytes(), b"x-hop, close");
+    }
+
     /// One `Connection` value carrying both the handler's other tokens and
     /// the server's persistence token: hyper 1.11 reads the first value only,
     /// and would close a connection the response says stays open.
