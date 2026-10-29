@@ -7,6 +7,11 @@ and this crate adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.h
 
 ## [Unreleased]
 
+### Security
+
+- An empty `Host` beside an absolute-form or CONNECT target that names an authority is now refused with `400` (`FramingError::HostMismatch`) and a close, on both backends. It used to be accepted, so an application or proxy reading `Host` saw no host while `Head::authority()` returned the target's, e.g. `GET http://internal/` with `Host:`. An empty `Host` with an origin-form target is still accepted (RFC 9112 section 3.2).
+- `Head::authority()` now documents that it returns the client's spelling: compare it case-insensitively, with the default port normalized.
+
 ## [0.5.0] - 2026-10-29
 
 ### Performance

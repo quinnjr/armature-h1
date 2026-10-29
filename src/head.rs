@@ -175,8 +175,16 @@ impl Head {
     ///
     /// RFC 9112 section 3.2.2 makes the target's authority win over `Host`.
     /// [`framing::decide`](crate::framing::decide) also rejects a request
-    /// whose `Host` disagrees with it, so after that check the two never
-    /// differ; this is the one accessor to route or authorize on regardless.
+    /// whose `Host` disagrees with it, or is empty beside it, so after that
+    /// check the two name the same authority; this is the one accessor to
+    /// route or authorize on regardless.
+    ///
+    /// "The same authority" is RFC 3986's equivalence, not byte equality: the
+    /// value is returned as the client spelled it, so the host may differ in
+    /// case from `Host`'s and may carry the scheme's default port where
+    /// `Host` omits it (`A.EXAMPLE:80` beside `Host: a.example`). Compare it
+    /// case-insensitively and with the default port normalized; an exact
+    /// string match against an allowlist would refuse equivalent spellings.
     ///
     /// ```
     /// use armature_h1::{Limits, framing, parse_head};
