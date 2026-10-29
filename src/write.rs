@@ -629,6 +629,18 @@ pub fn write_chunk(out: &mut BytesMut, data: &[u8]) {
 pub fn write_last_chunk(out: &mut BytesMut, trailers: &HeaderVec) {
     out.put_slice(b"0\r\n");
     for (id, value) in trailers.iter() {
+        // Framing, routing and authentication fields have no place after the
+        // body (RFC 9110 section 6.5.1): a recipient that merges trailers into
+        // the header section would act on a length or a credential that was
+        // never part of the head. The request side refuses them; the response
+        // side drops them, by the name the wire reads.
+        if id.canonical().forbidden_in_trailers() {
+            tracing::warn!(
+                field = id.as_str(),
+                "dropping a field forbidden in trailers"
+            );
+            continue;
+        }
         if !writable(id, value) {
             tracing::warn!(
                 field = id.as_str(),
@@ -1330,6 +1342,20 @@ mod tests {
         let mut out = BytesMut::new();
         write_last_chunk(&mut out, &trailers);
         assert_eq!(&out[..], b"0\r\n\r\n");
+    }
+
+    #[test]
+    fn write_last_chunk_drops_fields_forbidden_in_trailers() {
+        let mut trailers = HeaderVec::new();
+        trailers.push((HeaderId::ContentLength, Bytes::from_static(b"5")));
+        trailers.push((
+            HeaderId::Other(crate::ByteStr::from_static("Transfer-Encoding")),
+            Bytes::from_static(b"chunked"),
+        ));
+        trailers.push((HeaderId::Etag, Bytes::from_static(b"\"v1\"")));
+        let mut out = BytesMut::new();
+        write_last_chunk(&mut out, &trailers);
+        assert_eq!(&out[..], b"0\r\netag: \"v1\"\r\n\r\n");
     }
 
     #[test]

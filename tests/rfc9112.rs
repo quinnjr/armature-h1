@@ -449,6 +449,13 @@ fn bare_lf_in_trailer_section_400_close() {
           3\r\nabc\r\n0\r\n\nGET /hidden HTTP/1.1\r\nHost: a\r\n\r\n",
     )
     .assert_rejected_and_closed(400);
+    // The same after a well-formed trailer line: the bare-LF empty line ends
+    // the section for one reader and not for another.
+    raw_exchange(
+        b"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n\
+          3\r\nabc\r\n0\r\nX: a\r\n\nGET /hidden HTTP/1.1\r\nHost: a\r\n\r\n",
+    )
+    .assert_rejected_and_closed(400);
 }
 
 /// Positive twin of `fragment_in_target_400_close` for the hyper backend:
@@ -632,6 +639,28 @@ fn expect_100_continue_interim_then_final() {
     );
     assert!(e.body.contains("HTTP/1.1 200 OK"), "{}", e.body);
     assert!(e.body.ends_with("hello"), "{}", e.body);
+}
+
+/// With more than one `Expect` field the last one decides, on both backends:
+/// hyper's head parser reads them in order and keeps the last.
+#[test]
+fn the_last_expect_field_decides_on_both_backends() {
+    let e = raw_exchange(
+        b"POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\nExpect: foo\r\n\
+          Expect: 100-continue\r\nConnection: close\r\n\r\nhello",
+    );
+    assert!(
+        e.body.starts_with("HTTP/1.1 100 Continue\r\n\r\n"),
+        "{}",
+        e.body
+    );
+
+    let e = raw_exchange(
+        b"POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\nExpect: 100-continue\r\n\
+          Expect: foo\r\nConnection: close\r\n\r\nhello",
+    );
+    assert!(!e.body.contains("100 Continue"), "{}", e.body);
+    assert!(e.body.contains("HTTP/1.1 200 OK"), "{}", e.body);
 }
 
 #[test]

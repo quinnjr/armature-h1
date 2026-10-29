@@ -14,6 +14,8 @@ and this crate adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.h
 - The hyper backend now validates the request target the same way the native parser does: URI characters only, and one of the four RFC 9112 forms. `http::Uri` had accepted `GET @evil.example:80`, `GET evil.example`, `GET *`, `\\` and raw UTF-8 in a path, so `Head::path()` could come back without its leading `/`. These are now `400` + close.
 - A `%` in a request target must start a complete percent-encoding (`/a%zz` and `/a%` are now `400`), on both backends. Decoders downstream of routing disagree on what such a target means.
 - A response header built as `HeaderId::Other` with a well-known name (`Other("Transfer-Encoding")`, `Other("content-length")`, `Other("connection")`) is now treated as that header by both backends. On the native backend it used to bypass the framing and persistence checks and go out verbatim next to the writer's own framing. `header::intern` remains the way to build a header name at runtime.
+- `write::write_last_chunk` drops fields RFC 9110 forbids in a trailer section (`Content-Length`, `Transfer-Encoding`, `Host`, `Authorization`, ...), under any spelling, as the request side already refuses them.
+- With more than one `Expect` field, the last one now decides whether `100 Continue` is owed on the native backend too, matching hyper.
 - BACKENDS.md documents a further hyper divergence that cannot be shimmed: a bare LF straight after the last chunk opens a trailer section that hyper discards unread.
 
 ## [0.5.0] - 2026-10-29

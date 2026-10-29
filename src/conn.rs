@@ -442,9 +442,12 @@ where
             // section 15.2) and the expectation is to be ignored from one
             // (section 10.1.1). It would read the interim response as final.
             let expects_continue = version == Version::Http11
+                // The last field decides, as in hyper's head parser, so the
+                // backends agree on `Expect: foo` then `Expect: 100-continue`.
                 && head
-                    .get_str(&HeaderId::Expect)
-                    .is_some_and(|v| v.eq_ignore_ascii_case("100-continue"));
+                    .all(&HeaderId::Expect)
+                    .last()
+                    .is_some_and(|v| v.eq_ignore_ascii_case(b"100-continue"));
             let is_head_request = head.method == Method::Head;
 
             {

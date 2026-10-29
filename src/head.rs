@@ -150,13 +150,19 @@ impl Head {
     /// range. The one remaining `O(len)` cost is the UTF-8 revalidation inside
     /// [`ByteStr::as_str`], which stays because the crate forbids `unsafe` and
     /// so cannot skip the check.
-    #[inline]
     ///
     /// For an absolute-form target (`GET http://a.example/x`), the path
     /// component alone: `/x`, or `/` when the URI's path is empty (RFC 9112
     /// section 3.2.1). The scheme and authority are not part of the path, and
     /// a router or an auth check matching on a leading `/` must not see them;
     /// read the authority with [`authority`](Self::authority).
+    ///
+    /// An origin-form path may itself begin with `//` (`GET //evil.example/x`
+    /// is a valid target whose path is `//evil.example/x`). Echoed into a
+    /// `Location` or joined onto a base URL, that reads as a scheme-relative
+    /// reference to another host, so collapse leading slashes before using the
+    /// path as a URL.
+    #[inline]
     pub fn path(&self) -> &str {
         let t = self.target.as_str();
         let end = self.query_at.unwrap_or(t.len());
@@ -216,6 +222,10 @@ impl Head {
 
     /// The scheme of an absolute-form target, as received; `None` for every
     /// other form.
+    ///
+    /// This is the client's claim, not the transport's: `GET https://a/` over
+    /// plaintext reports `https`. Decide whether a request arrived over TLS from
+    /// the listener that accepted it, never from this.
     ///
     /// ```
     /// use armature_h1::{Limits, parse_head};

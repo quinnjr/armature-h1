@@ -197,9 +197,12 @@ impl<S: H1Service + 'static>
             // response to a 1.0 client, and `Body::continue_pending` must not
             // say one is owed when it never will be.
             let expects_continue = head.version == Version::Http11
+                // The last field decides, as in hyper's head parser, so the
+                // backends agree on `Expect: foo` then `Expect: 100-continue`.
                 && head
-                    .get_str(&HeaderId::Expect)
-                    .is_some_and(|v| v.eq_ignore_ascii_case("100-continue"));
+                    .all(&HeaderId::Expect)
+                    .last()
+                    .is_some_and(|v| v.eq_ignore_ascii_case(b"100-continue"));
 
             // Captured before `head` moves into the `Request`: hyper writes the
             // status line from the response's own version, so a 1.0 request
