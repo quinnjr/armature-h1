@@ -379,7 +379,14 @@ where
     /// So an upgrading handler must read the body to its end and then drop it
     /// before answering 101. Dropping it unread is not enough.
     pub async fn serve(mut self) -> io::Result<Option<Upgraded>> {
+        // An error response owed for the previous iteration's request, written
+        // once that iteration's handler has been dropped.
+        let mut owed_error: Option<(Version, u16)> = None;
         loop {
+            if let Some((version, status)) = owed_error.take() {
+                self.write_error(version, status).await?;
+                return Ok(None);
+            }
             // Wait for the next request to begin. An idle keep-alive connection
             // that never sends again is closed silently — no response is owed.
             match self.read_until_head_or_idle().await? {
@@ -490,122 +497,121 @@ where
                 }
             }
 
-            // Scoped so the handler's future — and whatever it holds: its
-            // `Body`, which is the last borrow of the transport, a pool
-            // connection, a lock — is dropped before an error response is
-            // written, not kept alive for as long as that write takes.
-            let resp = {
-                let mut call = std::pin::pin!(self.service.call(Request {
-                    head,
-                    body,
-                    peer: self.peer,
-                }));
+            // The handler's response, written once where it is produced. The
+            // request and response each carry an inline header array, and
+            // every wrapper or block boundary they pass through is another copy
+            // of it — on the keep-alive path, more than parsing the head costs.
+            // So the handler's future is pinned straight in the loop body, and
+            // an error ends the iteration to drop it (see `owed_error`).
+            let mut produced: Option<Response> = None;
+            let mut call = std::pin::pin!(self.service.call(Request {
+                head,
+                body,
+                peer: self.peer,
+            }));
 
-                let mut early = None;
-                if let Some(mut held) = held.take() {
-                    let polled =
-                        std::future::poll_fn(|cx| Poll::Ready(call.as_mut().poll(cx))).await;
-                    let mut bytes = held.bytes.take().unwrap_or_default();
-                    bytes.unsplit(std::mem::take(&mut self.out));
-                    self.out = bytes;
-                    match polled {
-                        Poll::Ready(resp) => {
-                            early = Some(resp);
-                            // Written with this response's head instead; the
-                            // body deadline restarts after that flush.
-                            self.held_in_out = true;
-                        }
-                        Poll::Pending => {
-                            self.flush().await?;
-                            self.start_body_deadline();
-                        }
+            if let Some(mut held) = held.take() {
+                let polled = std::future::poll_fn(|cx| Poll::Ready(call.as_mut().poll(cx))).await;
+                let mut bytes = held.bytes.take().unwrap_or_default();
+                bytes.unsplit(std::mem::take(&mut self.out));
+                self.out = bytes;
+                match polled {
+                    Poll::Ready(resp) => {
+                        produced = Some(resp);
+                        // Written with this response's head instead; the body
+                        // deadline restarts after that flush.
+                        self.held_in_out = true;
+                    }
+                    Poll::Pending => {
+                        self.flush().await?;
+                        self.start_body_deadline();
                     }
                 }
+            }
 
-                // The body deadline covers the handler's read of it. Nothing
-                // else polls this deadline, so the handler call itself has to
-                // race it: arming a timer nobody awaits would leave a handler
-                // blocked on body bytes the peer never sends holding the
-                // connection forever.
-                //
-                // `poll_fn` over the pinned call rather than `select!`, which
-                // takes its futures by value: with the request's inline header
-                // array inside, the handler's future is large enough that
-                // moving it into and out of the `select!` state cost more than
-                // parsing the head.
-                //
-                // `body_timeout` bounds the body's arrival, not the handler:
-                // once the body has been read to its end — or when there never
-                // was one — an expiry means nothing, and a handler may take as
-                // long as it needs. A body still incomplete at the deadline is
-                // a stalled peer (or a handler sitting on bytes it never
-                // reads), and gets the 408, checked before the handler as
-                // `biased` had it.
-                //
-                // `handler_timeout`, when set, bounds the handler itself and is
-                // the server's failure, not the peer's: 503 rather than 408. It
-                // is checked after the handler, as `tokio::time::timeout` (the
-                // hyper backend's) checks after its inner future, so a handler
-                // ready on the same wakeup wins under both. Armed only here:
-                // writing the earlier responses above is the write deadline's
-                // business, and a slow reader must not spend this handler's
-                // budget.
-                if let Some(resp) = early {
-                    Ok(resp)
-                } else {
-                    if let (Some(after), Some(d)) = (
-                        self.cfg.limits.handler_timeout,
-                        self.handler_deadline.as_mut(),
-                    ) {
-                        d.arm(after);
-                    }
-                    // Finished covers a body that failed as well as one read
-                    // to its end: either way no bytes are awaited, so a
-                    // handler composing its answer to a bad body is not cut
-                    // off with a 408 it did nothing to earn.
-                    let body_finished = || self.shared.borrow().body_finished;
-                    // One deadline per body, from when its handler is called —
-                    // restarted after any earlier pipelined responses were
-                    // flushed — and the same instant a streamed response is
-                    // later held to. `None` is a deadline switched off with
-                    // `Duration::MAX`.
-                    let body_armed = !body_finished() && self.body_deadline_at.is_some();
-                    if let Some(at) = self.body_deadline_at.filter(|_| body_armed) {
-                        self.deadline
-                            .arm(at.saturating_duration_since(tokio::time::Instant::now()));
-                    }
-                    let deadline = &mut self.deadline;
-                    let mut handler_deadline = self.handler_deadline.as_mut();
-                    let resp = std::future::poll_fn(|cx| {
-                        if body_armed && !body_finished() && deadline.poll_expired(cx).is_ready() {
-                            return Poll::Ready(Err(408));
-                        }
-                        if let Poll::Ready(resp) = call.as_mut().poll(cx) {
-                            return Poll::Ready(Ok(resp));
-                        }
-                        if let Some(d) = handler_deadline.as_mut()
-                            && d.poll_expired(cx).is_ready()
-                        {
-                            return Poll::Ready(Err(503));
-                        }
-                        Poll::Pending
-                    })
-                    .await;
-                    if body_armed {
-                        self.deadline.disarm();
-                    }
-                    if let Some(d) = self.handler_deadline.as_mut() {
-                        d.disarm();
-                    }
-                    resp
+            // The body deadline covers the handler's read of it. Nothing else
+            // polls this deadline, so the handler call itself has to race it:
+            // arming a timer nobody awaits would leave a handler blocked on body
+            // bytes the peer never sends holding the connection forever.
+            //
+            // `poll_fn` over the pinned call rather than `select!`, which takes
+            // its futures by value, and for the same reason as above.
+            //
+            // `body_timeout` bounds the body's arrival, not the handler: once
+            // the body has been read to its end — or when there never was one —
+            // an expiry means nothing, and a handler may take as long as it
+            // needs. A body still incomplete at the deadline is a stalled peer
+            // (or a handler sitting on bytes it never reads), and gets the 408,
+            // checked before the handler as `biased` had it.
+            //
+            // `handler_timeout`, when set, bounds the handler itself and is the
+            // server's failure, not the peer's: 503 rather than 408. It is
+            // checked after the handler, as `tokio::time::timeout` (the hyper
+            // backend's) checks after its inner future, so a handler ready on
+            // the same wakeup wins under both. Armed only here: writing the
+            // earlier responses above is the write deadline's business, and a
+            // slow reader must not spend this handler's budget.
+            let mut failed = None;
+            if produced.is_none() {
+                if let (Some(after), Some(d)) = (
+                    self.cfg.limits.handler_timeout,
+                    self.handler_deadline.as_mut(),
+                ) {
+                    d.arm(after);
                 }
-            };
-            let resp = match resp {
-                Ok(resp) => resp,
-                Err(status) => {
-                    self.write_error(version, status).await?;
-                    return Ok(None);
+                // Finished covers a body that failed as well as one read to its
+                // end: either way no bytes are awaited, so a handler composing
+                // its answer to a bad body is not cut off with a 408 it did
+                // nothing to earn.
+                let body_finished = || self.shared.borrow().body_finished;
+                // One deadline per body, from when its handler is called —
+                // restarted after any earlier pipelined responses were flushed
+                // — and the same instant a streamed response is later held to.
+                // `None` is a deadline switched off with `Duration::MAX`.
+                let body_armed = !body_finished() && self.body_deadline_at.is_some();
+                if let Some(at) = self.body_deadline_at.filter(|_| body_armed) {
+                    self.deadline
+                        .arm(at.saturating_duration_since(tokio::time::Instant::now()));
                 }
+                let deadline = &mut self.deadline;
+                let mut handler_deadline = self.handler_deadline.as_mut();
+                let produced = &mut produced;
+                failed = std::future::poll_fn(|cx| {
+                    if body_armed && !body_finished() && deadline.poll_expired(cx).is_ready() {
+                        return Poll::Ready(Some(408));
+                    }
+                    if let Poll::Ready(resp) = call.as_mut().poll(cx) {
+                        *produced = Some(resp);
+                        return Poll::Ready(None);
+                    }
+                    if let Some(d) = handler_deadline.as_mut()
+                        && d.poll_expired(cx).is_ready()
+                    {
+                        return Poll::Ready(Some(503));
+                    }
+                    Poll::Pending
+                })
+                .await;
+                if body_armed {
+                    self.deadline.disarm();
+                }
+                if let Some(d) = self.handler_deadline.as_mut() {
+                    d.disarm();
+                }
+            }
+            // A failure ends this iteration, which drops the handler's future
+            // — and whatever it holds: its `Body`, the last borrow of the
+            // transport, a pool connection, a lock — before the error response
+            // is written at the top of the next, rather than keeping it alive
+            // for as long as that write takes.
+            if let Some(status) = failed {
+                owed_error = Some((version, status));
+                continue;
+            }
+            let Some(resp) = produced else {
+                // Unreachable: no failure means the handler produced one.
+                owed_error = Some((version, 500));
+                continue;
             };
 
             // An unconsumed or errored body leaves an unknown number of bytes on

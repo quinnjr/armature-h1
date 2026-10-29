@@ -193,22 +193,16 @@ fn parse_authority(a: &[u8]) -> Option<(&[u8], Option<u16>)> {
 /// `reg-name` (RFC 3986 section 3.2.2), which also covers an IPv4 address:
 /// unreserved characters, sub-delims, and well-formed percent-encodings.
 fn valid_reg_name(host: &[u8]) -> bool {
-    let mut i = 0;
-    while i < host.len() {
-        match host[i] {
-            b'%' => {
-                if !host
-                    .get(i + 1..i + 3)
-                    .is_some_and(|h| h.iter().all(u8::is_ascii_hexdigit))
-                {
-                    return false;
-                }
-                i += 3;
-                continue;
-            }
-            b if b.is_ascii_alphanumeric()
+    // A table rather than a chain of comparisons: this runs over every
+    // request's `Host`, on the keep-alive path.
+    const REG_NAME: [bool; 256] = {
+        let mut t = [false; 256];
+        let mut b = 0;
+        while b < 256 {
+            let c = b as u8;
+            t[b] = c.is_ascii_alphanumeric()
                 || matches!(
-                    b,
+                    c,
                     b'-' | b'.'
                         | b'_'
                         | b'~'
@@ -223,7 +217,29 @@ fn valid_reg_name(host: &[u8]) -> bool {
                         | b','
                         | b';'
                         | b'='
-                ) => {}
+                );
+            b += 1;
+        }
+        t
+    };
+    // The common case — no percent-encoding — in one pass.
+    if host.iter().all(|&b| REG_NAME[b as usize]) {
+        return true;
+    }
+    let mut i = 0;
+    while i < host.len() {
+        match host[i] {
+            b'%' => {
+                if !host
+                    .get(i + 1..i + 3)
+                    .is_some_and(|h| h.iter().all(u8::is_ascii_hexdigit))
+                {
+                    return false;
+                }
+                i += 3;
+                continue;
+            }
+            b if REG_NAME[b as usize] => {}
             _ => return false,
         }
         i += 1;

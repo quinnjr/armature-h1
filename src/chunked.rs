@@ -113,7 +113,10 @@ pub struct ChunkedDecoder {
     /// Trailer fields allowed, as `Limits::max_headers` bounds head fields.
     max_trailers: usize,
     trailer_bytes: usize,
-    trailers: HeaderVec,
+    /// Allocated on the first trailer field, which almost no body has: held
+    /// inline, the array made every decoder — and every request body, which
+    /// carries one — over a kilobyte to move.
+    trailers: Option<Box<HeaderVec>>,
 }
 
 impl ChunkedDecoder {
@@ -127,7 +130,7 @@ impl ChunkedDecoder {
             max_trailer: limits.max_head_bytes,
             max_trailers: limits.max_headers,
             trailer_bytes: 0,
-            trailers: HeaderVec::new(),
+            trailers: None,
         }
     }
 
@@ -230,14 +233,11 @@ impl ChunkedDecoder {
                         // Empty line ends the trailer section.
                         buf.advance(consumed);
                         self.state = State::Ending;
-                        if self.trailers.is_empty() {
-                            // Nothing to report: skip the event rather than
-                            // allocating a box to say so.
+                        let Some(trailers) = self.trailers.take() else {
+                            // Nothing to report: skip the event.
                             continue;
-                        }
-                        return Ok(Some(ChunkEvent::Trailers(Box::new(std::mem::take(
-                            &mut self.trailers,
-                        )))));
+                        };
+                        return Ok(Some(ChunkEvent::Trailers(trailers)));
                     }
 
                     let line = buf.slice(..content_len);
@@ -259,7 +259,7 @@ impl ChunkedDecoder {
         // the same rules: a bounded count, token names, and no control bytes
         // in values. Fields that would fail the head parser must not reach a
         // handler just because they arrived after the body.
-        if self.trailers.len() >= self.max_trailers {
+        if self.trailers.as_ref().map_or(0, |t| t.len()) >= self.max_trailers {
             return Err(ChunkedError::BadTrailer);
         }
 
@@ -314,7 +314,9 @@ impl ChunkedDecoder {
             return Err(ChunkedError::BadTrailer);
         }
 
-        self.trailers.push((id, line.slice(start..end)));
+        self.trailers
+            .get_or_insert_with(|| Box::new(HeaderVec::new()))
+            .push((id, line.slice(start..end)));
         Ok(())
     }
 }

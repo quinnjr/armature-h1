@@ -10,9 +10,10 @@ and this crate adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.h
 ### Performance
 
 Measured against `axum` 0.8 (hyper `http1`) on identical in-process and
-loopback harnesses. Userspace cost per keep-alive request is now below
-axum's (GET: 30.3k → 10.6k instructions, axum 12.1k), syscalls per request
-match it (4 → 2), and a pipelined batch is served at roughly 4.5× the rate.
+loopback harnesses. Userspace cost per keep-alive request is below axum's on
+every case measured (GET: 30.3k → 11.3k instructions, axum 12.0k; pipelined:
+11.4k → 8.6k, axum 9.1k), syscalls per request match it (4 → 2), and a
+pipelined batch is served at roughly 4.5× the rate.
 
 - Reads fill the buffer's spare capacity through tokio's `read_buf` instead of
   zero-filling 8 KiB on every read poll, the `Pending` one included.
@@ -22,6 +23,9 @@ match it (4 → 2), and a pipelined batch is served at roughly 4.5× the rate.
 - The handler future is raced against the body deadline in place rather than
   moved through `select!`, and each head's terminator is found once instead
   of three times.
+- A request body no longer carries two inline header arrays it almost never
+  uses: chunked trailers are allocated on the first trailer field. A `Body`
+  shrinks from about 2.5 KB to 168 bytes, and every move of a request with it.
 - A keep-alive response whose successor is already buffered is held back, up
   to 32 KiB, so a pipelined batch goes out in one write. Nothing held back can
   wait on the peer or on a slow handler.

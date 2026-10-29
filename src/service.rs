@@ -160,7 +160,12 @@ struct BodyState {
     /// Bytes still expected, for a `Content-Length` body.
     remaining: u64,
     decoder: Option<ChunkedDecoder>,
-    trailers: Option<HeaderVec>,
+    /// The trailer fields, when there were any: boxed, since nearly every body
+    /// has none and an inline array made the body over a kilobyte to move.
+    trailers: Option<Box<HeaderVec>>,
+    /// Whether the trailer section is final — the body ended cleanly —
+    /// whether or not it had any fields.
+    trailers_ready: bool,
     io: Option<Rc<RefCell<dyn BodyIo>>>,
     /// This body's generation on its transport; see [`BodyIo::body_started`].
     generation: u64,
@@ -242,6 +247,28 @@ impl Drop for BodyState {
     }
 }
 
+/// Register a new request body with its transport, before the body is built;
+/// both constructors call it. Returns the body's generation, and whether its
+/// finish has already been reported.
+///
+/// Before, not after: the body is then built straight into its return slot.
+/// Its state holds two inline header arrays, and building it first and
+/// registering it after copied them on every request.
+///
+/// A body that is finished before it is read — none, or an explicit zero
+/// length — says so through the same `BodyIo::body_finished` signal a read one
+/// does, so the connection has one flag to time the body by.
+fn register(io: &Rc<RefCell<dyn BodyIo>>, done: bool) -> (u64, bool) {
+    let Ok(mut io) = io.try_borrow_mut() else {
+        return (0, false);
+    };
+    let generation = io.body_started();
+    if done {
+        io.body_finished(generation);
+    }
+    (generation, done)
+}
+
 /// A request body.
 ///
 /// Chunks are [`Bytes`] slices of the connection's read buffer, so reading a
@@ -268,7 +295,8 @@ impl Body {
                 buffered: Bytes::new(),
                 remaining: 0,
                 decoder: None,
-                trailers: Some(HeaderVec::new()),
+                trailers: None,
+                trailers_ready: true,
                 io: None,
                 generation: 0,
                 notified: false,
@@ -301,34 +329,39 @@ impl Body {
         limits: &crate::Limits,
         fully_read: Rc<Cell<bool>>,
     ) -> Self {
-        let (remaining, decoder, done) = match kind {
-            BodyKind::None => (0, None, true),
-            BodyKind::Length(n) => (n, None, n == 0),
-            BodyKind::Chunked => (0, Some(ChunkedDecoder::new(limits)), false),
+        let (remaining, done) = match kind {
+            BodyKind::None => (0, true),
+            BodyKind::Length(n) => (n, n == 0),
+            BodyKind::Chunked => (0, false),
         };
         fully_read.set(done);
-        Self::from_state(BodyState {
-            kind,
-            buffered: Bytes::new(),
-            remaining,
-            decoder,
-            trailers: if done { Some(HeaderVec::new()) } else { None },
-            io: Some(io),
-            generation: 0,
-            notified: false,
-            continue_sent: !needs_continue,
-            needs_continue,
-            done,
-            fully_read,
-            #[cfg(feature = "hyper-backend")]
-            raw: false,
-            #[cfg(feature = "hyper-backend")]
-            consumed: 0,
-            #[cfg(feature = "hyper-backend")]
-            cap: u64::MAX,
-            #[cfg(feature = "hyper-backend")]
-            trailers_slot: None,
-        })
+        let (generation, notified) = register(&io, done);
+        Self {
+            state: BodyState {
+                kind,
+                buffered: Bytes::new(),
+                remaining,
+                // Built in place: the decoder holds an inline header array.
+                decoder: matches!(kind, BodyKind::Chunked).then(|| ChunkedDecoder::new(limits)),
+                trailers: None,
+                trailers_ready: done,
+                io: Some(io),
+                generation,
+                notified,
+                continue_sent: !needs_continue,
+                needs_continue,
+                done,
+                fully_read,
+                #[cfg(feature = "hyper-backend")]
+                raw: false,
+                #[cfg(feature = "hyper-backend")]
+                consumed: 0,
+                #[cfg(feature = "hyper-backend")]
+                cap: u64::MAX,
+                #[cfg(feature = "hyper-backend")]
+                trailers_slot: None,
+            },
+        }
     }
 
     /// A body whose transport already de-framed it (the hyper backend).
@@ -352,24 +385,28 @@ impl Body {
         // the native loop reuses the connection.
         let done = matches!(kind, BodyKind::None | BodyKind::Length(0));
         fully_read.set(done);
-        Self::from_state(BodyState {
-            kind,
-            buffered: Bytes::new(),
-            remaining: 0,
-            decoder: None,
-            trailers: if done { Some(HeaderVec::new()) } else { None },
-            io: Some(io),
-            generation: 0,
-            notified: false,
-            continue_sent: !needs_continue,
-            needs_continue,
-            done,
-            fully_read,
-            raw: true,
-            consumed: 0,
-            cap: max_body_bytes,
-            trailers_slot: Some(trailers_slot),
-        })
+        let (generation, notified) = register(&io, done);
+        Self {
+            state: BodyState {
+                kind,
+                buffered: Bytes::new(),
+                remaining: 0,
+                decoder: None,
+                trailers: None,
+                trailers_ready: done,
+                io: Some(io),
+                generation,
+                notified,
+                continue_sent: !needs_continue,
+                needs_continue,
+                done,
+                fully_read,
+                raw: true,
+                consumed: 0,
+                cap: max_body_bytes,
+                trailers_slot: Some(trailers_slot),
+            },
+        }
     }
 
     /// A body over a fixed byte string, for tests and synthetic requests.
@@ -381,7 +418,8 @@ impl Body {
                 buffered: data,
                 remaining: len,
                 decoder: None,
-                trailers: Some(HeaderVec::new()),
+                trailers: None,
+                trailers_ready: true,
                 io: None,
                 generation: 0,
                 notified: false,
@@ -431,25 +469,13 @@ impl Body {
     /// The trailer section, once the body is fully read.
     #[inline]
     pub fn trailers(&self) -> Option<&HeaderVec> {
-        self.state.trailers.as_ref()
-    }
-
-    /// Wrap a freshly built state; both constructors end here.
-    ///
-    /// A body that is finished before it is read — none, or an explicit zero
-    /// length — says so through the same `BodyIo::body_finished` signal a read
-    /// one does, so the connection has one flag to time the body by.
-    fn from_state(mut state: BodyState) -> Self {
-        if let Some(io) = &state.io
-            && let Ok(mut io) = io.try_borrow_mut()
-        {
-            state.generation = io.body_started();
-        }
-        let mut body = Self { state };
-        if body.state.done {
-            body.state.notify_finished();
-        }
-        body
+        static NONE: std::sync::OnceLock<HeaderVec> = std::sync::OnceLock::new();
+        self.state.trailers_ready.then(|| {
+            self.state
+                .trailers
+                .as_deref()
+                .unwrap_or_else(|| NONE.get_or_init(HeaderVec::new))
+        })
     }
 
     /// Poll for the next body chunk.
@@ -508,7 +534,7 @@ impl Body {
                         s.remaining -= take as u64;
                         if s.remaining == 0 {
                             s.finish();
-                            s.trailers = Some(HeaderVec::new());
+                            s.trailers_ready = true;
                             // `take_buffered` is bounded by what this body is
                             // owed, but `fill` is not: it hands over the whole
                             // read, which can carry the front of the next
@@ -527,7 +553,7 @@ impl Body {
                     }
                     if s.remaining == 0 {
                         s.finish();
-                        s.trailers = Some(HeaderVec::new());
+                        s.trailers_ready = true;
                         return Poll::Ready(None);
                     }
                     match Self::fill(s, cx) {
@@ -563,14 +589,12 @@ impl Body {
                         }
                         Ok(Some(ChunkEvent::Data(d))) => return Poll::Ready(Some(Ok(d))),
                         Ok(Some(ChunkEvent::Trailers(t))) => {
-                            s.trailers = Some(*t);
+                            s.trailers = Some(t);
                             continue;
                         }
                         Ok(Some(ChunkEvent::End)) => {
                             s.finish();
-                            if s.trailers.is_none() {
-                                s.trailers = Some(HeaderVec::new());
-                            }
+                            s.trailers_ready = true;
                             // Anything left belongs to the next pipelined
                             // request; give it back rather than dropping it.
                             if !s.buffered.is_empty() {
@@ -629,7 +653,7 @@ impl Body {
                 // reused.
                 if matches!(s.kind, BodyKind::Length(n) if s.consumed == n) {
                     s.finish();
-                    s.trailers = Some(HeaderVec::new());
+                    s.trailers_ready = true;
                 }
                 return Poll::Ready(Some(Ok(chunk)));
             }
@@ -642,12 +666,13 @@ impl Body {
                 Poll::Ready(Ok(false)) => {
                     // Clean EOF: hyper delivered the whole body.
                     s.finish();
-                    s.trailers = Some(
-                        s.trailers_slot
-                            .as_ref()
-                            .and_then(|slot| slot.borrow_mut().take())
-                            .unwrap_or_default(),
-                    );
+                    s.trailers = s
+                        .trailers_slot
+                        .as_ref()
+                        .and_then(|slot| slot.borrow_mut().take())
+                        .filter(|t| !t.is_empty())
+                        .map(Box::new);
+                    s.trailers_ready = true;
                     return Poll::Ready(None);
                 }
                 Poll::Ready(Ok(true)) => continue,
