@@ -12,7 +12,7 @@ and this crate adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.h
 Measured against `axum` 0.8 (hyper `http1`) on identical in-process and
 loopback harnesses. Userspace cost per keep-alive request is below axum's on
 every case measured (GET: 30.3k → 11.3k instructions, axum 12.0k; pipelined:
-11.4k → 8.6k, axum 9.1k), syscalls per request match it (4 → 2), and a
+11.4k → 8.7k, axum 9.1k), syscalls per request match it (4 → 2), and a
 pipelined batch is served at roughly 4.5× the rate.
 
 - Reads fill the buffer's spare capacity through tokio's `read_buf` instead of

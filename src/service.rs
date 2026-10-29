@@ -251,9 +251,8 @@ impl Drop for BodyState {
 /// both constructors call it. Returns the body's generation, and whether its
 /// finish has already been reported.
 ///
-/// Before, not after: the body is then built straight into its return slot.
-/// Its state holds two inline header arrays, and building it first and
-/// registering it after copied them on every request.
+/// Before, not after: the body is then built straight into its return slot,
+/// rather than built in a local and copied out once registered.
 ///
 /// A body that is finished before it is read — none, or an explicit zero
 /// length — says so through the same `BodyIo::body_finished` signal a read one
@@ -341,7 +340,6 @@ impl Body {
                 kind,
                 buffered: Bytes::new(),
                 remaining,
-                // Built in place: the decoder holds an inline header array.
                 decoder: matches!(kind, BodyKind::Chunked).then(|| ChunkedDecoder::new(limits)),
                 trailers: None,
                 trailers_ready: done,
