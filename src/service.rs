@@ -130,13 +130,26 @@ pub trait BodyIo {
     /// been handed bytes belonging to the next request.
     fn push_back(&mut self, bytes: Bytes);
 
-    /// The body is finished: read to its end, or failed.
+    /// A new request's [`Body`] is being created; returns its generation.
     ///
-    /// Either way no more body bytes are awaited, so the body's deadline has
-    /// nothing left to bound. The default does nothing; the connection uses it
-    /// to stop racing `Limits::body_timeout` against a handler that is now
-    /// only working on its response.
-    fn body_finished(&mut self) {}
+    /// The generation ties [`body_finished`](Self::body_finished) to the body
+    /// it came from: a `Body` from an earlier request that a handler kept
+    /// alive must not, when it is finally dropped, report a later request's
+    /// body as finished. The default returns `0`.
+    fn body_started(&mut self) -> u64 {
+        0
+    }
+
+    /// The body of `generation` awaits no more bytes: read to its end, failed,
+    /// or dropped unread.
+    ///
+    /// Either way nothing can read more of it, so its deadline has nothing
+    /// left to bound. The default does nothing; the connection uses it to stop
+    /// racing `Limits::body_timeout` against a handler that is now only
+    /// working on its response.
+    fn body_finished(&mut self, generation: u64) {
+        let _ = generation;
+    }
 }
 
 /// Shared body-reading state.
@@ -149,6 +162,10 @@ struct BodyState {
     decoder: Option<ChunkedDecoder>,
     trailers: Option<HeaderVec>,
     io: Option<Rc<RefCell<dyn BodyIo>>>,
+    /// This body's generation on its transport; see [`BodyIo::body_started`].
+    generation: u64,
+    /// Whether the transport has been told this body is finished.
+    notified: bool,
     continue_sent: bool,
     needs_continue: bool,
     done: bool,
@@ -204,11 +221,24 @@ impl BodyState {
     /// was before this signal existed, where a panic would take the
     /// connection down.
     fn notify_finished(&mut self) {
+        if self.notified {
+            return;
+        }
         if let Some(io) = &self.io
             && let Ok(mut io) = io.try_borrow_mut()
         {
-            io.body_finished();
+            io.body_finished(self.generation);
+            self.notified = true;
         }
+    }
+}
+
+impl Drop for BodyState {
+    /// A body dropped before it finished awaits nothing either: whatever is
+    /// left of it on the wire, nothing will read it, and the connection closes
+    /// over it (`fully_read` stays false). Its deadline has nothing to bound.
+    fn drop(&mut self) {
+        self.notify_finished();
     }
 }
 
@@ -240,6 +270,8 @@ impl Body {
                 decoder: None,
                 trailers: Some(HeaderVec::new()),
                 io: None,
+                generation: 0,
+                notified: false,
                 continue_sent: true,
                 needs_continue: false,
                 done: true,
@@ -282,6 +314,8 @@ impl Body {
             decoder,
             trailers: if done { Some(HeaderVec::new()) } else { None },
             io: Some(io),
+            generation: 0,
+            notified: false,
             continue_sent: !needs_continue,
             needs_continue,
             done,
@@ -325,6 +359,8 @@ impl Body {
             decoder: None,
             trailers: if done { Some(HeaderVec::new()) } else { None },
             io: Some(io),
+            generation: 0,
+            notified: false,
             continue_sent: !needs_continue,
             needs_continue,
             done,
@@ -347,6 +383,8 @@ impl Body {
                 decoder: None,
                 trailers: Some(HeaderVec::new()),
                 io: None,
+                generation: 0,
+                notified: false,
                 continue_sent: true,
                 needs_continue: false,
                 done: len == 0,
@@ -401,7 +439,12 @@ impl Body {
     /// A body that is finished before it is read — none, or an explicit zero
     /// length — says so through the same `BodyIo::body_finished` signal a read
     /// one does, so the connection has one flag to time the body by.
-    fn from_state(state: BodyState) -> Self {
+    fn from_state(mut state: BodyState) -> Self {
+        if let Some(io) = &state.io
+            && let Ok(mut io) = io.try_borrow_mut()
+        {
+            state.generation = io.body_started();
+        }
         let mut body = Self { state };
         if body.state.done {
             body.state.notify_finished();

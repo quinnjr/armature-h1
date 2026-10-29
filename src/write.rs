@@ -159,31 +159,30 @@ pub(crate) fn forbids_body_framing(status: u16) -> bool {
     matches!(status, 204 | 304) || (100..200).contains(&status)
 }
 
-/// Whether a handler `Connection` field carries a token the server owns.
-pub(crate) fn has_persistence_token(value: &[u8]) -> bool {
-    header::value_has_token(value, "close") || header::value_has_token(value, "keep-alive")
-}
-
-/// The tokens of a `Connection` field other than `close` and `keep-alive`.
+/// The tokens of a handler `Connection` field that reach the wire: every one
+/// but `close` and `keep-alive`, which are the server's to state, and only
+/// those that are tokens (RFC 9110 section 7.6.1), so a malformed one is
+/// dropped on its own rather than sinking the field — or being written.
 ///
-/// The one definition both backends filter a handler's field through, so
-/// which tokens count as the server's cannot drift between them.
-pub(crate) fn non_persistence_tokens(value: &[u8]) -> impl Iterator<Item = &[u8]> {
+/// The one definition both backends write a handler's field through, so
+/// which of its tokens go out cannot differ between them.
+pub(crate) fn connection_tokens(value: &[u8]) -> impl Iterator<Item = &[u8]> {
     value
         .split(|&b| b == b',')
         .map(crate::framing::trim_ows)
         .filter(|t| {
             !t.is_empty()
+                && t.iter().copied().all(header::is_tchar)
                 && !t.eq_ignore_ascii_case(b"close")
                 && !t.eq_ignore_ascii_case(b"keep-alive")
         })
 }
 
-/// Write a handler `Connection` field minus its `close` and `keep-alive`
-/// tokens, or nothing if no other token is left.
-fn write_connection_without_persistence(out: &mut BytesMut, value: &[u8]) {
+/// Write a handler `Connection` field as [`connection_tokens`] leaves it, or
+/// nothing if no token is left.
+fn write_connection_tokens(out: &mut BytesMut, value: &[u8]) {
     let mut first = true;
-    for token in non_persistence_tokens(value) {
+    for token in connection_tokens(value) {
         out.put_slice(if first { b"connection: " } else { b", " });
         out.put_slice(token);
         first = false;
@@ -534,6 +533,14 @@ pub(crate) fn write_head_for(
             tracing::warn!("dropping response transfer-encoding that does not frame the body");
             continue;
         }
+        if id == &HeaderId::Connection {
+            // Persistence is the server's to state, so those two tokens go;
+            // the rest of the list stays, token by token. Dropping the whole
+            // field would take `upgrade` with it, and a 101 without
+            // `Connection: upgrade` is a handshake the client aborts.
+            write_connection_tokens(out, value);
+            continue;
+        }
         if !field_writable[i] {
             // The status line is already in `out`, so there is no error left to
             // return; dropping the field is the only outcome that does not put
@@ -542,14 +549,6 @@ pub(crate) fn write_head_for(
                 field = id.as_str(),
                 "dropping response header with an invalid field name or value"
             );
-            continue;
-        }
-        if id == &HeaderId::Connection && has_persistence_token(value) {
-            // Persistence is the server's to state, so those two tokens go;
-            // the rest of the list stays. Dropping the whole field would take
-            // `upgrade` with it, and a 101 without `Connection: upgrade` is a
-            // handshake the client aborts.
-            write_connection_without_persistence(out, value);
             continue;
         }
         out.put_slice(id.as_str().as_bytes());

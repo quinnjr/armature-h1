@@ -903,14 +903,16 @@ fn a_slow_handler_after_reading_its_body_is_not_cut_off() {
     assert!(ex.body.ends_with("hello"), "{:?}", ex.body);
 }
 
-/// A handler that never reads its body still answers to the deadline: the
-/// body has not arrived, from the server's point of view.
+/// A handler that holds its body without reading it still answers to the
+/// deadline: the body is still awaited, and has not arrived, from the
+/// server's point of view.
 #[test]
 fn a_handler_sitting_on_an_unread_body_still_gets_408() {
     let ex = raw_exchange_with_service(
         quick_limits(),
         || {
-            |_req: Request| async {
+            |req: Request| async move {
+                let _held = req.body;
                 tokio::time::sleep(Duration::from_millis(1500)).await;
                 Response::text("late")
             }
@@ -1319,4 +1321,85 @@ fn collect_over_its_cap_on_a_complete_body_keeps_the_connection() {
     assert_eq!(ex.status(), Some(413), "{:?}", ex.body);
     assert_eq!(ex.responses(), 2, "/b was served too: {:?}", ex.body);
     assert!(ex.body.ends_with("b"), "{:?}", ex.body);
+}
+
+/// A body the handler dropped unread is awaited by nothing, so the deadline
+/// has nothing to bound: the slow handler's answer goes out, and the
+/// connection closes over the unread bytes.
+#[test]
+fn a_handler_that_dropped_its_body_is_not_cut_off_by_body_timeout() {
+    let ex = raw_exchange_with_service(
+        quick_limits(),
+        || {
+            |req: Request| async move {
+                drop(req.body);
+                tokio::time::sleep(Duration::from_millis(900)).await;
+                Response::text("late")
+            }
+        },
+        vec![b"POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\n\r\nhel".to_vec()],
+        Duration::ZERO,
+    );
+    assert_eq!(ex.status(), Some(200), "{:?}", ex.body);
+    assert!(ex.closed, "the unread body forces a close");
+}
+
+/// RFC 9112 section 6.1: an HTTP/1.0 streamed body is close-delimited, and
+/// both backends say so rather than promise a persistence they do not keep.
+#[test]
+fn an_http_10_streamed_response_says_close() {
+    struct One(bool);
+    impl armature_h1::service::futures_stream::Stream for One {
+        fn poll_next(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Result<bytes::Bytes, armature_h1::BodyError>>> {
+            let first = !self.0;
+            self.0 = true;
+            std::task::Poll::Ready(first.then(|| Ok(bytes::Bytes::from_static(b"streamed"))))
+        }
+    }
+    let ex = raw_exchange_with_service(
+        quick_limits(),
+        || {
+            |_req: Request| async {
+                Response::ok().with_body(armature_h1::ResponseBody::Stream(Box::pin(One(false))))
+            }
+        },
+        vec![b"GET / HTTP/1.0\r\nConnection: keep-alive\r\n\r\n".to_vec()],
+        Duration::ZERO,
+    );
+    let lower = ex.body.to_ascii_lowercase();
+    assert!(lower.contains("connection: close\r\n"), "{:?}", ex.body);
+    assert!(!lower.contains("keep-alive"), "{:?}", ex.body);
+    assert!(ex.body.ends_with("streamed"), "{:?}", ex.body);
+    assert!(ex.closed);
+}
+
+/// A malformed `Connection` token is dropped on its own, and exactly the same
+/// tokens reach the wire under either backend.
+#[test]
+fn a_malformed_connection_token_is_dropped_alone() {
+    let ex = raw_exchange_with_service(
+        quick_limits(),
+        || {
+            |_req: Request| async {
+                Response::text("hi").header(
+                    armature_h1::HeaderId::Connection,
+                    bytes::Bytes::from_static(b"x\x01y, x-hop"),
+                )
+            }
+        },
+        vec![b"GET / HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n".to_vec()],
+        Duration::ZERO,
+    );
+    let lower = ex.body.to_ascii_lowercase();
+    let mut tokens: Vec<&str> = lower
+        .split("\r\n")
+        .filter_map(|l| l.strip_prefix("connection:"))
+        .flat_map(|v| v.split(','))
+        .map(str::trim)
+        .collect();
+    tokens.sort_unstable();
+    assert_eq!(tokens, ["close", "x-hop"], "{:?}", ex.body);
 }

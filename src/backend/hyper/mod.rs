@@ -110,7 +110,11 @@ pub(crate) struct PhaseClock {
     /// failed, or empty from the start. `body_timeout` bounds the body's
     /// arrival, not the handler, so an expiry in [`Phase::Handler`] only
     /// counts while this is still `false`.
-    request_body_finished: Rc<Cell<bool>>,
+    ///
+    /// A fresh flag per request: a `Body` from an earlier request that a
+    /// handler kept alive holds the old one, so its eventual drop cannot mark
+    /// a later request's body finished.
+    request_body_finished: RefCell<Rc<Cell<bool>>>,
     notify: tokio::sync::Notify,
 }
 
@@ -122,7 +126,7 @@ impl PhaseClock {
             wrote_bytes: Cell::new(false),
             body_done: Cell::new(false),
             detached: Cell::new(false),
-            request_body_finished: Rc::new(Cell::new(false)),
+            request_body_finished: RefCell::new(Rc::new(Cell::new(false))),
             notify: tokio::sync::Notify::new(),
         }
     }
@@ -160,7 +164,7 @@ impl PhaseClock {
             self.body_done.set(false);
         }
         if p == Phase::Handler {
-            self.request_body_finished.set(false);
+            *self.request_body_finished.borrow_mut() = Rc::new(Cell::new(false));
         }
         self.phase.set(p);
         self.bump();
@@ -200,7 +204,7 @@ impl PhaseClock {
     /// The flag the current request's body reports finishing through,
     /// whether it was read to its end, failed, or never had any bytes.
     pub(crate) fn request_body_finished(&self) -> Rc<Cell<bool>> {
-        self.request_body_finished.clone()
+        self.request_body_finished.borrow().clone()
     }
 
     /// Record that the response body has no more frames to give.
@@ -260,7 +264,7 @@ async fn watchdog(clock: &PhaseClock, limits: &Limits, deadline: &mut ConnDeadli
                 // awaits no more bytes either — and the handler's own runtime
                 // is not bounded, as natively. Nothing to time until the phase
                 // moves.
-                if phase == Phase::Handler && clock.request_body_finished.get() {
+                if phase == Phase::Handler && clock.request_body_finished.borrow().get() {
                     deadline.disarm();
                     clock.notify.notified().await;
                     continue;

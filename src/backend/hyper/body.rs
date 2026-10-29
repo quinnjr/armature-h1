@@ -103,7 +103,10 @@ where
         self.stash.split_to(n)
     }
 
-    fn body_finished(&mut self) {
+    // One `HyperBodyIo` per request, and its flag is that request's own (the
+    // clock makes a fresh one per handler), so the generation has nothing to
+    // tell apart here.
+    fn body_finished(&mut self, _generation: u64) {
         if let Some(flag) = &self.finished {
             flag.set(true);
         }

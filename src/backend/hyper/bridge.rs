@@ -274,12 +274,20 @@ impl<S: H1Service + 'static>
             if is_head_request {
                 phase.note_body_end();
             }
+            // An HTTP/1.0 streamed body that is actually written has no framing
+            // but the close (hyper delimits it so, and closes): say `close`,
+            // as native does, rather than promise a persistence hyper will not
+            // keep.
+            let close_delimited = version == Version::Http10
+                && matches!(resp.body, crate::service::ResponseBody::Stream(_))
+                && !is_head_request
+                && !crate::write::forbids_body_framing(resp.status);
             Ok(convert_response(
                 resp,
                 &cfg,
                 version,
                 phase,
-                keep_alive && !force_close,
+                keep_alive && !force_close && !close_delimited,
                 is_head_request,
             ))
         })
@@ -470,14 +478,10 @@ fn convert_response(
         // followed by the server's `keep-alive` would close a connection the
         // response says stays open. Everything goes out as one value below.
         if id == HeaderId::Connection {
-            // Token by token, each held to hyper's own rule: one malformed
-            // token must not sink the combined value, and the server's
-            // persistence token with it.
-            connection_tokens.extend(
-                crate::write::non_persistence_tokens(&value)
-                    .filter(|t| ::hyper::http::HeaderValue::from_bytes(t).is_ok())
-                    .map(<[u8]>::to_vec),
-            );
+            // Through `write`'s filter, token by token, so exactly the
+            // tokens the native writer sends go out here too, and one
+            // malformed token cannot sink the combined value.
+            connection_tokens.extend(crate::write::connection_tokens(&value).map(<[u8]>::to_vec));
             continue;
         }
         // Dropped rather than written, for the reason the native writer gives:

@@ -102,6 +102,8 @@ struct IoState<IO> {
     /// Whether the current request's body is finished — read to its end or
     /// failed — so its deadline has nothing left to bound.
     body_finished: bool,
+    /// The current request body's generation; see [`BodyIo::body_started`].
+    body_generation: u64,
     /// How many bytes of a `100 Continue` are owed to the peer and not yet
     /// written; zero when none is.
     ///
@@ -196,8 +198,16 @@ impl<IO: AsyncRead + AsyncWrite + Unpin> BodyIo for IoState<IO> {
         self.buf = joined;
     }
 
-    fn body_finished(&mut self) {
-        self.body_finished = true;
+    fn body_started(&mut self) -> u64 {
+        self.body_generation = self.body_generation.wrapping_add(1);
+        self.body_finished = false;
+        self.body_generation
+    }
+
+    fn body_finished(&mut self, generation: u64) {
+        if generation == self.body_generation {
+            self.body_finished = true;
+        }
     }
 
     fn poll_send_continue(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -281,6 +291,7 @@ where
                 head_end: None,
                 pending_continue: 0,
                 body_finished: false,
+                body_generation: 0,
             })),
             service,
             cfg,
@@ -926,16 +937,13 @@ where
                                     // there is no 408 to give; the connection
                                     // closes.
                                     //
-                                    // Only while the request's `Body` is still
-                                    // alive: it holds the one reference to the
-                                    // transport besides this connection's, so a
-                                    // count above one says something can still
-                                    // read it. A body the handler dropped unread
-                                    // awaits nothing, and a download or event
-                                    // stream answering it must not be cut off.
+                                    // Only while the body is still awaited: one
+                                    // read to its end, failed, or dropped unread
+                                    // (a download or event stream answering a
+                                    // body it ignored) has reported finished,
+                                    // and must not be cut off.
                                     let body_awaited = |shared: &Rc<RefCell<IoState<IO>>>| {
-                                        Rc::strong_count(shared) > 1
-                                            && !shared.borrow().body_finished
+                                        !shared.borrow().body_finished
                                     };
                                     let bounded = self
                                         .body_deadline_at
@@ -949,8 +957,6 @@ where
                                             self.deadline.arm(at.saturating_duration_since(
                                                 tokio::time::Instant::now(),
                                             ));
-                                            // Borrowed, not cloned: a clone
-                                            // would itself count as a reader.
                                             let shared = &self.shared;
                                             let deadline = &mut self.deadline;
                                             let item = std::future::poll_fn(|cx| {
@@ -1949,6 +1955,41 @@ mod tests {
         .await;
         assert!(out.contains("second"), "{out}");
         assert!(out.ends_with("0\r\n\r\n"), "a clean end: {out}");
+    }
+
+    /// A `Body` a handler kept from an earlier request cannot make a later
+    /// request's body look awaited — nor, when it is finally dropped, finished.
+    #[tokio::test]
+    async fn a_body_kept_from_an_earlier_request_does_not_affect_a_later_one() {
+        let kept: Rc<RefCell<Vec<Body>>> = Rc::new(RefCell::new(Vec::new()));
+        let stash = kept.clone();
+        let service = move |mut req: Request| {
+            let stash = stash.clone();
+            async move {
+                if req.head.path() == "/keep" {
+                    let _ = req.body.collect(64).await;
+                    stash.borrow_mut().push(req.body);
+                    return Response::text("kept");
+                }
+                Response::ok().with_body(ResponseBody::Stream(Box::pin(PausingStream {
+                    pause: Box::pin(tokio::time::sleep(Duration::from_millis(500))),
+                    stage: 0,
+                })))
+            }
+        };
+        let out = exchange(
+            b"POST /keep HTTP/1.1\r\nHost: a\r\nContent-Length: 2\r\n\r\nhi\
+              POST /stream HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello",
+            service,
+            Limits {
+                body_timeout: Duration::from_millis(200),
+                ..Default::default()
+            },
+        )
+        .await;
+        assert!(out.contains("kept"), "{out}");
+        assert!(out.contains("second"), "the later stream ran intact: {out}");
+        assert!(out.ends_with("0\r\n\r\n"), "{out}");
     }
 
     /// RFC 9110 sections 10.1.1 and 15.2: no 1xx to an HTTP/1.0 client.
