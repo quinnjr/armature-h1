@@ -222,11 +222,19 @@ impl PhaseClock {
         self.request_body_finished.borrow().clone()
     }
 
-    /// A future that completes the next time the phase moves (or the body
-    /// finishes). Create it before checking the phase, so a move in between
-    /// still wakes it.
-    pub(crate) fn notified(&self) -> tokio::sync::futures::Notified<'_> {
-        self.notify.notified()
+    /// Wait until the clock is out of [`Phase::Write`]: the previous
+    /// response fully written.
+    ///
+    /// The notification is taken before each check, so a move landing in
+    /// between still wakes it.
+    pub(crate) async fn leave_write(&self) {
+        loop {
+            let moved = self.notify.notified();
+            if self.phase.get() != Phase::Write {
+                return;
+            }
+            moved.await;
+        }
     }
 
     /// Set the current request body's deadline; see `body_deadline_at`.
@@ -1690,5 +1698,42 @@ mod tests {
             assert!(!c.wrote_bytes());
             assert_eq!(c.generation.get(), generation, "a detached clock is quiet");
         }
+    }
+
+    /// The bridge waits out a previous response still being written before
+    /// it enters `Handler`: `leave_write` stays pending in `Write`, through a
+    /// write that only re-arms it, and completes once the response is out.
+    #[tokio::test]
+    async fn leave_write_waits_until_the_previous_response_is_out() {
+        let clock = Rc::new(PhaseClock::new(Phase::Write));
+        let waiting = clock.clone();
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async move {
+                let task = tokio::task::spawn_local(async move { waiting.leave_write().await });
+                tokio::task::yield_now().await;
+                assert!(!task.is_finished(), "pending while the response is written");
+                clock.note_write();
+                tokio::task::yield_now().await;
+                assert!(
+                    !task.is_finished(),
+                    "a write is not the end of the response"
+                );
+                clock.note_body_end();
+                clock.note_flush();
+                tokio::time::timeout(std::time::Duration::from_secs(1), task)
+                    .await
+                    .expect("done once the response is out")
+                    .unwrap();
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn leave_write_is_immediate_outside_write() {
+        let clock = PhaseClock::new(Phase::Idle);
+        tokio::time::timeout(std::time::Duration::from_secs(1), clock.leave_write())
+            .await
+            .expect("not in Write: nothing to wait for");
     }
 }

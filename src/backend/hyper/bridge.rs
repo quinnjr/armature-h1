@@ -151,13 +151,7 @@ impl<S: H1Service + 'static>
             // tail. So wait, as natively, until it is out: hyper keeps
             // flushing while it polls this future, and `write_timeout` still
             // bounds the wait.
-            loop {
-                let moved = phase.notified();
-                if phase.phase() != Phase::Write {
-                    break;
-                }
-                moved.await;
-            }
+            phase.leave_write().await;
             phase.set(Phase::Handler);
             phase.set_body_deadline(
                 tokio::time::Instant::now().checked_add(cfg.limits.body_timeout),
