@@ -9,9 +9,9 @@ of what could not be shimmed. Every
 `#[cfg_attr(feature = "hyper-backend", ignore)]` in the test suite must
 reference a row here; a row without a strong justification is a bug.
 
-**Verified against hyper 1.10–1.11 and http 1.4.** `Cargo.toml` floors
-`hyper` at `"1.11"`; this re-review re-checked every citation below against
-both `hyper` 1.10.1 and 1.11.0. Every "why it cannot be shimmed" below cites
+**Verified against hyper 1.11 and http 1.4.** `Cargo.toml` floors
+`hyper` at `"1.11"`; every citation below was checked against `hyper`
+1.11.0 (the bare-LF trailer row also against 1.12.0). Every "why it cannot be shimmed" below cites
 the behaviour of a specific upstream version, and several cite specific source
 files. A minor-version bump of either crate can add the hook a row says does
 not exist, or move the code a row points at: recheck the citations — and

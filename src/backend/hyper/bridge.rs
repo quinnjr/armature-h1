@@ -972,6 +972,23 @@ mod tests {
         assert_eq!(header_of(&out, "connection").as_deref(), Some("close"));
     }
 
+    /// A length named both ways is a duplicate, and a duplicate is stale: the
+    /// bridge drops both and hyper frames the body itself, once.
+    #[test]
+    fn a_length_spelled_both_ways_is_a_duplicate() {
+        let resp = crate::service::Response::new(200)
+            .header(HeaderId::ContentLength, Bytes::from_static(b"2"))
+            .header(
+                HeaderId::Other(crate::ByteStr::from_static("Content-Length")),
+                Bytes::from_static(b"2"),
+            )
+            .with_body(crate::service::ResponseBody::Full(Bytes::from_static(
+                b"hi",
+            )));
+        let out = conv(resp, Version::Http11);
+        assert_eq!(out.headers().get_all("content-length").iter().count(), 0);
+    }
+
     /// `http::StatusCode` has no representation for a status outside
     /// `100..=999`, so the bridge degrades to `500`. See BACKENDS.md.
     #[test]

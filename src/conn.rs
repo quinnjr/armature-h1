@@ -2563,6 +2563,46 @@ mod tests {
         assert!(out.contains("server: armature-h1"), "{out}");
     }
 
+    /// A handler `Server` named through `HeaderId::Other` still suppresses
+    /// the configured one, so the response carries a single `Server`.
+    #[tokio::test]
+    async fn a_handler_server_spelled_as_other_suppresses_the_configured_one() {
+        async fn own_server(_req: Request) -> Response {
+            Response::ok().header(
+                HeaderId::Other(crate::ByteStr::from_static("Server")),
+                Bytes::from_static(b"handler"),
+            )
+        }
+        let (mut client, server) = tokio::io::duplex(4096);
+        let local = tokio::task::LocalSet::new();
+        let conn = Connection::new(
+            server,
+            own_server,
+            Rc::new(ConnConfig {
+                limits: Limits::default(),
+                tick: Duration::from_millis(10),
+                server_name: Some(Bytes::from_static(b"armature-h1")),
+            }),
+            Rc::new(RefCell::new(DateCache::new())),
+        );
+        let task = local.spawn_local(async move { conn.serve().await });
+        let out = local
+            .run_until(async move {
+                client
+                    .write_all(b"GET / HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n")
+                    .await
+                    .unwrap();
+                let mut out = Vec::new();
+                let _ = tokio::time::timeout(Duration::from_secs(2), client.read_to_end(&mut out))
+                    .await;
+                let _ = task.await;
+                String::from_utf8_lossy(&out).into_owned()
+            })
+            .await;
+        assert_eq!(out.matches("server: ").count(), 1, "{out}");
+        assert!(out.contains("server: handler"), "{out}");
+    }
+
     #[tokio::test]
     async fn response_headers_from_the_handler_are_emitted() {
         async fn tagged(_req: Request) -> Response {
