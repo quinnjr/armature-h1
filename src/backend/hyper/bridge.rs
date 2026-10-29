@@ -414,6 +414,8 @@ fn convert_response(
         .status(status)
         .version(wire_version(version));
     let mut has_server = false;
+    // A handler's `Connection` tokens other than the persistence ones.
+    let mut connection_tokens: Vec<Vec<u8>> = Vec::new();
     // Parity with `conn::write_response`: a handler `Connection: close` is
     // acted on, not just echoed.
     let keep_alive = keep_alive
@@ -462,15 +464,18 @@ fn convert_response(
         // `Connection: upgrade` its handshake needs.
         // The filter is `write`'s, so the backends cannot disagree on which
         // tokens are the server's; a field with none of them passes as is.
-        let value = if id == HeaderId::Connection && crate::write::has_persistence_token(&value) {
-            let rest: Vec<&[u8]> = crate::write::non_persistence_tokens(&value).collect();
-            if rest.is_empty() {
-                continue;
+        //
+        // Gathered rather than written: hyper 1.11 decides keep-alive from
+        // the *first* `Connection` value alone, so a handler's `x-hop`
+        // followed by the server's `keep-alive` would close a connection the
+        // response says stays open. Everything goes out as one value below.
+        if id == HeaderId::Connection {
+            if crate::write::valid_field_value(&value) {
+                connection_tokens
+                    .extend(crate::write::non_persistence_tokens(&value).map(<[u8]>::to_vec));
             }
-            Bytes::from(rest.join(&b", "[..]))
-        } else {
-            value
-        };
+            continue;
+        }
         // Dropped rather than written, for the reason the native writer gives:
         // there is no error left to return once a response is being built, and
         // dropping is the only outcome that does not put attacker-chosen bytes
@@ -514,13 +519,27 @@ fn convert_response(
     // which hyper leaves implicit on 1.0.
     // The persistence token is always the server's own, and a 101's
     // connection continues as another protocol, where it means nothing.
-    if status != ::hyper::http::StatusCode::SWITCHING_PROTOCOLS
-        && let Some(field) = crate::write::connection_field(version, keep_alive)
-    {
-        builder = builder.header(
-            ::hyper::http::header::CONNECTION,
-            ::hyper::http::HeaderValue::from_static(field),
-        );
+    //
+    // One `Connection` value carrying the handler's other tokens and the
+    // server's own, so every hyper version reads the persistence decision —
+    // 1.11 looks at the first value only.
+    let server_token = (status != ::hyper::http::StatusCode::SWITCHING_PROTOCOLS)
+        .then(|| crate::write::connection_field(version, keep_alive))
+        .flatten();
+    if connection_tokens.is_empty() {
+        if let Some(field) = server_token {
+            builder = builder.header(
+                ::hyper::http::header::CONNECTION,
+                ::hyper::http::HeaderValue::from_static(field),
+            );
+        }
+    } else {
+        if let Some(field) = server_token {
+            connection_tokens.push(field.as_bytes().to_vec());
+        }
+        if let Ok(v) = ::hyper::http::HeaderValue::from_bytes(&connection_tokens.join(&b", "[..])) {
+            builder = builder.header(::hyper::http::header::CONNECTION, v);
+        }
     }
 
     builder
@@ -811,6 +830,25 @@ mod tests {
     /// HTTP/1.0 persistence has to be stated: hyper closes a 1.0 connection
     /// whose response does not say otherwise, and the native writer emits
     /// exactly this field for the same case.
+    /// One `Connection` value carrying both the handler's other tokens and
+    /// the server's persistence token: hyper 1.11 reads the first value only,
+    /// and would close a connection the response says stays open.
+    #[test]
+    fn connection_tokens_go_out_as_one_value() {
+        let out = conv_full(
+            crate::service::Response::new(200).header(
+                HeaderId::Connection,
+                Bytes::from_static(b"keep-alive, x-hop"),
+            ),
+            Version::Http10,
+            true,
+            None,
+        );
+        let values: Vec<_> = out.headers().get_all("connection").iter().collect();
+        assert_eq!(values.len(), 1, "{values:?}");
+        assert_eq!(values[0].as_bytes(), b"x-hop, keep-alive");
+    }
+
     #[test]
     fn http10_keep_alive_is_stated_and_http11_is_not() {
         let out = conv_full(

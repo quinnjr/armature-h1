@@ -226,6 +226,10 @@ pub struct Connection<IO, S> {
     /// The `Limits::handler_timeout` clock, created only when one is set, so a
     /// connection without it costs no second timer.
     handler_deadline: Option<ConnDeadline>,
+    /// When the current request's body must have arrived by, set as its
+    /// handler is called. Outlives the handler: a streamed response may still
+    /// be reading the body, and the deadline holds until the body finishes.
+    body_deadline_at: Option<tokio::time::Instant>,
     out: BytesMut,
     /// Reused across requests: allocating a fresh flag per request would put an
     /// allocation back on the steady-state path.
@@ -283,6 +287,7 @@ where
             date,
             deadline,
             handler_deadline,
+            body_deadline_at: None,
             out: BytesMut::with_capacity(1024),
             body_read: Rc::new(Cell::new(false)),
             peer: None,
@@ -454,6 +459,10 @@ where
             // exists before the handler is even called, so a handler that
             // panics — in `call` itself or in its first poll — does not take
             // finished responses down with it.
+            // `None` when it cannot be represented: `Duration::MAX` is how the
+            // deadline is switched off.
+            self.body_deadline_at =
+                tokio::time::Instant::now().checked_add(self.cfg.limits.body_timeout);
             let mut held = None;
             if !self.out.is_empty() {
                 if expects_continue {
@@ -909,7 +918,43 @@ where
                                     if !self.out.is_empty() {
                                         self.flush().await?;
                                     }
-                                    std::future::poll_fn(|cx| s.as_mut().poll_next(cx)).await
+                                    // A stream fed by the request body is still
+                                    // waiting on the peer, and the body's
+                                    // deadline still holds: a peer that sends
+                                    // half the body and stops must not hold the
+                                    // connection forever. The head is out, so
+                                    // there is no 408 to give; the connection
+                                    // closes.
+                                    let bounded = self
+                                        .body_deadline_at
+                                        .filter(|_| !self.shared.borrow().body_finished);
+                                    match bounded {
+                                        None => {
+                                            std::future::poll_fn(|cx| s.as_mut().poll_next(cx))
+                                                .await
+                                        }
+                                        Some(at) => {
+                                            self.deadline.arm(at.saturating_duration_since(
+                                                tokio::time::Instant::now(),
+                                            ));
+                                            let shared = self.shared.clone();
+                                            let deadline = &mut self.deadline;
+                                            let item = std::future::poll_fn(|cx| {
+                                                if !shared.borrow().body_finished
+                                                    && deadline.poll_expired(cx).is_ready()
+                                                {
+                                                    return Poll::Ready(None);
+                                                }
+                                                s.as_mut().poll_next(cx).map(Some)
+                                            })
+                                            .await;
+                                            self.deadline.disarm();
+                                            let Some(item) = item else {
+                                                return Ok(Disposition::Close);
+                                            };
+                                            item
+                                        }
+                                    }
                                 }
                             };
                         match next {
@@ -1816,6 +1861,27 @@ mod tests {
             );
             assert!(closed, "{status}");
         }
+    }
+
+    /// A streamed response still reading the request body stays under the
+    /// body deadline: a peer that sends part of the body and stalls has its
+    /// connection closed, not held forever.
+    #[tokio::test]
+    async fn a_stalled_body_behind_a_streamed_response_is_bounded() {
+        let (out, closed) = exchange_raw(
+            b"POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 10\r\n\r\nabc",
+            |req: Request| async move {
+                Response::ok().with_body(ResponseBody::Stream(Box::pin(EchoStream(req.body))))
+            },
+            Limits {
+                body_timeout: Duration::from_millis(200),
+                ..Default::default()
+            },
+        )
+        .await;
+        assert!(out.starts_with("HTTP/1.1 200 OK"), "{out}");
+        assert!(closed, "the connection must close at the body deadline: {out}");
+        assert!(!out.ends_with("0\r\n\r\n"), "never a clean end: {out}");
     }
 
     /// RFC 9110 sections 10.1.1 and 15.2: no 1xx to an HTTP/1.0 client.
