@@ -222,6 +222,13 @@ impl PhaseClock {
         self.request_body_finished.borrow().clone()
     }
 
+    /// A future that completes the next time the phase moves (or the body
+    /// finishes). Create it before checking the phase, so a move in between
+    /// still wakes it.
+    pub(crate) fn notified(&self) -> tokio::sync::futures::Notified<'_> {
+        self.notify.notified()
+    }
+
     /// Set the current request body's deadline; see `body_deadline_at`.
     pub(crate) fn set_body_deadline(&self, at: Option<tokio::time::Instant>) {
         self.body_deadline_at.set(at);

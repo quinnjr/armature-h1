@@ -1470,3 +1470,41 @@ fn a_fixed_response_is_not_cut_off_at_the_body_deadline() {
     let body_at = ex.body.find("\r\n\r\n").map_or(0, |i| i + 4);
     assert_eq!(ex.body.len() - body_at, LEN, "the whole response arrived");
 }
+
+/// A held pipelined response is written in full before the next request's
+/// handler phase begins: a body deadline on that next request can never cut
+/// it short, nor splice a 408 into its tail.
+#[test]
+fn a_held_response_is_never_cut_short_by_the_next_requests_body_deadline() {
+    const LEN: usize = 4 << 20;
+    let ex = raw_exchange_with_service(
+        quick_limits(),
+        || {
+            |mut req: Request| async move {
+                if req.head.path() == "/big" {
+                    return Response::ok().with_body(armature_h1::ResponseBody::Full(
+                        bytes::Bytes::from(vec![b'a'; LEN]),
+                    ));
+                }
+                let _ = req.body.collect(64).await;
+                Response::text("second")
+            }
+        },
+        vec![
+            b"GET /big HTTP/1.1\r\nHost: a\r\n\r\n\
+              POST /x HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhel"
+                .to_vec(),
+            b"lo".to_vec(),
+        ],
+        Duration::from_millis(1200),
+    );
+    let first_body = ex.body.find("\r\n\r\n").map_or(0, |i| i + 4);
+    let rest = &ex.body[first_body..];
+    let run = rest.bytes().take_while(|&b| b == b'a').count();
+    assert_eq!(run, LEN, "the first response arrived whole");
+    assert!(
+        rest[run..].starts_with("HTTP/1.1 "),
+        "and the next response follows it, not spliced into it: {:?}",
+        &rest[run..run.saturating_add(60).min(rest.len())]
+    );
+}

@@ -144,6 +144,20 @@ impl<S: H1Service + 'static>
         Box::pin(async move {
             // The head is parsed by the time hyper calls us: everything from
             // here to the response is the native loop's handler/body window.
+            // hyper calls the service for an already-buffered pipelined
+            // request once the previous response is *buffered*, not written.
+            // Entering `Handler` now would drop that response's write
+            // deadline and let a body-phase 408 be spliced into its unwritten
+            // tail. So wait, as natively, until it is out: hyper keeps
+            // flushing while it polls this future, and `write_timeout` still
+            // bounds the wait.
+            loop {
+                let moved = phase.notified();
+                if phase.phase() != Phase::Write {
+                    break;
+                }
+                moved.await;
+            }
             phase.set(Phase::Handler);
             phase.set_body_deadline(
                 tokio::time::Instant::now().checked_add(cfg.limits.body_timeout),

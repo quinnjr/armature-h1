@@ -240,6 +240,9 @@ pub struct Connection<IO, S> {
     /// handler is called. Outlives the handler: a streamed response may still
     /// be reading the body, and the deadline holds until the body finishes.
     body_deadline_at: Option<tokio::time::Instant>,
+    /// Earlier pipelined responses were put back in `out` to go out with the
+    /// current one's head, so the body deadline restarts once they have.
+    held_in_out: bool,
     out: BytesMut,
     /// Reused across requests: allocating a fresh flag per request would put an
     /// allocation back on the steady-state path.
@@ -299,6 +302,7 @@ where
             deadline,
             handler_deadline,
             body_deadline_at: None,
+            held_in_out: false,
             out: BytesMut::with_capacity(1024),
             body_read: Rc::new(Cell::new(false)),
             peer: None,
@@ -503,7 +507,12 @@ where
                     bytes.unsplit(std::mem::take(&mut self.out));
                     self.out = bytes;
                     match polled {
-                        Poll::Ready(resp) => early = Some(resp),
+                        Poll::Ready(resp) => {
+                            early = Some(resp);
+                            // Written with this response's head instead; the
+                            // body deadline restarts after that flush.
+                            self.held_in_out = true;
+                        }
                         Poll::Pending => {
                             self.flush().await?;
                             self.start_body_deadline();
@@ -553,10 +562,11 @@ where
                     // handler composing its answer to a bad body is not cut
                     // off with a 408 it did nothing to earn.
                     let body_finished = || self.shared.borrow().body_finished;
-                    // One deadline per body, counted from its head: the same
-                    // instant a streamed response is later held to, not a
-                    // fresh window opened after any held output was flushed.
-                    // `None` is a deadline switched off with `Duration::MAX`.
+                    // One deadline per body, from when its handler is called —
+                    // restarted after any earlier pipelined responses were
+                    // flushed — and the same instant a streamed response is
+                    // later held to. `None` is a deadline switched off with
+                    // `Duration::MAX`.
                     let body_armed = !body_finished() && self.body_deadline_at.is_some();
                     if let Some(at) = self.body_deadline_at.filter(|_| body_armed) {
                         self.deadline
@@ -929,6 +939,11 @@ where
                     //
                     // Flush the head first so the peer can begin processing.
                     self.flush().await?;
+                    // Earlier pipelined responses went out with it: that slow
+                    // write is `write_timeout`'s, not the request body's.
+                    if std::mem::take(&mut self.held_in_out) {
+                        self.start_body_deadline();
+                    }
                     loop {
                         // Poll once without committing to a wait. If the stream
                         // is not ready, whatever has been coalesced so far is
@@ -2070,6 +2085,71 @@ mod tests {
             out.ends_with("hello"),
             "{}",
             &out[out.len().saturating_sub(200)..]
+        );
+    }
+
+    /// The same when the handler answers at once with a stream over its body:
+    /// the held responses go out with the stream's head, and that flush does
+    /// not spend the body's deadline either.
+    #[tokio::test]
+    async fn a_slow_flush_before_a_streamed_echo_does_not_expire_its_body() {
+        let service = |req: Request| async move {
+            if req.head.path() == "/big" {
+                let mut r = Response::new(200);
+                r.body = ResponseBody::Full(Bytes::from(vec![b'a'; 30 * 1024]));
+                return r;
+            }
+            Response::ok().with_body(ResponseBody::Stream(Box::pin(EchoStream(req.body))))
+        };
+        let (mut client, server) = tokio::io::duplex(1024);
+        let local = tokio::task::LocalSet::new();
+        let conn = Connection::new(
+            server,
+            service,
+            cfg(Limits {
+                body_timeout: Duration::from_millis(300),
+                ..Default::default()
+            }),
+            Rc::new(RefCell::new(DateCache::new())),
+        );
+        let server_task = local.spawn_local(async move { conn.serve().await });
+        let out = local
+            .run_until(async move {
+                client
+                    .write_all(
+                        b"GET /big HTTP/1.1\r\nHost: a\r\n\r\n\
+                          POST /echo HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhe",
+                    )
+                    .await
+                    .unwrap();
+                // Slow to read: the held response finishes flushing well past
+                // a deadline counted from the handler's call.
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                let mut out = Vec::new();
+                let mut buf = vec![0u8; 4096];
+                while out.len() < 30 * 1024 {
+                    let n = client.read(&mut buf).await.unwrap();
+                    assert!(n > 0, "closed early");
+                    out.extend_from_slice(&buf[..n]);
+                }
+                // The rest of the body, inside the window restarted after it.
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                client.write_all(b"llo").await.unwrap();
+                let _ = tokio::time::timeout(Duration::from_secs(3), client.read_to_end(&mut out))
+                    .await;
+                let _ = server_task.await;
+                String::from_utf8_lossy(&out).into_owned()
+            })
+            .await;
+        assert!(
+            out.ends_with("0\r\n\r\n"),
+            "a clean end: {}",
+            &out[out.len().saturating_sub(120)..]
+        );
+        assert!(
+            out.contains("llo"),
+            "{}",
+            &out[out.len().saturating_sub(120)..]
         );
     }
 

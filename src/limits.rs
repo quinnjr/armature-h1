@@ -38,7 +38,9 @@ pub struct Limits {
     pub max_body_bytes: u64,
     /// Deadline for the complete head to arrive once the first byte does.
     pub header_timeout: Duration,
-    /// Deadline for the complete body to arrive once the head is parsed.
+    /// Deadline for the complete body to arrive, counted from when its
+    /// handler is called — after any earlier pipelined responses have been
+    /// written, which is `write_timeout`'s to bound, not the body's.
     ///
     /// It bounds the body, not the handler: once the body has been read to
     /// its end, or when the request has none, the handler may run as long as
