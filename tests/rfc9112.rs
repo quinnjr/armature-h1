@@ -415,6 +415,42 @@ fn fragment_in_target_400_close() {
     raw_exchange(b"GET /a#frag HTTP/1.1\r\nHost: a\r\n\r\n").assert_rejected_and_closed(400);
 }
 
+/// Targets outside the URI character set, a `%` that starts no percent-encoding,
+/// and targets matching none of the four RFC 9112 section 3.2 forms are refused
+/// by both backends. `http::Uri` alone admits every one of these — `@host:port`
+/// as authority-form under GET, which would reach `Head::path` without a leading
+/// `/` — so the hyper bridge re-validates the target it is handed.
+#[test]
+fn malformed_targets_400_close_on_both_backends() {
+    for raw in [
+        &b"GET /a\\b HTTP/1.1\r\nHost: a\r\n\r\n"[..],
+        &b"GET /a\xc3\xa9 HTTP/1.1\r\nHost: a\r\n\r\n"[..],
+        &b"GET /a%zz HTTP/1.1\r\nHost: a\r\n\r\n"[..],
+        &b"GET @evil.example:80 HTTP/1.1\r\nHost: a\r\n\r\n"[..],
+        &b"GET evil.example HTTP/1.1\r\nHost: a\r\n\r\n"[..],
+        &b"GET * HTTP/1.1\r\nHost: a\r\n\r\n"[..],
+    ] {
+        raw_exchange(raw).assert_rejected_and_closed(400);
+    }
+}
+
+/// RFC 9112 section 7.1.2: the trailer section is field lines ending in CRLF.
+/// A bare LF there is a line-ending disagreement between hops, and under this
+/// one an embedded request vanished into the "trailers" — so it is refused.
+#[test]
+#[cfg_attr(
+    feature = "hyper-backend",
+    ignore = "see BACKENDS.md: bare LF in the chunked trailer section \
+              (hyper discards the section before the bridge sees it)"
+)]
+fn bare_lf_in_trailer_section_400_close() {
+    raw_exchange(
+        b"POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n\
+          3\r\nabc\r\n0\r\n\nGET /hidden HTTP/1.1\r\nHost: a\r\n\r\n",
+    )
+    .assert_rejected_and_closed(400);
+}
+
 /// Positive twin of `fragment_in_target_400_close` for the hyper backend:
 /// BACKENDS.md documents `http::uri::PathAndQuery::from_shared` truncating
 /// at `#` before hyper builds the `Request`, so the bridge never sees the

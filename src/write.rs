@@ -461,7 +461,7 @@ pub(crate) fn write_head_for(
         if !ok {
             continue;
         }
-        match id {
+        match id.canonical() {
             HeaderId::Date => has_date = true,
             HeaderId::ContentLength => {
                 len_count += 1;
@@ -537,6 +537,9 @@ pub(crate) fn write_head_for(
 
     // Handler-supplied headers first, so the checks below can see them.
     for (i, (id, value)) in resp.headers.iter().enumerate() {
+        // Judged, and written, as the field the wire reads: an `Other` that
+        // spells `content-length` is a framing field like any other.
+        let id = id.canonical();
         if stale_content_length && id == &HeaderId::ContentLength {
             tracing::warn!("dropping response content-length that disagrees with the body length");
             continue;
@@ -966,6 +969,37 @@ mod tests {
         );
         assert_eq!(got.matches("transfer-encoding").count(), 1, "{got}");
         assert!(got.contains("transfer-encoding: chunked\r\n"), "{got}");
+    }
+
+    #[test]
+    fn an_other_spelling_a_framing_field_is_judged_as_that_field() {
+        // `HeaderId::Other` is public, so a relay handler can copy upstream
+        // names into it verbatim. Judged as opaque names, these went out as
+        // written beside the writer's own framing: two lengths, a chunked
+        // advertisement over an unchunked body, and both persistence tokens.
+        let other = |n: &'static str| HeaderId::Other(crate::ByteStr::from_static(n));
+        let got = render(
+            Version::Http11,
+            &head_of(
+                200,
+                &[
+                    (other("content-length"), "0"),
+                    (other("Transfer-Encoding"), "chunked"),
+                    (other("Connection"), "keep-alive, x-hop"),
+                ],
+            ),
+            &OutBody::Fixed(Bytes::from_static(b"hello")),
+            false,
+        );
+        assert_eq!(
+            got,
+            "HTTP/1.1 200 OK\r\n\
+             connection: x-hop\r\n\
+             date: Thu, 01 Jan 1970 00:00:00 GMT\r\n\
+             content-length: 5\r\n\
+             connection: close\r\n\
+             \r\n"
+        );
     }
 
     #[test]

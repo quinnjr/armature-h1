@@ -887,8 +887,9 @@ where
         // A handler that says `Connection: close` is taken at its word. The
         // writer states persistence itself and drops such a field, so the
         // socket's fate and what the response says about it cannot disagree.
-        if header::all(&headers, &HeaderId::Connection).any(|v| header::value_has_token(v, "close"))
-        {
+        if headers.iter().any(|(id, v)| {
+            id.canonical() == &HeaderId::Connection && header::value_has_token(v, "close")
+        }) {
             keep_alive = false;
         }
 
@@ -905,7 +906,9 @@ where
         }
 
         if let Some(name) = &self.cfg.server_name
-            && header::get(&headers, &HeaderId::Server).is_none()
+            && !headers
+                .iter()
+                .any(|(id, _)| id.canonical() == &HeaderId::Server)
         {
             headers.push((HeaderId::Server, name.clone()));
         }
@@ -1898,6 +1901,30 @@ mod tests {
         .await;
         assert_eq!(out.matches("HTTP/1.1 200").count(), 1, "{out}");
         assert_eq!(out.matches("connection").count(), 1, "{out}");
+        assert!(closed);
+    }
+
+    /// The same when the handler names the field through `HeaderId::Other`
+    /// rather than the interned variant.
+    #[tokio::test]
+    async fn a_handler_close_spelled_as_other_closes_the_connection() {
+        let (out, closed) = exchange_raw(
+            b"GET / HTTP/1.1\r\nHost: a\r\n\r\nGET / HTTP/1.1\r\nHost: a\r\n\r\n",
+            |_req: Request| async {
+                Response::text("hi").header(
+                    HeaderId::Other(crate::ByteStr::from_static("Connection")),
+                    Bytes::from_static(b"close"),
+                )
+            },
+            Limits::default(),
+        )
+        .await;
+        assert_eq!(out.matches("HTTP/1.1 200").count(), 1, "{out}");
+        assert_eq!(
+            out.to_ascii_lowercase().matches("connection").count(),
+            1,
+            "{out}"
+        );
         assert!(closed);
     }
 

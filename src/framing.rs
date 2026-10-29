@@ -491,7 +491,6 @@ mod tests {
             &b"GET http://trusted@evil.example/ HTTP/1.1\r\nHost: evil.example\r\n\r\n"[..],
             b"GET http:///x HTTP/1.1\r\nHost: a\r\n\r\n",
             b"GET http://a.example:99999/ HTTP/1.1\r\nHost: a.example\r\n\r\n",
-            b"GET http://a%zz/ HTTP/1.1\r\nHost: a\r\n\r\n",
         ] {
             assert_eq!(
                 decide(&head(raw), &Limits::default()),
@@ -499,6 +498,22 @@ mod tests {
                 "{raw:?}"
             );
         }
+
+        // A broken percent-encoding no longer gets past the parser, but the
+        // authority check still refuses one on its own: `decide` is also run on
+        // heads the hyper bridge builds.
+        let mut headers = crate::header::HeaderVec::new();
+        headers.push((crate::HeaderId::Host, Bytes::from_static(b"a")));
+        let broken = crate::Head::new(
+            crate::Method::Get,
+            crate::ByteStr::from_static("http://a%zz/"),
+            crate::Version::Http11,
+            headers,
+        );
+        assert_eq!(
+            decide(&broken, &Limits::default()),
+            Err(FramingError::InvalidAuthority)
+        );
     }
 
     /// CONNECT's target is its authority, held to the same rules.
