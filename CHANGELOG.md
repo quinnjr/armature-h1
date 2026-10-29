@@ -17,6 +17,10 @@ every case measured (GET: 30.3k → 11.3k instructions, axum 12.0k; pipelined:
 11.4k → 8.7k, axum 9.1k), syscalls per request match it (4 → 2), and a
 pipelined batch is served at roughly 4.5× the rate.
 
+- The once-per-second `Date` reformat writes straight into its cache instead of
+  through `httpdate::fmt_http_date`'s `String`, so the steady-state path is
+  allocation-free across second boundaries too. This was also the source of an
+  occasional `alloc_regression` failure.
 - Reads fill the buffer's spare capacity through tokio's `read_buf` instead of
   zero-filling 8 KiB on every read poll, the `Pending` one included.
 - `ConnDeadline` arms lazily: it records the deadline and touches the timer

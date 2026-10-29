@@ -48,11 +48,16 @@ impl DateCache {
             .map(|d| d.as_secs())
             .unwrap_or(0);
         if !self.valid || secs != self.secs {
-            let formatted = httpdate::fmt_http_date(now);
-            debug_assert_eq!(formatted.len(), DATE_LEN);
-            let bytes = formatted.as_bytes();
-            let n = bytes.len().min(DATE_LEN);
-            self.buf[..n].copy_from_slice(&bytes[..n]);
+            // Formatted straight into the buffer: `fmt_http_date` returns a
+            // `String`, which put one allocation on the request path every
+            // second. An IMF-fixdate is always exactly `DATE_LEN` bytes, so the
+            // write cannot run out of room.
+            let mut out = &mut self.buf[..];
+            let written = std::io::Write::write_fmt(
+                &mut out,
+                format_args!("{}", httpdate::HttpDate::from(now)),
+            );
+            debug_assert!(written.is_ok() && out.is_empty());
             self.secs = secs;
             self.valid = true;
         }
