@@ -18,14 +18,17 @@ pub(crate) struct HyperBodyIo<B> {
     /// Bytes the `Body` took but did not consume, or pushed back.
     stash: Bytes,
     trailers_slot: Rc<RefCell<Option<HeaderVec>>>,
-    /// Set when the request's `Body` finishes, read to its end or failed.
-    finished: Option<Rc<std::cell::Cell<bool>>>,
+    /// The clock to report the request's `Body` finishing to, and that
+    /// request's own flag on it.
+    finished: Option<(Rc<super::PhaseClock>, Rc<std::cell::Cell<bool>>)>,
 }
 
 impl<B> HyperBodyIo<B> {
-    /// Report the body's end — success or failure — through `flag`.
-    pub(crate) fn with_finished(mut self, flag: Rc<std::cell::Cell<bool>>) -> Self {
-        self.finished = Some(flag);
+    /// Report the body's end — read, failed or dropped — to `clock`, against
+    /// the current request's flag as of now.
+    pub(crate) fn with_clock(mut self, clock: Rc<super::PhaseClock>) -> Self {
+        let flag = clock.request_body_finished();
+        self.finished = Some((clock, flag));
         self
     }
 
@@ -105,10 +108,10 @@ where
 
     // One `HyperBodyIo` per request, and its flag is that request's own (the
     // clock makes a fresh one per handler), so the generation has nothing to
-    // tell apart here.
+    // tell apart here; the clock ignores a flag that is no longer current.
     fn body_finished(&mut self, _generation: u64) {
-        if let Some(flag) = &self.finished {
-            flag.set(true);
+        if let Some((clock, flag)) = &self.finished {
+            clock.note_request_body_finished(flag);
         }
     }
 

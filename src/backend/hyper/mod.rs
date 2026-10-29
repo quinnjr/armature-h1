@@ -119,6 +119,13 @@ pub(crate) struct PhaseClock {
     /// bridge as the handler is called; `None` when switched off. Holds in
     /// [`Phase::Write`] too, for a streamed response still reading the body.
     body_deadline_at: Cell<Option<tokio::time::Instant>>,
+    /// Whether the current response's body is a stream, the only response
+    /// the request body's deadline still bounds in [`Phase::Write`] — as
+    /// natively, where only a streamed response can still be reading it.
+    response_streams: Cell<bool>,
+    /// When the phase last moved (or a write re-armed it), so the watchdog,
+    /// woken for anything else, arms only what is left of the phase's time.
+    phase_since: Cell<tokio::time::Instant>,
     notify: tokio::sync::Notify,
 }
 
@@ -132,6 +139,8 @@ impl PhaseClock {
             detached: Cell::new(false),
             request_body_finished: RefCell::new(Rc::new(Cell::new(false))),
             body_deadline_at: Cell::new(None),
+            response_streams: Cell::new(false),
+            phase_since: Cell::new(tokio::time::Instant::now()),
             notify: tokio::sync::Notify::new(),
         }
     }
@@ -170,6 +179,7 @@ impl PhaseClock {
         }
         if p == Phase::Handler {
             *self.request_body_finished.borrow_mut() = Rc::new(Cell::new(false));
+            self.response_streams.set(false);
         }
         self.phase.set(p);
         self.bump();
@@ -239,7 +249,26 @@ impl PhaseClock {
 
     fn bump(&self) {
         self.generation.set(self.generation.get().wrapping_add(1));
+        self.phase_since.set(tokio::time::Instant::now());
         self.notify.notify_waiters();
+    }
+
+    /// The request body behind `flag` is finished — read, failed or dropped.
+    ///
+    /// Wakes the watchdog, so a deadline armed for the body gives way to the
+    /// phase's own the moment the body no longer needs bounding, rather than
+    /// whenever the body's would have fired. A flag that is no longer the
+    /// current request's — a `Body` kept from an earlier one — is ignored.
+    pub(crate) fn note_request_body_finished(&self, flag: &Rc<Cell<bool>>) {
+        flag.set(true);
+        if Rc::ptr_eq(flag, &self.request_body_finished.borrow()) {
+            self.notify.notify_waiters();
+        }
+    }
+
+    /// Record whether the response being handed to hyper streams its body.
+    pub(crate) fn set_response_streams(&self, streams: bool) {
+        self.response_streams.set(streams);
     }
 }
 
@@ -269,12 +298,16 @@ async fn watchdog(clock: &PhaseClock, limits: &Limits, deadline: &mut ConnDeadli
             .get()
             .filter(|_| !clock.request_body_finished.borrow().get());
         let now = tokio::time::Instant::now();
+        // What is left of the phase's own time: woken for a body finishing, the
+        // watchdog must not hand a stalled write a fresh `write_timeout`.
+        let remaining = phase_timeout(phase, limits)
+            .saturating_sub(now.saturating_duration_since(clock.phase_since.get()));
         let arm_for = match (phase, body_at) {
             (Phase::Handler, Some(at)) => at.saturating_duration_since(now),
-            (Phase::Write, Some(at)) => {
-                phase_timeout(phase, limits).min(at.saturating_duration_since(now))
+            (Phase::Write, Some(at)) if clock.response_streams.get() => {
+                remaining.min(at.saturating_duration_since(now))
             }
-            _ => phase_timeout(phase, limits),
+            _ => remaining,
         };
         deadline.arm(arm_for);
         tokio::select! {
@@ -296,13 +329,10 @@ async fn watchdog(clock: &PhaseClock, limits: &Limits, deadline: &mut ConnDeadli
                     clock.notify.notified().await;
                     continue;
                 }
-                // Armed for the body, which finished in time after all: the
-                // write deadline itself has not run out. Re-arm for it.
-                if phase == Phase::Write
-                    && body_at.is_some()
-                    && body_done
-                    && arm_for < phase_timeout(phase, limits)
-                {
+                // Armed for a body that finished just as it fired, before the
+                // wake-up could land: re-arm for what is left of the write's
+                // own time.
+                if phase == Phase::Write && body_at.is_some() && body_done {
                     continue;
                 }
                 return phase;

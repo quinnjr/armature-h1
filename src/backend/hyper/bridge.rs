@@ -202,8 +202,7 @@ impl<S: H1Service + 'static>
             let fully_read = Rc::new(Cell::new(false));
             let trailers_slot = Rc::new(RefCell::new(None));
             let body_io: Rc<RefCell<dyn crate::service::BodyIo>> = Rc::new(RefCell::new(
-                HyperBodyIo::new(incoming, trailers_slot.clone())
-                    .with_finished(phase.request_body_finished()),
+                HyperBodyIo::new(incoming, trailers_slot.clone()).with_clock(phase.clone()),
             ));
             let body = Body::from_backend(
                 kind,
@@ -285,6 +284,8 @@ impl<S: H1Service + 'static>
                 && matches!(resp.body, crate::service::ResponseBody::Stream(_))
                 && !is_head_request
                 && !crate::write::forbids_body_framing(resp.status);
+            phase
+                .set_response_streams(matches!(resp.body, crate::service::ResponseBody::Stream(_)));
             Ok(convert_response(
                 resp,
                 &cfg,

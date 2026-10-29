@@ -1437,3 +1437,36 @@ fn a_stalled_body_behind_a_streamed_response_closes_at_the_body_deadline() {
         started.elapsed()
     );
 }
+
+thread_local! {
+    /// Bodies a test handler keeps alive past its own return.
+    static KEPT_BODIES: std::cell::RefCell<Vec<armature_h1::Body>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Only a streamed response is still reading the request body, so only it is
+/// held to the body deadline: a large fixed response is written under
+/// `write_timeout` alone, even while an unfinished body is kept alive
+/// elsewhere and the peer is slow to read.
+#[test]
+fn a_fixed_response_is_not_cut_off_at_the_body_deadline() {
+    const LEN: usize = 4 << 20;
+    let ex = raw_exchange_with_service(
+        quick_limits(),
+        || {
+            |req: Request| async move {
+                KEPT_BODIES.with(|k| k.borrow_mut().push(req.body));
+                Response::ok().with_body(armature_h1::ResponseBody::Full(bytes::Bytes::from(
+                    vec![b'a'; LEN],
+                )))
+            }
+        },
+        vec![
+            b"POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\n\r\nhel".to_vec(),
+            b"lo".to_vec(),
+        ],
+        Duration::from_millis(700),
+    );
+    let body_at = ex.body.find("\r\n\r\n").map_or(0, |i| i + 4);
+    assert_eq!(ex.body.len() - body_at, LEN, "the whole response arrived");
+}
