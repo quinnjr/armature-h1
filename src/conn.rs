@@ -379,14 +379,7 @@ where
     /// So an upgrading handler must read the body to its end and then drop it
     /// before answering 101. Dropping it unread is not enough.
     pub async fn serve(mut self) -> io::Result<Option<Upgraded>> {
-        // An error response owed for the previous iteration's request, written
-        // once that iteration's handler has been dropped.
-        let mut owed_error: Option<(Version, u16)> = None;
         loop {
-            if let Some((version, status)) = owed_error.take() {
-                self.write_error(version, status).await?;
-                return Ok(None);
-            }
             // Wait for the next request to begin. An idle keep-alive connection
             // that never sends again is closed silently — no response is owed.
             match self.read_until_head_or_idle().await? {
@@ -501,17 +494,30 @@ where
             // request and response each carry an inline header array, and
             // every wrapper or block boundary they pass through is another copy
             // of it — on the keep-alive path, more than parsing the head costs.
-            // So the handler's future is pinned straight in the loop body, and
-            // an error ends the iteration to drop it (see `owed_error`).
             let mut produced: Option<Response> = None;
-            let mut call = std::pin::pin!(self.service.call(Request {
+            // Pinned as an `Option` so it can be dropped in place the moment it
+            // has produced its response — or fails — rather than at the end of
+            // the iteration: a hand-written future that keeps its `Request`
+            // would otherwise hold the `Body`, and with it the transport,
+            // through the response write and an upgrade handoff, as hyper's
+            // dispatcher never does.
+            let mut call = std::pin::pin!(Some(self.service.call(Request {
                 head,
                 body,
                 peer: self.peer,
-            }));
+            })));
 
             if let Some(mut held) = held.take() {
-                let polled = std::future::poll_fn(|cx| Poll::Ready(call.as_mut().poll(cx))).await;
+                let polled = std::future::poll_fn(|cx| {
+                    Poll::Ready(match call.as_mut().as_pin_mut() {
+                        Some(f) => f.poll(cx),
+                        None => Poll::Pending,
+                    })
+                })
+                .await;
+                if polled.is_ready() {
+                    call.set(None);
+                }
                 let mut bytes = held.bytes.take().unwrap_or_default();
                 bytes.unsplit(std::mem::take(&mut self.out));
                 self.out = bytes;
@@ -580,7 +586,10 @@ where
                     if body_armed && !body_finished() && deadline.poll_expired(cx).is_ready() {
                         return Poll::Ready(Some(408));
                     }
-                    if let Poll::Ready(resp) = call.as_mut().poll(cx) {
+                    if let Some(f) = call.as_mut().as_pin_mut()
+                        && let Poll::Ready(resp) = f.poll(cx)
+                    {
+                        call.set(None);
                         *produced = Some(resp);
                         return Poll::Ready(None);
                     }
@@ -599,19 +608,20 @@ where
                     d.disarm();
                 }
             }
-            // A failure ends this iteration, which drops the handler's future
-            // — and whatever it holds: its `Body`, the last borrow of the
-            // transport, a pool connection, a lock — before the error response
-            // is written at the top of the next, rather than keeping it alive
-            // for as long as that write takes.
+            // On failure the handler's future — and whatever it holds: its
+            // `Body`, the last borrow of the transport, a pool connection, a
+            // lock — is dropped before the error response is written, rather
+            // than kept alive for as long as that write takes.
             if let Some(status) = failed {
-                owed_error = Some((version, status));
-                continue;
+                call.set(None);
+                self.write_error(version, status).await?;
+                return Ok(None);
             }
             let Some(resp) = produced else {
                 // Unreachable: no failure means the handler produced one.
-                owed_error = Some((version, 500));
-                continue;
+                call.set(None);
+                self.write_error(version, 500).await?;
+                return Ok(None);
             };
 
             // An unconsumed or errored body leaves an unknown number of bytes on
@@ -2689,6 +2699,58 @@ mod tests {
             b"FIRSTFRAME",
             "bytes past the head belong to the upgraded protocol"
         );
+    }
+
+    /// A hand-written handler future that keeps its `Request` after
+    /// producing the response is dropped as soon as it has: its `Body` must
+    /// not hold the transport through the response, or the upgrade handoff
+    /// is forfeited — hyper's dispatcher drops a finished future at once.
+    #[tokio::test]
+    async fn a_finished_handler_future_is_dropped_before_the_handoff() {
+        struct KeepsRequest(Option<Request>);
+        impl Future for KeepsRequest {
+            type Output = Response;
+            fn poll(self: std::pin::Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Response> {
+                // Keeps the request — and its body's hold on the transport.
+                let _still_held = &self.0;
+                Poll::Ready(
+                    Response::new(101)
+                        .header(HeaderId::Upgrade, Bytes::from_static(b"raw"))
+                        .header(HeaderId::Connection, Bytes::from_static(b"upgrade")),
+                )
+            }
+        }
+        struct Svc;
+        impl H1Service for Svc {
+            type Future = KeepsRequest;
+            fn call(&self, req: Request) -> KeepsRequest {
+                KeepsRequest(Some(req))
+            }
+        }
+
+        let (mut client, server) = tokio::io::duplex(4096);
+        let local = tokio::task::LocalSet::new();
+        let conn = Connection::new(
+            server,
+            Svc,
+            cfg(Limits::default()),
+            Rc::new(RefCell::new(DateCache::new())),
+        );
+        let task = local.spawn_local(async move { conn.serve().await });
+        let upgraded = local
+            .run_until(async move {
+                client
+                    .write_all(
+                        b"GET / HTTP/1.1\r\nHost: a\r\nConnection: upgrade\r\nUpgrade: raw\r\n\r\n",
+                    )
+                    .await
+                    .unwrap();
+                let mut buf = [0u8; 256];
+                let _ = client.read(&mut buf).await.unwrap();
+                task.await.expect("join").expect("serve")
+            })
+            .await;
+        assert!(upgraded.is_some(), "the transport must be handed back");
     }
 
     /// A handler that keeps the request body alive past its 101 still owns a
