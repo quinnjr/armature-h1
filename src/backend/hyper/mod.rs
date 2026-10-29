@@ -115,6 +115,10 @@ pub(crate) struct PhaseClock {
     /// handler kept alive holds the old one, so its eventual drop cannot mark
     /// a later request's body finished.
     request_body_finished: RefCell<Rc<Cell<bool>>>,
+    /// When the current request's body must have arrived by, set by the
+    /// bridge as the handler is called; `None` when switched off. Holds in
+    /// [`Phase::Write`] too, for a streamed response still reading the body.
+    body_deadline_at: Cell<Option<tokio::time::Instant>>,
     notify: tokio::sync::Notify,
 }
 
@@ -127,6 +131,7 @@ impl PhaseClock {
             body_done: Cell::new(false),
             detached: Cell::new(false),
             request_body_finished: RefCell::new(Rc::new(Cell::new(false))),
+            body_deadline_at: Cell::new(None),
             notify: tokio::sync::Notify::new(),
         }
     }
@@ -207,6 +212,11 @@ impl PhaseClock {
         self.request_body_finished.borrow().clone()
     }
 
+    /// Set the current request body's deadline; see `body_deadline_at`.
+    pub(crate) fn set_body_deadline(&self, at: Option<tokio::time::Instant>) {
+        self.body_deadline_at.set(at);
+    }
+
     /// Record that the response body has no more frames to give.
     pub(crate) fn note_body_end(&self) {
         self.body_done.set(true);
@@ -250,7 +260,23 @@ async fn watchdog(clock: &PhaseClock, limits: &Limits, deadline: &mut ConnDeadli
     loop {
         let generation = clock.generation.get();
         let phase = clock.phase.get();
-        deadline.arm(phase_timeout(phase, limits));
+        // The request body's deadline, while the body is still awaited. It
+        // bounds the handler, and — as natively — a streamed response still
+        // reading the body: `write_timeout` alone would let a stream that
+        // writes heartbeats wait on a stalled body forever.
+        let body_at = clock
+            .body_deadline_at
+            .get()
+            .filter(|_| !clock.request_body_finished.borrow().get());
+        let now = tokio::time::Instant::now();
+        let arm_for = match (phase, body_at) {
+            (Phase::Handler, Some(at)) => at.saturating_duration_since(now),
+            (Phase::Write, Some(at)) => {
+                phase_timeout(phase, limits).min(at.saturating_duration_since(now))
+            }
+            _ => phase_timeout(phase, limits),
+        };
+        deadline.arm(arm_for);
         tokio::select! {
             biased;
             () = clock.notify.notified() => continue,
@@ -264,9 +290,19 @@ async fn watchdog(clock: &PhaseClock, limits: &Limits, deadline: &mut ConnDeadli
                 // awaits no more bytes either — and the handler's own runtime
                 // is not bounded, as natively. Nothing to time until the phase
                 // moves.
-                if phase == Phase::Handler && clock.request_body_finished.borrow().get() {
+                let body_done = clock.request_body_finished.borrow().get();
+                if phase == Phase::Handler && body_done {
                     deadline.disarm();
                     clock.notify.notified().await;
+                    continue;
+                }
+                // Armed for the body, which finished in time after all: the
+                // write deadline itself has not run out. Re-arm for it.
+                if phase == Phase::Write
+                    && body_at.is_some()
+                    && body_done
+                    && arm_for < phase_timeout(phase, limits)
+                {
                     continue;
                 }
                 return phase;

@@ -552,9 +552,14 @@ where
                     // handler composing its answer to a bad body is not cut
                     // off with a 408 it did nothing to earn.
                     let body_finished = || self.shared.borrow().body_finished;
-                    let body_armed = !body_finished();
-                    if body_armed {
-                        self.deadline.arm(self.cfg.limits.body_timeout);
+                    // One deadline per body, counted from its head: the same
+                    // instant a streamed response is later held to, not a
+                    // fresh window opened after any held output was flushed.
+                    // `None` is a deadline switched off with `Duration::MAX`.
+                    let body_armed = !body_finished() && self.body_deadline_at.is_some();
+                    if let Some(at) = self.body_deadline_at.filter(|_| body_armed) {
+                        self.deadline
+                            .arm(at.saturating_duration_since(tokio::time::Instant::now()));
                     }
                     let deadline = &mut self.deadline;
                     let mut handler_deadline = self.handler_deadline.as_mut();

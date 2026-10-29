@@ -1403,3 +1403,37 @@ fn a_malformed_connection_token_is_dropped_alone() {
     tokens.sort_unstable();
     assert_eq!(tokens, ["close", "x-hop"], "{:?}", ex.body);
 }
+
+/// A streamed response still reading a request body that stalls is bounded
+/// by the body deadline under either backend — not by `write_timeout`, which
+/// a stream that keeps writing would never run out.
+#[test]
+fn a_stalled_body_behind_a_streamed_response_closes_at_the_body_deadline() {
+    struct Echo(armature_h1::Body);
+    impl armature_h1::service::futures_stream::Stream for Echo {
+        fn poll_next(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Result<bytes::Bytes, armature_h1::BodyError>>> {
+            self.0.poll_chunk(cx)
+        }
+    }
+    let started = std::time::Instant::now();
+    let ex = raw_exchange_with_service(
+        quick_limits(),
+        || {
+            |req: Request| async move {
+                Response::ok()
+                    .with_body(armature_h1::ResponseBody::Stream(Box::pin(Echo(req.body))))
+            }
+        },
+        vec![b"POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 10\r\n\r\nabc".to_vec()],
+        Duration::ZERO,
+    );
+    assert!(ex.closed, "{:?}", ex.body);
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "closed at the body deadline, not write_timeout: {:?}",
+        started.elapsed()
+    );
+}

@@ -145,6 +145,9 @@ impl<S: H1Service + 'static>
             // The head is parsed by the time hyper calls us: everything from
             // here to the response is the native loop's handler/body window.
             phase.set(Phase::Handler);
+            phase.set_body_deadline(
+                tokio::time::Instant::now().checked_add(cfg.limits.body_timeout),
+            );
             // Recorded before anything can fail so a 408 raised anywhere in
             // this window carries the request's version, as native's does.
             req_version.set(from_wire(req.version()).unwrap_or(Version::Http11));

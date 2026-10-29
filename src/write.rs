@@ -164,6 +164,11 @@ pub(crate) fn forbids_body_framing(status: u16) -> bool {
 /// those that are tokens (RFC 9110 section 7.6.1), so a malformed one is
 /// dropped on its own rather than sinking the field — or being written.
 ///
+/// Nor a framing field's name. A compliant intermediary strips every field
+/// `Connection` names, so `Connection: content-length` would have it strip
+/// the very field that delimits this response and guess where the body ends
+/// — the desync every other framing rule in this module exists to prevent.
+///
 /// The one definition both backends write a handler's field through, so
 /// which of its tokens go out cannot differ between them.
 pub(crate) fn connection_tokens(value: &[u8]) -> impl Iterator<Item = &[u8]> {
@@ -175,6 +180,8 @@ pub(crate) fn connection_tokens(value: &[u8]) -> impl Iterator<Item = &[u8]> {
                 && t.iter().copied().all(header::is_tchar)
                 && !t.eq_ignore_ascii_case(b"close")
                 && !t.eq_ignore_ascii_case(b"keep-alive")
+                && !t.eq_ignore_ascii_case(b"content-length")
+                && !t.eq_ignore_ascii_case(b"transfer-encoding")
         })
 }
 
@@ -1141,6 +1148,28 @@ mod tests {
             .to_ascii_lowercase();
         assert!(got.contains("transfer-encoding: chunked\r\n"), "{got}");
         assert!(!got.contains("content-length"), "{got}");
+    }
+
+    /// A `Connection` field may not name the fields that frame the response.
+    #[test]
+    fn connection_never_names_a_framing_field() {
+        let got = render(
+            Version::Http11,
+            &head_of(
+                200,
+                &[(
+                    HeaderId::Connection,
+                    "Content-Length, x-hop, transfer-encoding",
+                )],
+            ),
+            &OutBody::Fixed(Bytes::from_static(b"hi")),
+            true,
+        );
+        let lower = got.to_ascii_lowercase();
+        assert!(lower.contains("connection: x-hop\r\n"), "{got}");
+        assert!(!lower.contains("connection: content-length"), "{got}");
+        assert!(!lower.contains("transfer-encoding"), "{got}");
+        assert!(lower.contains("content-length: 2\r\n"), "{got}");
     }
 
     /// Only the persistence tokens are the server's: `upgrade` beside them
